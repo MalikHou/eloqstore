@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.2)
+cmake_minimum_required(VERSION 3.20)
 project(eloqkvstore)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -28,7 +28,8 @@ target_link_libraries(io_uring_test ${URING_LIB})
 add_executable(uring_register_test uring_register_test.cpp)
 target_link_libraries(uring_register_test ${URING_LIB})
 
-if(CMAKE_BUILD_TYPE MATCHES "Debug")
+option(WITH_ASAN "build with ASAN" OFF)
+if(WITH_ASAN)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined -fsanitize=address -fno-omit-frame-pointer")
 endif()
 

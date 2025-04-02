@@ -75,7 +75,7 @@ public:
     const KvOptions *Options() const;
     AsyncIoManager *IoMgr() const;
 
-    void CleanStubRoot(const TableIdent &tbl_id);
+    void EvictRootIfEmpty(const TableIdent &tbl_id);
 
 private:
     /**

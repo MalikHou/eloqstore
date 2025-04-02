@@ -61,11 +61,11 @@ void WriteTask::Abort()
         cow_meta_.old_mapping_ = nullptr;
     }
     cow_meta_.mapper_ = nullptr;
-
-    if (cow_meta_.root_ == nullptr)
+    if (cow_meta_.manifest_size_ == 0)
     {
+        assert(cow_meta_.root_ == nullptr);
         // MakeCowRoot will create a empty RootMeta if partition not found
-        index_mgr->CleanStubRoot(tbl_ident_);
+        index_mgr->EvictRootIfEmpty(tbl_ident_);
     }
 }
 
@@ -364,10 +364,9 @@ KvError BatchWriteTask::LeafLinkDelete()
     return KvError::NoError;
 }
 
-KvError WriteTask::FlushManifest(const MemIndexPage *root)
+KvError WriteTask::FlushManifest(uint32_t root)
 {
-    uint32_t root_pg_id = root ? root->PageId() : UINT32_MAX;
-    std::string_view blob = wal_builder_.Finalize(root_pg_id);
+    std::string_view blob = wal_builder_.Finalize(root);
 
     if (cow_meta_.manifest_size_ > 0 &&
         cow_meta_.manifest_size_ + blob.size() <= Options()->manifest_limit)
@@ -379,7 +378,7 @@ KvError WriteTask::FlushManifest(const MemIndexPage *root)
     }
     else
     {
-        blob = wal_builder_.Snapshot(root_pg_id, *cow_meta_.mapper_);
+        blob = wal_builder_.Snapshot(root, *cow_meta_.mapper_);
         KvError err = IoMgr()->SwitchManifest(tbl_ident_, blob);
         CHECK_KV_ERR(err);
         cow_meta_.manifest_size_ = blob.size();
@@ -389,18 +388,22 @@ KvError WriteTask::FlushManifest(const MemIndexPage *root)
 
 KvError WriteTask::UpdateMeta(MemIndexPage *root)
 {
-    cow_meta_.old_mapping_ = nullptr;
+    assert(root == nullptr || root->IsPinned());
     KvError err = IoMgr()->FlushData(tbl_ident_);
     CHECK_KV_ERR(err);
     if (!wal_builder_.Empty())
     {
-        err = FlushManifest(root);
+        uint32_t root_id = root != nullptr ? root->PageId() : UINT32_MAX;
+        err = FlushManifest(root_id);
         CHECK_KV_ERR(err);
     }
     index_mgr->UpdateRoot(tbl_ident_,
                           root,
                           std::move(cow_meta_.mapper_),
                           cow_meta_.manifest_size_);
+    // We have to clear the old mapping after UpdateRoot, otherwise the
+    // to_free_file_pages_ will be applied on the old PageMapper.
+    cow_meta_.old_mapping_ = nullptr;
     return KvError::NoError;
 }
 
@@ -486,7 +489,17 @@ KvError BatchWriteTask::Apply()
         new_root = new_page;
     }
 
-    return UpdateMeta(new_root);
+    // Prevent the root page from being evicted before update RootMeta.
+    if (new_root != nullptr)
+    {
+        new_root->Pin();
+    }
+    err = UpdateMeta(new_root);
+    if (new_root != nullptr)
+    {
+        new_root->Unpin();
+    }
+    return err;
 }
 
 KvError BatchWriteTask::LoadApplyingPage(uint32_t page_id)
@@ -1233,18 +1246,27 @@ KvError TruncateTask::Truncate(std::string_view trunc_pos)
     }
     wal_builder_.Reset();
 
-    MemIndexPage *new_root = nullptr;
     if (trunc_pos.empty())
     {
         DeleteTree(cow_meta_.root_->PageId());
+        return UpdateMeta(nullptr);
     }
-    else
+
+    auto ret = TruncateIndexPage(cow_meta_.root_->PageId(), trunc_pos);
+    CHECK_KV_ERR(ret.second);
+    MemIndexPage *new_root = ret.first;
+
+    // Prevent the root page from being evicted before update RootMeta.
+    if (new_root != nullptr)
     {
-        auto ret = TruncateIndexPage(cow_meta_.root_->PageId(), trunc_pos);
-        CHECK_KV_ERR(ret.second);
-        new_root = ret.first;
+        new_root->Pin();
     }
-    return UpdateMeta(new_root);
+    err = UpdateMeta(new_root);
+    if (new_root != nullptr)
+    {
+        new_root->Unpin();
+    }
+    return err;
 }
 
 std::pair<bool, KvError> TruncateTask::TruncateDataPage(

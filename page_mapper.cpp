@@ -173,11 +173,6 @@ uint32_t PageMapper::GetFreeFilePage()
     }
 }
 
-bool PageMapper::DelFreeFilePage(uint32_t file_page_id)
-{
-    return free_file_pages_.erase(file_page_id);
-}
-
 uint64_t PageMapper::EncodeFilePageId(uint32_t file_page_id)
 {
     return (file_page_id << MAPPING_BITS) | MAPPING_PHYSICAL;

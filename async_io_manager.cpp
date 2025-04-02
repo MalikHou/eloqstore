@@ -416,8 +416,9 @@ IouringMgr::LruFD::Ref IouringMgr::GetOrCreateFD(const TableIdent &tbl_id,
 
             if (fd < 0)
             {
-                LOG(ERROR) << "open file/directory failed " << tbl_id << '@'
-                           << file_id;
+                LOG_IF(ERROR, fd != -ENOENT)
+                    << "open file/directory failed " << tbl_id << '@' << file_id
+                    << " : " << fd;
                 lru_fd.Get()->fd_ = LruFD::FdEmpty;
                 // notify all waiting tasks failed
                 for (KvTask *task : lru_fd.Get()->loading_)
@@ -851,6 +852,10 @@ KvError IouringMgr::SwitchManifest(const TableIdent &tbl_id,
 
     // Generate temporary manifest
     LruFD::Ref tmp_ref = GetOrCreateFD(tbl_id, LruFD::kTmpManifest);
+    if (tmp_ref == nullptr)
+    {
+        return KvError::OpenFileLimit;
+    }
     int res = Write(tmp_ref.FdPair(), snapshot.data(), snapshot.size(), 0);
     if (res < 0)
     {
@@ -932,7 +937,6 @@ IouringMgr::WriteReq *IouringMgr::AllocWriteReq()
         // queue size is fixed, so the maximal ongoing write requests is capped.
         asyn_write_reqs_.emplace_back(std::make_unique<WriteReq>());
         first = asyn_write_reqs_.back().get();
-        assert(asyn_write_reqs_.size() <= options_->io_queue_size);
     }
 
     first->task_ = static_cast<WriteTask *>(thd_task);

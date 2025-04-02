@@ -77,7 +77,7 @@ protected:
     static void AdvanceDataPageIter(DataPageIter &iter, bool &is_valid);
     static void AdvanceIndexPageIter(IndexPageIter &iter, bool &is_valid);
 
-    KvError FlushManifest(const MemIndexPage *root);
+    KvError FlushManifest(uint32_t root);
     KvError UpdateMeta(MemIndexPage *root);
 
     std::pair<uint32_t, KvError> Seek(std::string_view key);

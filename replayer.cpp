@@ -104,27 +104,21 @@ KvError Replayer::ReplayMapping(std::string_view bat)
         {
             // Insert/Update mapping
             std::vector<uint64_t> &mapping = mapper_->Mapping();
-            assert(page_id <= mapping.size());
-            if (page_id == mapping.size())
+            while (page_id >= mapping.size())
             {
-                // Insert new mapping. Allocate a new logical page id
                 mapping.emplace_back(UINT32_MAX);
+                mapper_->FreePage(mapping.size() - 1);
             }
-            else if (mapper_->DequeFreePage(page_id))
-            {
-                // Insert new mapping. Reuse freed logical page id
-            }
-            else
+            if (!mapper_->DequeFreePage(page_id))
             {
                 // Update existing mapping. Free old physical page id
                 uint32_t old_fp = mapper_->GetMapping()->ToFilePage(page_id);
                 mapper_->FreeFilePage(old_fp);
             }
             // Allocate new physical page id
-            if (!mapper_->DelFreeFilePage(file_page))
+            if (!mapper_->free_file_pages_.erase(file_page))
             {
-                uint32_t fp = mapper_->ExpandFilePage();
-                assert(fp == file_page);
+                CHECK(mapper_->ExpandFilePage() == file_page);
             }
             mapper_->UpdateMapping(page_id, file_page);
         }

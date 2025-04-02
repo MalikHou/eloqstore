@@ -117,6 +117,7 @@ std::pair<RootMeta *, KvError> IndexPageManager::FindRoot(
     RootMeta *meta = &it->second;
     if (meta->root_page_)
     {
+        assert(!meta->root_page_->IsDetached());
         EnqueuIndexPage(meta->root_page_);
     }
     return {meta, KvError::NoError};
@@ -135,12 +136,11 @@ KvError IndexPageManager::MakeCowRoot(const TableIdent &tbl_ident,
         cow_meta.mapper_ = std::move(new_mapper);
         cow_meta.old_mapping_ = meta->mapper_->GetMappingSnapshot();
         cow_meta.manifest_size_ = meta->manifest_size_;
-        return KvError::NoError;
     }
     else if (err == KvError::NotFound)
     {
-        // TODO(zhanghao): This will leave a empty RootMeta entry if WriteTask
-        // do not call UpdateRoot
+        // It is the WriteTask's responsibility to clean up this stub RootMeta
+        // if it aborted.
         auto [tbl_it, _] = tbl_roots_.try_emplace(tbl_ident);
         const TableIdent *tbl_id = &tbl_it->first;
         std::unique_ptr<PageMapper> mapper =
@@ -150,12 +150,14 @@ KvError IndexPageManager::MakeCowRoot(const TableIdent &tbl_ident,
         cow_meta.mapper_ = std::move(mapper);
         cow_meta.old_mapping_ = std::move(mapping);
         cow_meta.manifest_size_ = 0;
-        return KvError::NoError;
+        meta = &tbl_it->second;
     }
     else
     {
         return err;
     }
+    meta->mapping_snapshots_.insert(cow_meta.mapper_->GetMapping());
+    return KvError::NoError;
 }
 
 void IndexPageManager::UpdateRoot(const TableIdent &tbl_ident,
@@ -163,12 +165,12 @@ void IndexPageManager::UpdateRoot(const TableIdent &tbl_ident,
                                   std::unique_ptr<PageMapper> new_mapper,
                                   uint64_t manifest_size)
 {
+    assert(!new_root->IsDetached());
     auto tbl_it = tbl_roots_.find(tbl_ident);
     assert(tbl_it != tbl_roots_.end());
     RootMeta &meta = tbl_it->second;
     meta.root_page_ = new_root;
     meta.mapper_ = std::move(new_mapper);
-    meta.mapping_snapshots_.insert(meta.mapper_->GetMapping());
     meta.manifest_size_ = manifest_size;
 }
 
@@ -321,6 +323,7 @@ std::pair<MemIndexPage *, KvError> IndexPageManager::FindPage(
             return {new_page, KvError::NoError};
         }
     }
+    assert(!idx_page->IsDetached());
     EnqueuIndexPage(idx_page);
     return {idx_page, KvError::NoError};
 }
@@ -332,8 +335,11 @@ void IndexPageManager::FreeMappingSnapshot(MappingSnapshot *mapping)
     assert(tbl_it != tbl_roots_.end());
     RootMeta &meta = tbl_it->second;
     // Puts back file pages freed in this mapping snapshot
-    assert(meta.mapper_ != nullptr);
-    meta.mapper_->FreeFilePages(std::move(mapping->to_free_file_pages_));
+    if (!mapping->to_free_file_pages_.empty())
+    {
+        assert(meta.mapper_ != nullptr);
+        meta.mapper_->FreeFilePages(std::move(mapping->to_free_file_pages_));
+    }
     meta.mapping_snapshots_.erase(mapping);
 }
 
@@ -373,7 +379,7 @@ bool IndexPageManager::Evict()
     return true;
 }
 
-void IndexPageManager::CleanStubRoot(const TableIdent &tbl_id)
+void IndexPageManager::EvictRootIfEmpty(const TableIdent &tbl_id)
 {
     auto it = tbl_roots_.find(tbl_id);
     if (it != tbl_roots_.end())
@@ -487,6 +493,7 @@ KvError IndexPageManager::SeekIndex(MappingSnapshot *mapping,
     if (node->IsPointingToLeaf() || page_id == UINT32_MAX)
     {
         // Updates the cache replacement list.
+        assert(!node->IsDetached());
         EnqueuIndexPage(node);
         result = page_id;
         return KvError::NoError;

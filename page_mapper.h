@@ -91,7 +91,6 @@ private:
 
     uint32_t ExpandFilePage();
     bool DequeFreePage(uint32_t page_id);
-    bool DelFreeFilePage(uint32_t file_page_id);
 
     /**
      * @brief Gets a free file page. The implementation now returns the smaller
