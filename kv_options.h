@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 #include "comparator.h"
@@ -8,10 +9,15 @@
 namespace kvstore
 {
 constexpr uint8_t max_overflow_pointers = 128;
+constexpr uint16_t max_read_pages_batch = max_overflow_pointers;
+constexpr uint16_t max_write_pages_batch = 256;
+
 constexpr uint16_t max_key_size = 2048;
 
 struct KvOptions
 {
+    bool operator==(const KvOptions &other) const;
+
     /**
      * @brief Key-Value database storage path.
      * In-memory storage will be used if path is empty.
@@ -35,7 +41,7 @@ struct KvOptions
     /**
      * @brief Limit manifest file size.
      */
-    uint64_t manifest_limit = 8 << 20;  // 8MB
+    uint64_t manifest_limit = 16 << 20;  // 16MB
     /**
      * @brief Max amount of opened files per thread.
      */
@@ -49,9 +55,9 @@ struct KvOptions
      */
     uint32_t max_inflight_write = 4096;
     /**
-     * @brief Max amount of inflight write IO per task.
+     * @brief The maximum number of pages per batch for the write task.
      */
-    uint16_t max_write_task_io = 64;
+    uint16_t max_write_batch_pages = 64;
     /**
      * @brief Size of io-uring selected buffer ring.
      * It must be a power-of 2, and can be up to 32768.
@@ -63,9 +69,37 @@ struct KvOptions
      */
     uint32_t coroutine_stack_size = 16 * 1024;
 
-    /*
-     * The following options will be persisted. User cannot change them after
-     * setting for the first time.
+    /**
+     * @brief Limit number of retained archives.
+     * Only take effect when data_append_mode is enabled.
+     */
+    uint16_t num_retained_archives = 0;
+    /**
+     * @brief Set the (minimum) archive time interval in seconds.
+     * 0 means do not generate archives automatically.
+     * Only take effect when data_append_mode is enabled and
+     * num_retained_archives is not 0.
+     */
+    uint32_t archive_interval_secs = 86400;  // 1 day
+    /**
+     * @brief The maximum number of running archive tasks at the same time.
+     */
+    uint16_t max_archive_tasks = 256;
+    /**
+     * @brief Move pages in data file that space amplification factor
+     * bigger than this value.
+     * Only take effect when data_append_mode is enabled.
+     */
+    uint8_t file_amplify_factor = 2;
+    /**
+     * @brief Number of background file GC threads.
+     * Only take effect when data_append_mode is enabled.
+     */
+    uint16_t num_gc_threads = 1;
+
+    /* NOTE:
+     * The following options will be persisted in storage, so after the first
+     * setting, them cannot be changed anymore in the future.
      */
 
     /**
@@ -73,15 +107,32 @@ struct KvOptions
      * Ensure that it is aligned to the system's page size.
      */
     uint16_t data_page_size = 1 << 12;  // 4KB
+
+    size_t FilePageOffsetMask() const;
     /**
-     * @brief Amount of pages per data file (1 << num_file_pages_shift).
+     * @brief Amount of pages per data file (1 << pages_per_file_shift).
      */
-    uint8_t num_file_pages_shift = 11;  // 2048
+    uint8_t pages_per_file_shift = 11;  // 2048
+
     /**
      * @brief Amount of pointers stored in overflow page.
-     * The maximum value is 128.
+     * The maximum can be set to 128 (max_overflow_pointers).
      */
     uint8_t overflow_pointers = 16;
+    /**
+     * @brief Write data file pages in append only mode.
+     */
+    bool data_append_mode = false;
 };
+
+inline bool KvOptions::operator==(const KvOptions &other) const
+{
+    return std::memcmp(this, &other, sizeof(KvOptions)) == 0;
+}
+
+inline size_t KvOptions::FilePageOffsetMask() const
+{
+    return (1 << pages_per_file_shift) - 1;
+}
 
 }  // namespace kvstore

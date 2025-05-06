@@ -12,7 +12,7 @@
 #include "kv_options.h"
 #include "mem_index_page.h"
 #include "root_meta.h"
-#include "table_ident.h"
+#include "types.h"
 
 namespace kvstore
 {
@@ -48,15 +48,12 @@ public:
 
     KvError MakeCowRoot(const TableIdent &tbl_ident, CowRootMeta &cow_meta);
 
-    void UpdateRoot(const TableIdent &tbl_ident,
-                    MemIndexPage *new_root,
-                    std::unique_ptr<PageMapper> new_mapper,
-                    uint64_t manifest_size);
+    void UpdateRoot(const TableIdent &tbl_ident, CowRootMeta new_meta);
 
     KvError LoadTablePartition(const TableIdent &tbl_id);
 
     std::pair<MemIndexPage *, KvError> FindPage(MappingSnapshot *mapping,
-                                                uint32_t page_id);
+                                                PageId page_id);
 
     void FreeMappingSnapshot(MappingSnapshot *mapping);
 

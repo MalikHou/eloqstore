@@ -1,9 +1,9 @@
 #include "read_task.h"
 
 #include "error.h"
-#include "index_page_manager.h"
 #include "mem_index_page.h"
 #include "page_mapper.h"
+#include "shard.h"
 
 namespace kvstore
 {
@@ -13,7 +13,7 @@ KvError ReadTask::Read(const TableIdent &tbl_id,
                        std::string &value,
                        uint64_t &timestamp)
 {
-    auto [meta, err] = index_mgr->FindRoot(tbl_id);
+    auto [meta, err] = shard->IndexManager()->FindRoot(tbl_id);
     CHECK_KV_ERR(err);
     if (meta->root_page_ == nullptr)
     {
@@ -21,11 +21,11 @@ KvError ReadTask::Read(const TableIdent &tbl_id,
     }
     auto mapping = meta->mapper_->GetMappingSnapshot();
 
-    uint32_t page_id;
-    err = index_mgr->SeekIndex(
+    PageId page_id;
+    err = shard->IndexManager()->SeekIndex(
         mapping.get(), tbl_id, meta->root_page_, search_key, page_id);
     CHECK_KV_ERR(err);
-    uint32_t file_page = mapping->ToFilePage(page_id);
+    FilePageId file_page = mapping->ToFilePage(page_id);
     auto [page, err_load] = LoadDataPage(tbl_id, page_id, file_page);
     CHECK_KV_ERR(err_load);
 

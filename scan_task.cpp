@@ -5,8 +5,8 @@
 #include <memory>
 
 #include "error.h"
-#include "index_page_manager.h"
 #include "page_mapper.h"
+#include "shard.h"
 
 namespace kvstore
 {
@@ -27,20 +27,20 @@ KvError ScanTask::Scan(const TableIdent &tbl_id,
     has_remaining = false;
     size_t result_size = 0;
 
-    auto [meta, err] = index_mgr->FindRoot(tbl_id);
+    auto [meta, err] = shard->IndexManager()->FindRoot(tbl_id);
     CHECK_KV_ERR(err);
     if (meta->root_page_ == nullptr)
     {
-        return KvError::NotFound;
+        return KvError::NoError;
     }
     auto mapping = meta->mapper_->GetMappingSnapshot();
 
-    uint32_t page_id;
-    err = index_mgr->SeekIndex(
+    PageId page_id;
+    err = shard->IndexManager()->SeekIndex(
         mapping.get(), tbl_id, meta->root_page_, begin_key, page_id);
     CHECK_KV_ERR(err);
-    assert(page_id != UINT32_MAX);
-    uint32_t file_page = mapping->ToFilePage(page_id);
+    assert(page_id != MaxPageId);
+    FilePageId file_page = mapping->ToFilePage(page_id);
     auto [page, err_load] = LoadDataPage(tbl_id, page_id, file_page);
     CHECK_KV_ERR(err_load);
     data_page_ = std::move(page);
@@ -107,19 +107,20 @@ End:
     return err == KvError::EndOfFile ? KvError::NoError : err;
 }
 
-KvError ScanTask::Next(MappingSnapshot *m)
+KvError ScanTask::Next(MappingSnapshot *mapping)
 {
     if (!iter_.HasNext())
     {
-        uint32_t page_id = data_page_.NextPageId();
+        PageId page_id = data_page_.NextPageId();
         data_page_.Clear();
-        if (page_id == UINT32_MAX)
+        if (page_id == MaxPageId)
         {
             // EndOfFile will just break the scan process
             return KvError::EndOfFile;
         }
-        uint32_t file_page = m->ToFilePage(page_id);
-        auto [page, err] = LoadDataPage(*m->tbl_ident_, page_id, file_page);
+        FilePageId file_page = mapping->ToFilePage(page_id);
+        auto [page, err] =
+            LoadDataPage(*mapping->tbl_ident_, page_id, file_page);
         CHECK_KV_ERR(err);
         data_page_ = std::move(page);
 

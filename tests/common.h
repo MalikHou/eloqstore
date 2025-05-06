@@ -4,13 +4,18 @@
 #include <cstdint>
 #include <string_view>
 
+#include "../common.h"
 #include "coding.h"
 #include "eloq_store.h"
 
-static constexpr kvstore::TableIdent test_tbl_id = {"t1", 0};
-inline std::unique_ptr<kvstore::EloqStore> memstore = nullptr;
+constexpr char test_path[] = "/tmp/eloqstore";
+static constexpr kvstore::TableIdent test_tbl_id = {"t0", 0};
+const kvstore::KvOptions mem_store_opts = {};
+const kvstore::KvOptions default_opts = {
+    .db_path = test_path,
+};
 
-void InitMemStore();
+kvstore::EloqStore *InitStore(const kvstore::KvOptions &opts);
 
 inline std::string_view ConvertIntKey(char *ptr, uint64_t key)
 {

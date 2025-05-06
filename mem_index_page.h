@@ -12,6 +12,7 @@
 #include "comparator.h"
 #include "kv_options.h"
 #include "page.h"
+#include "types.h"
 
 namespace kvstore
 {
@@ -70,29 +71,29 @@ public:
         return prev_ == nullptr && next_ == nullptr;
     }
 
-    uint32_t PageId() const
+    PageId GetPageId() const
     {
         return page_id_;
     }
 
-    uint32_t FilePageId() const
+    FilePageId GetFilePageId() const
     {
         return file_page_id_;
     }
 
-    void SetPageId(uint32_t page_id)
+    void SetPageId(PageId page_id)
     {
         page_id_ = page_id;
     }
 
-    void SetFilePageId(uint32_t file_page_id)
+    void SetFilePageId(FilePageId file_page_id)
     {
         file_page_id_ = file_page_id;
     }
 
     bool IsPageIdValid() const
     {
-        return page_id_ < UINT32_MAX;
+        return page_id_ < MaxPageId;
     }
 
     /**
@@ -106,9 +107,9 @@ private:
      * not been flushed to storage.
      *
      */
-    uint32_t page_id_{UINT32_MAX};
+    PageId page_id_{MaxPageId};
 
-    uint32_t file_page_id_{UINT32_MAX};
+    FilePageId file_page_id_{MaxFilePageId};
 
     /**
      * @brief Number of concurrent tasks that have pinned the page. A page is
@@ -177,7 +178,7 @@ public:
         return {key_.data(), key_.size()};
     }
 
-    uint32_t PageId() const
+    PageId GetPageId() const
     {
         return page_id_;
     }
@@ -199,7 +200,7 @@ private:
         curr_restart_idx_ = restart_idx;
         curr_offset_ = RestartOffset(restart_idx);
         key_.clear();
-        page_id_ = UINT32_MAX;
+        page_id_ = MaxPageId;
     }
 
     bool ParseNextKey();
@@ -223,6 +224,6 @@ private:
     uint16_t curr_restart_idx_{0};
 
     std::string key_;
-    uint32_t page_id_{UINT32_MAX};
+    PageId page_id_{MaxPageId};
 };
 }  // namespace kvstore

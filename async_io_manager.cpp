@@ -13,34 +13,41 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "common.h"
 #include "error.h"
 #include "kill_point.h"
 #include "kv_options.h"
 #include "read_task.h"
-#include "table_ident.h"
+#include "shard.h"
 #include "task.h"
 #include "write_task.h"
 
 namespace kvstore
 {
+namespace fs = std::filesystem;
+
 char *VarPagePtr(const VarPage &page)
 {
     char *ptr = nullptr;
-    switch (page.index())
+    switch (VarPageType(page.index()))
     {
-    case 0:
+    case VarPageType::MemIndexPage:
         ptr = std::get<MemIndexPage *>(page)->PagePtr();
         break;
-    case 1:
+    case VarPageType::DataPage:
         ptr = std::get<DataPage>(page).PagePtr();
         break;
-    case 2:
+    case VarPageType::OverflowPage:
         ptr = std::get<OverflowPage>(page).PagePtr();
+        break;
+    case VarPageType::Page:
+        ptr = std::get<Page>(page).get();
         break;
     }
     assert(!((uint64_t) ptr & (page_align - 1)));
@@ -125,7 +132,7 @@ KvError IouringMgr::Init(int dir_fd)
 }
 
 std::pair<Page, KvError> IouringMgr::ReadPage(const TableIdent &tbl_id,
-                                              uint32_t fp_id,
+                                              FilePageId fp_id,
                                               Page page)
 {
     auto [file_id, offset] = ConvFilePageId(fp_id);
@@ -158,16 +165,16 @@ std::pair<Page, KvError> IouringMgr::ReadPage(const TableIdent &tbl_id,
 }
 
 KvError IouringMgr::ReadPages(const TableIdent &tbl_id,
-                              std::span<uint32_t> page_ids,
+                              std::span<FilePageId> page_ids,
                               std::vector<Page> &pages)
 {
-    assert(page_ids.size() <= max_overflow_pointers);
+    assert(page_ids.size() <= max_read_pages_batch);
     // ReadReq is a temporary object, so we allocate it on stack.
-    std::array<ReadReq, max_overflow_pointers> reqs_buf;
+    std::array<ReadReq, max_read_pages_batch> reqs_buf;
     std::span<ReadReq> reqs(reqs_buf.data(), page_ids.size());
 
     // Prepare requests.
-    for (uint8_t i = 0; uint32_t fp_id : page_ids)
+    for (uint8_t i = 0; FilePageId fp_id : page_ids)
     {
         auto [file_id, offset] = ConvFilePageId(fp_id);
         auto [fd_ref, err] = GetFD(tbl_id, file_id);
@@ -215,7 +222,7 @@ KvError IouringMgr::ReadPages(const TableIdent &tbl_id,
     {
         if (!ValidatePageChecksum(req.page_.get(), options_->data_page_size))
         {
-            uint32_t file_id = req.fd_ref_.Get()->file_id_;
+            FileId file_id = req.fd_ref_.Get()->file_id_;
             LOG(ERROR) << "corrupted " << tbl_id << " file " << file_id;
             return KvError::Corrupted;
         }
@@ -243,7 +250,7 @@ std::pair<ManifestFilePtr, KvError> IouringMgr::GetManifest(
 
 KvError IouringMgr::WritePage(const TableIdent &tbl_id,
                               VarPage page,
-                              uint32_t file_page_id)
+                              FilePageId file_page_id)
 {
     TEST_KILL_POINT("WritePage:0")
     auto [file_id, offset] = ConvFilePageId(file_page_id);
@@ -261,17 +268,50 @@ KvError IouringMgr::WritePage(const TableIdent &tbl_id,
     }
 
     char *ptr = req->PagePtr();
-    SetPageChecksum(ptr, Options()->data_page_size);
     io_uring_prep_write(sqe, fd, ptr, options_->data_page_size, offset);
     return KvError::NoError;
 }
 
-KvError IouringMgr::FlushData(const TableIdent &tbl_id)
+KvError IouringMgr::WritePages(const TableIdent &tbl_id,
+                               std::span<VarPage> pages,
+                               FilePageId first_fp_id)
 {
-    WriteTask *task = static_cast<WriteTask *>(thd_task);
-    KvError err = task->WaitWrite();
+    auto [file_id, offset] = ConvFilePageId(first_fp_id);
+    auto [fd_ref, err] = GetOrCreateFD(tbl_id, file_id);
     CHECK_KV_ERR(err);
+    fd_ref.Get()->dirty_ = true;
 
+    auto [fd, registered] = fd_ref.FdPair();
+    io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, thd_task);
+    if (registered)
+    {
+        sqe->flags |= IOSQE_FIXED_FILE;
+    }
+
+    size_t num_pages = pages.size();
+    assert(num_pages < max_write_pages_batch);
+    std::array<iovec, max_write_pages_batch> iov;
+    for (size_t i = 0; i < num_pages; i++)
+    {
+        iov[i].iov_base = VarPagePtr(pages[i]);
+        iov[i].iov_len = options_->data_page_size;
+    }
+    io_uring_prep_writev(sqe, fd, iov.data(), num_pages, offset);
+
+    int ret = thd_task->WaitSyncIo();
+    if (ret < 0)
+    {
+        return ToKvError(ret);
+    }
+    if (ret < (num_pages * Options()->data_page_size))
+    {
+        return KvError::TryAgain;
+    }
+    return KvError::NoError;
+}
+
+KvError IouringMgr::SyncData(const TableIdent &tbl_id)
+{
     auto it_tbl = tables_.find(tbl_id);
     if (it_tbl == tables_.end())
     {
@@ -285,7 +325,7 @@ KvError IouringMgr::FlushData(const TableIdent &tbl_id)
     {
         if (fd.dirty_)
         {
-            fsync_reqs.emplace_back(task, LruFD::Ref(&fd, this));
+            fsync_reqs.emplace_back(thd_task, LruFD::Ref(&fd, this));
         }
     }
     for (const FsyncReq &req : fsync_reqs)
@@ -298,8 +338,9 @@ KvError IouringMgr::FlushData(const TableIdent &tbl_id)
         }
         io_uring_prep_fsync(sqe, fd, IORING_FSYNC_DATASYNC);
     }
-    task->WaitAsynIo();
+    thd_task->WaitAsynIo();
 
+    KvError err = KvError::NoError;
     for (const FsyncReq &req : fsync_reqs)
     {
         if (req.io_res_ < 0)
@@ -354,11 +395,6 @@ void IouringMgr::CleanTable(const TableIdent &tbl_id)
     tables_.erase(it);
 }
 
-std::string IouringMgr::DataFileName(uint32_t file_id)
-{
-    return "data_" + std::to_string(file_id);
-}
-
 KvError IouringMgr::ToKvError(int err_no)
 {
     if (err_no >= 0)
@@ -402,7 +438,7 @@ void IouringMgr::EncodeUserData(io_uring_sqe *sqe,
 }
 
 IouringMgr::LruFD::Ref IouringMgr::GetCachedFD(const TableIdent &tbl_id,
-                                               uint32_t file_id)
+                                               FileId file_id)
 {
     auto get_tbl_partition = [this](const TableIdent &tbl_id)
     {
@@ -440,13 +476,13 @@ IouringMgr::LruFD::Ref IouringMgr::GetCachedFD(const TableIdent &tbl_id,
 }
 
 std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::GetFD(
-    const TableIdent &tbl_id, uint32_t file_id)
+    const TableIdent &tbl_id, FileId file_id)
 {
     return GetOrCreateFD(tbl_id, file_id, false);
 }
 
 std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::GetOrCreateFD(
-    const TableIdent &tbl_id, uint32_t file_id, bool create)
+    const TableIdent &tbl_id, FileId file_id, bool create)
 {
     LruFD::Ref lru_fd = GetCachedFD(tbl_id, file_id);
     if (lru_fd == nullptr)
@@ -473,13 +509,12 @@ std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::GetOrCreateFD(
                     fd = CreateDir(dir_fd_idx_, dirname.c_str());
                 }
             }
-            else if (file_id == LruFD::kManifest ||
-                     file_id == LruFD::kTmpManifest)
+            else if (file_id == LruFD::kManifest || file_id == LruFD::kTmpFile)
             {
-                std::string path = tbl_id.ToString();
-                path.push_back('/');
-                const char *filename =
-                    file_id == LruFD::kManifest ? mani_file : mani_tmpfile;
+                const char *filename = file_id == LruFD::kManifest
+                                           ? FileNameManifest
+                                           : FileNameTmpfile;
+                fs::path path = tbl_id.ToString();
                 path.append(filename);
                 fd = OpenAt(dir_fd_idx_, path.c_str(), O_RDWR);
                 if (fd == -ENOENT && create)
@@ -504,16 +539,15 @@ std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::GetOrCreateFD(
             else
             {
                 std::string filename = DataFileName(file_id);
-                std::string path = tbl_id.ToString();
-                path.push_back('/');
+                fs::path path = tbl_id.ToString();
                 path.append(filename);
-
                 fd = OpenAt(dir_fd_idx_, path.c_str(), O_RDWR | O_DIRECT);
                 if (fd == -ENOENT && create)
                 {
                     auto [dfd_ref, err] =
                         GetOrCreateFD(tbl_id, LruFD::kDirectiry);
                     error = err;
+                    assert(dfd_ref != nullptr);
                     if (dfd_ref != nullptr)
                     {
                         fd = OpenAt(dfd_ref.FdPair(),
@@ -522,12 +556,13 @@ std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::GetOrCreateFD(
                                     0644);
                         if (fd >= 0)
                         {
-                            // Multiple data files maybe created in one
+                            // Multiple data files may be created in one
                             // WriteTask. Table partition directory FD will be
                             // marked as dirty every time, but only fsync it
-                            // once when SyncFiles.
+                            // once when SyncData.
                             dfd_ref.Get()->dirty_ = true;
                         }
+                        assert(fd >= 0);
                     }
                 }
             }
@@ -538,9 +573,18 @@ std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::GetOrCreateFD(
                 {
                     error = ToKvError(fd);
                 }
-                LOG_IF(ERROR, fd != -ENOENT)
-                    << "open file/directory failed " << tbl_id << '@' << file_id
-                    << " : " << ErrorString(error);
+
+                if (file_id == LruFD::kManifest && error == KvError::NotFound)
+                {
+                    // Manifest not found, this is normal so don't log it.
+                }
+                else
+                {
+                    LOG(ERROR) << "open failed " << tbl_id << " file id "
+                               << file_id << " : " << ErrorString(error);
+                    assert(false);
+                }
+
                 lru_fd.Get()->fd_ = LruFD::FdEmpty;
                 // notify all waiting tasks failed
                 for (KvTask *task : lru_fd.Get()->loading_)
@@ -585,12 +629,12 @@ std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::GetOrCreateFD(
     return {std::move(lru_fd), KvError::NoError};
 }
 
-std::pair<uint32_t, uint32_t> IouringMgr::ConvFilePageId(
-    uint32_t file_page_id) const
+std::pair<FileId, uint32_t> IouringMgr::ConvFilePageId(
+    FilePageId file_page_id) const
 {
-    uint32_t file_id = file_page_id >> options_->num_file_pages_shift;
+    FileId file_id = file_page_id >> options_->pages_per_file_shift;
     uint32_t offset =
-        (file_page_id & ((1 << options_->num_file_pages_shift) - 1)) *
+        (file_page_id & ((1 << options_->pages_per_file_shift) - 1)) *
         options_->data_page_size;
     assert(!(offset & (page_align - 1)));
     return {file_id, offset};
@@ -648,8 +692,20 @@ void IouringMgr::PollComplete()
         case UserDataType::WriteReq:
         {
             WriteReq *req = static_cast<WriteReq *>(ptr);
-            KvError err =
-                cqe->res >= 0 ? KvError::NoError : ToKvError(cqe->res);
+            KvError err;
+            assert(cqe->res <= options_->data_page_size);
+            if (cqe->res < 0)
+            {
+                err = ToKvError(cqe->res);
+            }
+            else if (cqe->res < options_->data_page_size)
+            {
+                err = KvError::TryAgain;
+            }
+            else
+            {
+                err = KvError::NoError;
+            }
             req->task_->WritePageCallback(std::move(req->page_), err);
             task = req->task_;
             FreeWriteReq(req);
@@ -812,6 +868,43 @@ int IouringMgr::CloseFile(int fd)
     return res;
 }
 
+KvError IouringMgr::CloseFile(LruFD::Ref fd_ref)
+{
+    // This LruFD will be removed by ~Guard if succeed to close, otherwise be
+    // enqueued back to LRU.
+    LruFD *lru_fd = fd_ref.Get();
+    assert(lru_fd->ref_count_ == 1);
+    FdIdx fd_idx = lru_fd->FdPair();
+    int fd = lru_fd->fd_;
+
+    // Make sure no tasks can use this fd during closing.
+    lru_fd->fd_ = LruFD::FdLocked;
+
+    if (lru_fd->dirty_)
+    {
+        if (int res = Fdatasync(fd_idx); res < 0)
+        {
+            lru_fd->fd_ = fd;
+            return ToKvError(res);
+        }
+        lru_fd->dirty_ = false;
+    }
+
+    if (fd_idx.second)
+    {
+        UnregisterFile(fd_idx.first);
+        lru_fd->reg_idx_ = -1;
+    }
+
+    if (int res = CloseFile(fd); res < 0)
+    {
+        lru_fd->fd_ = fd;
+        return ToKvError(res);
+    }
+    lru_fd->fd_ = LruFD::FdEmpty;
+    return KvError::NoError;
+}
+
 bool IouringMgr::EvictFDIfFull()
 {
     while (lru_fd_count_ >= options_->fd_limit)
@@ -823,38 +916,7 @@ bool IouringMgr::EvictFDIfFull()
             return false;
         }
         assert(lru_fd->ref_count_ == 0);
-
-        // This fd will be enqueue again by ~Guard() when an error occurs
-        LruFD::Ref ref(lru_fd, this);
-
-        FdIdx fd_idx = lru_fd->FdPair();
-        int fd = lru_fd->fd_;
-        lru_fd->fd_ = LruFD::FdLocked;
-
-        if (lru_fd->dirty_)
-        {
-            if (Fdatasync(fd_idx) < 0)
-            {
-                LOG(ERROR) << "failed to fsync before evict fd";
-                lru_fd->fd_ = fd;
-                continue;
-            }
-            lru_fd->dirty_ = false;
-        }
-
-        if (fd_idx.second)
-        {
-            UnregisterFile(fd_idx.first);
-            lru_fd->reg_idx_ = -1;
-        }
-
-        if (CloseFile(fd) < 0)
-        {
-            LOG(ERROR) << "failed to close before evict fd";
-            lru_fd->fd_ = fd;
-            continue;
-        }
-        lru_fd->fd_ = LruFD::FdEmpty;
+        CloseFile(LruFD::Ref(lru_fd, this));
     }
     return true;
 }
@@ -958,10 +1020,67 @@ KvError IouringMgr::AppendManifest(const TableIdent &tbl_id,
     return KvError::NoError;
 }
 
+KvError IouringMgr::AtomicWriteFile(const TableIdent &tbl_id,
+                                    const char *name,
+                                    std::string_view content,
+                                    LruFD::Ref result)
+{
+    // Generate temporary file.
+    auto [tmp_ref, err] = GetOrCreateFD(tbl_id, LruFD::kTmpFile);
+    CHECK_KV_ERR(err);
+    int res = Write(tmp_ref.FdPair(), content.data(), content.size(), 0);
+    if (res < 0)
+    {
+        LOG(ERROR) << "write temporary file failed " << res;
+        return ToKvError(res);
+    }
+    TEST_KILL_POINT("AtomicWriteFile:before_fsync")
+    res = Fdatasync(tmp_ref.FdPair());
+    if (res < 0)
+    {
+        LOG(ERROR) << "fsync temporary file failed " << res;
+        return ToKvError(res);
+    }
+    TEST_KILL_POINT("AtomicWriteFile:after_fsync")
+
+    // Switch file on disk.
+    auto [dfd_ref, dir_err] = GetOrCreateFD(tbl_id, LruFD::kDirectiry);
+    CHECK_KV_ERR(dir_err);
+    TEST_KILL_POINT("AtomicWriteFile:before_name")
+    res = Rename(dfd_ref.FdPair(), FileNameTmpfile, name);
+    if (res < 0)
+    {
+        LOG(ERROR) << "rename temporary file failed " << res;
+        return ToKvError(res);
+    }
+    TEST_KILL_POINT("AtomicWriteFile:fsync_dir")
+    res = Fdatasync(dfd_ref.FdPair());
+    if (res < 0)
+    {
+        LOG(ERROR) << "fsync directory failed " << res;
+        return ToKvError(res);
+    }
+
+    if (result != nullptr)
+    {
+        // Switch file in memory
+        result.Get()->fd_ = tmp_ref.Get()->fd_;
+        result.Get()->reg_idx_ = tmp_ref.Get()->reg_idx_;
+        assert(tmp_ref.Get()->ref_count_ == 1);
+        tmp_ref.Get()->fd_ = LruFD::FdEmpty;
+        tmp_ref.Get()->reg_idx_ = -1;
+    }
+    else
+    {
+        err = CloseFile(std::move(tmp_ref));
+        CHECK(err == KvError::NoError);
+    }
+    return KvError::NoError;
+}
+
 KvError IouringMgr::SwitchManifest(const TableIdent &tbl_id,
                                    std::string_view snapshot)
 {
-    TEST_KILL_POINT("SwitchManifest:0")
     LOG(INFO) << "switch manifest file for " << tbl_id;
     // Unregister and close the old manifest if it is opened
     LruFD::Ref fd_ref = GetCachedFD(tbl_id, LruFD::kManifest);
@@ -969,6 +1088,7 @@ KvError IouringMgr::SwitchManifest(const TableIdent &tbl_id,
     {
         return KvError::OpenFileLimit;
     }
+    TEST_KILL_POINT("SwitchManifest:0")
     auto [old_fd, registered] = fd_ref.FdPair();
     if (old_fd >= 0)
     {
@@ -981,48 +1101,16 @@ KvError IouringMgr::SwitchManifest(const TableIdent &tbl_id,
     }
 
     TEST_KILL_POINT("SwitchManifest:1")
-    // Generate temporary manifest
-    auto [tmp_ref, err] = GetOrCreateFD(tbl_id, LruFD::kTmpManifest);
-    CHECK_KV_ERR(err);
-    int res = Write(tmp_ref.FdPair(), snapshot.data(), snapshot.size(), 0);
-    if (res < 0)
-    {
-        LOG(ERROR) << "init temporary manifest write failed " << res;
-        return ToKvError(res);
-    }
-    TEST_KILL_POINT("SwitchManifest:Fdatasync:0")
-    res = Fdatasync(tmp_ref.FdPair());
-    if (res < 0)
-    {
-        LOG(ERROR) << "init temporary manifest fsync failed " << res;
-        return ToKvError(res);
-    }
+    return AtomicWriteFile(
+        tbl_id, FileNameManifest, snapshot, std::move(fd_ref));
+}
 
-    TEST_KILL_POINT("SwitchManifest:3")
-    // Switch manifest on disk
-    auto [dfd_ref, dir_err] = GetOrCreateFD(tbl_id, LruFD::kDirectiry);
-    CHECK_KV_ERR(dir_err);
-    TEST_KILL_POINT("SwitchManifest:Rename")
-    res = Rename(dfd_ref.FdPair(), mani_tmpfile, mani_file);
-    if (res < 0)
-    {
-        LOG(ERROR) << "switch manifest rename failed " << res;
-        return ToKvError(res);
-    }
-    TEST_KILL_POINT("SwitchManifest:Fdatasync:2")
-    res = Fdatasync(dfd_ref.FdPair());
-    if (res < 0)
-    {
-        LOG(ERROR) << "switch manifest fsync directory failed " << res;
-        return ToKvError(res);
-    }
-
-    // Switch manifest in memory
-    fd_ref.Get()->fd_ = tmp_ref.Get()->fd_;
-    fd_ref.Get()->reg_idx_ = tmp_ref.Get()->reg_idx_;
-    tmp_ref.Get()->fd_ = LruFD::FdEmpty;
-    tmp_ref.Get()->reg_idx_ = -1;
-    return KvError::NoError;
+KvError IouringMgr::CreateArchive(const TableIdent &tbl_id,
+                                  std::string_view snapshot,
+                                  uint64_t ts)
+{
+    const std::string name = ArchiveName(ts);
+    return AtomicWriteFile(tbl_id, name.c_str(), snapshot, nullptr);
 }
 
 io_uring_sqe *IouringMgr::GetSQE(UserDataType type, const void *user_ptr)
@@ -1109,7 +1197,7 @@ KvError IouringMgr::Manifest::Read(char *dst, size_t n)
     return KvError::NoError;
 }
 
-IouringMgr::LruFD::LruFD(PartitionFiles *tbl, uint32_t file_id)
+IouringMgr::LruFD::LruFD(PartitionFiles *tbl, FileId file_id)
     : tbl_(tbl), file_id_(file_id)
 {
 }
@@ -1271,7 +1359,7 @@ IouringMgr::ReadReq::ReadReq(KvTask *task, LruFD::Ref fd, uint32_t offset)
     : task_(task),
       fd_ref_(std::move(fd)),
       offset_(offset),
-      page_(page_pool->Allocate())
+      page_(shard->PagePool()->Allocate())
 {
 }
 
@@ -1279,7 +1367,7 @@ IouringMgr::ReadReq::~ReadReq()
 {
     if (page_ != nullptr)
     {
-        page_pool->Free(std::move(page_));
+        shard->PagePool()->Free(std::move(page_));
     }
 }
 
@@ -1301,6 +1389,9 @@ void IouringMgr::WriteReq::SetPage(VarPage page)
     case 2:
         page_.emplace<OverflowPage>(std::move(std::get<OverflowPage>(page)));
         break;
+    case 3:
+        page_.emplace<Page>(std::move(std::get<Page>(page)));
+        break;
     }
 }
 
@@ -1314,7 +1405,7 @@ KvError MemStoreMgr::Init(int dir_fd)
 }
 
 std::pair<Page, KvError> MemStoreMgr::ReadPage(const TableIdent &tbl_id,
-                                               uint32_t fp_id,
+                                               FilePageId fp_id,
                                                Page page)
 {
     auto it = store_.find(tbl_id);
@@ -1333,20 +1424,21 @@ std::pair<Page, KvError> MemStoreMgr::ReadPage(const TableIdent &tbl_id,
 }
 
 KvError MemStoreMgr::ReadPages(const TableIdent &tbl_id,
-                               std::span<uint32_t> page_ids,
+                               std::span<FilePageId> page_ids,
                                std::vector<Page> &pages)
 {
     pages.clear();
     pages.reserve(page_ids.size());
-    for (uint32_t fp_id : page_ids)
+    for (FilePageId fp_id : page_ids)
     {
-        auto [page, err] = ReadPage(tbl_id, fp_id, page_pool->Allocate());
+        auto [page, err] =
+            ReadPage(tbl_id, fp_id, shard->PagePool()->Allocate());
         pages.push_back(std::move(page));
         if (err != KvError::NoError)
         {
             while (!pages.empty())
             {
-                page_pool->Free(std::move(pages.back()));
+                shard->PagePool()->Free(std::move(pages.back()));
                 pages.pop_back();
             }
             return err;
@@ -1368,7 +1460,7 @@ std::pair<ManifestFilePtr, KvError> MemStoreMgr::GetManifest(
 
 KvError MemStoreMgr::WritePage(const TableIdent &tbl_id,
                                VarPage page,
-                               uint32_t file_page_id)
+                               FilePageId file_page_id)
 {
     auto it = store_.find(tbl_id);
     if (it == store_.end())
@@ -1395,6 +1487,23 @@ KvError MemStoreMgr::WritePage(const TableIdent &tbl_id,
 
     static_cast<WriteTask *>(thd_task)->WritePageCallback(std::move(page),
                                                           KvError::NoError);
+    return KvError::NoError;
+}
+
+KvError MemStoreMgr::WritePages(const TableIdent &tbl_id,
+                                std::span<VarPage> pages,
+                                FilePageId first_fp_id)
+{
+    LOG(FATAL) << "not implemented";
+}
+
+KvError MemStoreMgr::SyncData(const TableIdent &tbl_id)
+{
+    return KvError::NoError;
+}
+
+KvError MemStoreMgr::AbortWrite(const TableIdent &tbl_id)
+{
     return KvError::NoError;
 }
 
@@ -1430,6 +1539,13 @@ KvError MemStoreMgr::SwitchManifest(const TableIdent &tbl_id,
     part.wal.clear();
     part.wal.append(snapshot);
     return KvError::NoError;
+}
+
+KvError MemStoreMgr::CreateArchive(const TableIdent &tbl_id,
+                                   std::string_view snapshot,
+                                   uint64_t ts)
+{
+    LOG(FATAL) << "not implemented";
 }
 
 KvError MemStoreMgr::Manifest::Read(char *dst, size_t n)

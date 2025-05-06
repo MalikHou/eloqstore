@@ -9,8 +9,8 @@ using namespace test_util;
 
 TEST_CASE("delete scan", "[scan]")
 {
-    InitMemStore();
-    MapVerifier verify(test_tbl_id, memstore.get());
+    kvstore::EloqStore *store = InitStore(mem_store_opts);
+    MapVerifier verify(test_tbl_id, store);
     verify.Upsert(1, 100);
     verify.Delete(50, 70);
     verify.Scan(100, 200);
@@ -20,8 +20,8 @@ TEST_CASE("delete scan", "[scan]")
 
 TEST_CASE("complex scan", "[scan]")
 {
-    InitMemStore();
-    MapVerifier verify(test_tbl_id, memstore.get());
+    kvstore::EloqStore *store = InitStore(mem_store_opts);
+    MapVerifier verify(test_tbl_id, store);
     verify.Upsert(1, 1000);
     verify.Upsert(2000, 3000);
     verify.Upsert(800, 1200);
@@ -41,8 +41,8 @@ TEST_CASE("complex scan", "[scan]")
 
 TEST_CASE("random write and scan", "[scan]")
 {
-    InitMemStore();
-    MapVerifier verify(test_tbl_id, memstore.get());
+    kvstore::EloqStore *store = InitStore(mem_store_opts);
+    MapVerifier verify(test_tbl_id, store);
     constexpr uint64_t max_val = 1000;
     for (int i = 0; i < 10; i++)
     {
@@ -57,8 +57,8 @@ TEST_CASE("random write and scan", "[scan]")
 
 TEST_CASE("paginate the scan results", "[scan]")
 {
-    InitMemStore();
-    MapVerifier verify(test_tbl_id, memstore.get(), false);
+    kvstore::EloqStore *store = InitStore(mem_store_opts);
+    MapVerifier verify(test_tbl_id, store, false);
     verify.SetValueSize(100);
     verify.WriteRnd(0, 10000, 0, 90);
     // Paginate by entries amount.

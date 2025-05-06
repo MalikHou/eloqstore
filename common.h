@@ -1,0 +1,37 @@
+#include "types.h"
+
+namespace kvstore
+{
+inline std::pair<std::string_view, std::string_view> ParseFileName(
+    std::string_view name)
+{
+    size_t pos = name.find(FileNameSeparator);
+    std::string_view file_type(name.data(), pos);
+    std::string_view file_id;
+    if (pos != std::string::npos)
+    {
+        file_id = std::string_view{name.data() + pos + 1};
+    }
+    return {file_type, file_id};
+}
+
+inline std::string DataFileName(FileId file_id)
+{
+    std::string name;
+    name.reserve(std::size(FileNameData) + 11);
+    name.append(FileNameData);
+    name.push_back(FileNameSeparator);
+    name.append(std::to_string(file_id));
+    return std::move(name);
+}
+
+inline std::string ArchiveName(uint64_t ts)
+{
+    std::string name;
+    name.reserve(std::size(FileNameManifest) + 20);
+    name.append(FileNameManifest);
+    name.push_back(FileNameSeparator);
+    name.append(std::to_string(ts));
+    return std::move(name);
+}
+}  // namespace kvstore

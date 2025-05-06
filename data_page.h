@@ -7,6 +7,7 @@
 #include "comparator.h"
 #include "kv_options.h"
 #include "page.h"
+#include "types.h"
 
 namespace kvstore
 {
@@ -23,8 +24,8 @@ class DataPage
 {
 public:
     DataPage() = default;
-    DataPage(uint32_t page_id, uint32_t page_size = 0);
-    DataPage(uint32_t page_id, Page page)
+    DataPage(PageId page_id, uint16_t page_size = 0);
+    DataPage(PageId page_id, Page page)
         : page_id_(page_id), page_(std::move(page)) {};
     DataPage(const DataPage &) = delete;
     DataPage(DataPage &&rhs);
@@ -34,26 +35,25 @@ public:
     static uint16_t const page_size_offset = page_type_offset + sizeof(uint8_t);
     static uint16_t const prev_page_offset =
         page_size_offset + sizeof(uint16_t);
-    static uint16_t const next_page_offset =
-        prev_page_offset + sizeof(uint32_t);
-    static uint16_t const content_offset = next_page_offset + sizeof(uint32_t);
+    static uint16_t const next_page_offset = prev_page_offset + sizeof(PageId);
+    static uint16_t const content_offset = next_page_offset + sizeof(PageId);
 
     bool IsEmpty() const;
     uint16_t ContentLength() const;
     uint16_t RestartNum() const;
-    uint32_t PrevPageId() const;
-    uint32_t NextPageId() const;
-    void SetPrevPageId(uint32_t page_id);
-    void SetNextPageId(uint32_t page_id);
-    void SetPageId(uint32_t page_id);
-    uint32_t PageId() const;
+    PageId PrevPageId() const;
+    PageId NextPageId() const;
+    void SetPrevPageId(PageId page_id);
+    void SetNextPageId(PageId page_id);
+    void SetPageId(PageId page_id);
+    PageId GetPageId() const;
     char *PagePtr() const;
     Page GetPtr();
     void SetPtr(Page ptr);
     void Clear();
 
 private:
-    uint32_t page_id_{UINT32_MAX};
+    PageId page_id_{MaxPageId};
     Page page_{nullptr, std::free};
 };
 
@@ -118,17 +118,17 @@ class OverflowPage
 {
 public:
     OverflowPage() = default;
-    OverflowPage(uint32_t page_id, Page page);
-    OverflowPage(uint32_t page_id,
+    OverflowPage(PageId page_id, Page page);
+    OverflowPage(PageId page_id,
                  const KvOptions *opts,
                  std::string_view val,
-                 std::span<uint32_t> pointers = {});
+                 std::span<PageId> pointers = {});
     OverflowPage(const OverflowPage &) = delete;
     OverflowPage(OverflowPage &&rhs);
     ~OverflowPage();
     void Clear();
-    void SetPageId(uint32_t page_id);
-    uint32_t PageId() const;
+    void SetPageId(PageId page_id);
+    PageId GetPageId() const;
     char *PagePtr() const;
     uint16_t ValueSize() const;
     std::string_view GetValue() const;
@@ -147,7 +147,7 @@ public:
     static const uint16_t header_size = value_offset;
 
 private:
-    uint32_t page_id_{UINT32_MAX};
+    PageId page_id_{MaxPageId};
     Page page_{nullptr, std::free};
 };
 }  // namespace kvstore

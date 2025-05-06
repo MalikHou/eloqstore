@@ -9,19 +9,20 @@
 
 #include "coding.h"
 #include "kv_options.h"
+#include "shard.h"
 
 namespace kvstore
 {
-DataPage::DataPage(uint32_t page_id, uint32_t page_size) : page_id_(page_id)
+DataPage::DataPage(PageId page_id, uint16_t page_size) : page_id_(page_id)
 {
     if (page_size == 0)
     {
         return;
     }
 
-    if (page_pool != nullptr)
+    if (shard != nullptr)
     {
-        page_ = page_pool->Allocate();
+        page_ = shard->PagePool()->Allocate();
     }
     else
     {
@@ -65,32 +66,32 @@ uint16_t DataPage::RestartNum() const
     return DecodeFixed16(page_.get() + ContentLength() - sizeof(uint16_t));
 }
 
-uint32_t DataPage::PrevPageId() const
+PageId DataPage::PrevPageId() const
 {
     return DecodeFixed32(page_.get() + prev_page_offset);
 }
 
-uint32_t DataPage::NextPageId() const
+PageId DataPage::NextPageId() const
 {
     return DecodeFixed32(page_.get() + next_page_offset);
 }
 
-void DataPage::SetPrevPageId(uint32_t page_id)
+void DataPage::SetPrevPageId(PageId page_id)
 {
     EncodeFixed32(page_.get() + prev_page_offset, page_id);
 }
 
-void DataPage::SetNextPageId(uint32_t page_id)
+void DataPage::SetNextPageId(PageId page_id)
 {
     EncodeFixed32(page_.get() + next_page_offset, page_id);
 }
 
-void DataPage::SetPageId(uint32_t page_id)
+void DataPage::SetPageId(PageId page_id)
 {
     page_id_ = page_id;
 }
 
-uint32_t DataPage::PageId() const
+PageId DataPage::GetPageId() const
 {
     return page_id_;
 }
@@ -114,9 +115,9 @@ void DataPage::Clear()
 {
     if (page_ != nullptr)
     {
-        if (page_pool != nullptr)
+        if (shard != nullptr)
         {
-            page_pool->Free(std::move(page_));
+            shard->PagePool()->Free(std::move(page_));
         }
         else
         {
@@ -127,7 +128,7 @@ void DataPage::Clear()
 
 std::ostream &operator<<(std::ostream &out, DataPage const &page)
 {
-    out << "{D" << page.PageId() << '|';
+    out << "{D" << page.GetPageId() << '|';
     out << page.PrevPageId() << ',' << page.NextPageId() << '}';
     return out;
 }
@@ -401,16 +402,16 @@ const char *DataPageIter::DecodeEntry(const char *p,
     return p;
 }
 
-OverflowPage::OverflowPage(uint32_t page_id, Page page)
+OverflowPage::OverflowPage(PageId page_id, Page page)
     : page_id_(page_id), page_(std::move(page))
 {
     assert(TypeOfPage(page_.get()) == PageType::Overflow);
 }
 
-OverflowPage::OverflowPage(uint32_t page_id,
+OverflowPage::OverflowPage(PageId page_id,
                            const KvOptions *opts,
                            std::string_view val,
-                           std::span<uint32_t> pointers)
+                           std::span<PageId> pointers)
     : page_id_(page_id)
 {
     if (opts->data_page_size == 0)
@@ -418,9 +419,9 @@ OverflowPage::OverflowPage(uint32_t page_id,
         return;
     }
 
-    if (page_pool != nullptr)
+    if (shard != nullptr)
     {
-        page_ = page_pool->Allocate();
+        page_ = shard->PagePool()->Allocate();
     }
     else
     {
@@ -436,15 +437,13 @@ OverflowPage::OverflowPage(uint32_t page_id,
     *dst = pointers.size();
     if (!pointers.empty())
     {
-        dst -= (pointers.size() * sizeof(uint32_t));
-        for (uint32_t p : pointers)
+        dst -= (pointers.size() * sizeof(PageId));
+        for (PageId p : pointers)
         {
             EncodeFixed32(dst, p);
-            dst += sizeof(uint32_t);
+            dst += sizeof(PageId);
         }
     }
-
-    SetPageChecksum(page_.get(), opts->data_page_size);
     assert(NumPointers(opts) == pointers.size());
 }
 
@@ -462,9 +461,9 @@ void OverflowPage::Clear()
 {
     if (page_ != nullptr)
     {
-        if (page_pool != nullptr)
+        if (shard != nullptr)
         {
-            page_pool->Free(std::move(page_));
+            shard->PagePool()->Free(std::move(page_));
         }
         else
         {
@@ -483,12 +482,12 @@ std::string_view OverflowPage::GetValue() const
     return {page_.get() + value_offset, ValueSize()};
 }
 
-void OverflowPage::SetPageId(uint32_t page_id)
+void OverflowPage::SetPageId(PageId page_id)
 {
     page_id_ = page_id;
 }
 
-uint32_t OverflowPage::PageId() const
+PageId OverflowPage::GetPageId() const
 {
     return page_id_;
 }
@@ -505,7 +504,7 @@ uint16_t OverflowPage::Capacity(const KvOptions *options, bool end)
     if (end)
     {
         // The end page of a overflow group has pointers to the next group.
-        cap -= (options->overflow_pointers * sizeof(uint32_t));
+        cap -= (options->overflow_pointers * sizeof(PageId));
     }
     return cap;
 }

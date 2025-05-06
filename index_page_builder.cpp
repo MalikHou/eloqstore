@@ -70,7 +70,7 @@ std::string_view IndexPageBuilder::Finish()
 }
 
 bool IndexPageBuilder::Add(std::string_view key,
-                           uint32_t page_id,
+                           PageId page_id,
                            bool is_leaf_index)
 {
     if (IsEmpty())

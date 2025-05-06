@@ -8,7 +8,7 @@
 #include "comparator.h"
 #include "data_page.h"
 #include "error.h"
-#include "table_ident.h"
+#include "types.h"
 
 namespace kvstore
 {
@@ -18,11 +18,11 @@ class IndexPageManager;
 class AsyncIoManager;
 class KvOptions;
 class TaskManager;
-class PagePool;
+class PagesPool;
 class MappingSnapshot;
+class Shard;
 
-inline thread_local IndexPageManager *index_mgr;
-inline thread_local TaskManager *task_mgr;
+inline thread_local Shard *shard;
 inline thread_local KvTask *thd_task;
 
 AsyncIoManager *IoMgr();
@@ -43,7 +43,9 @@ enum struct TaskType
     Read = 0,
     Scan,
     BatchWrite,
-    Truncate
+    Truncate,
+    Compact,
+    Archive
 };
 
 using boost::context::continuation;
@@ -66,13 +68,13 @@ public:
     void FinishIo(bool is_sync_io);
 
     std::pair<Page, KvError> LoadPage(const TableIdent &tbl_id,
-                                      uint32_t file_page_id);
+                                      FilePageId file_page_id);
     std::pair<DataPage, KvError> LoadDataPage(const TableIdent &tbl_id,
-                                              uint32_t page_id,
-                                              uint32_t file_page_id);
+                                              PageId page_id,
+                                              FilePageId file_page_id);
     std::pair<OverflowPage, KvError> LoadOverflowPage(const TableIdent &tbl_id,
-                                                      uint32_t page_id,
-                                                      uint32_t file_page_id);
+                                                      PageId page_id,
+                                                      FilePageId file_page_id);
 
     /**
      * @brief Get overflow value.
@@ -92,7 +94,11 @@ public:
      */
     static uint8_t DecodeOverflowPointers(
         std::string_view encoded,
-        std::span<uint32_t, max_overflow_pointers> pointers);
+        std::span<PageId, max_overflow_pointers> pointers);
+    static uint8_t DecodeOverflowPointers(
+        std::string_view encoded,
+        std::span<FilePageId, max_overflow_pointers> pointers,
+        const MappingSnapshot *mapping);
 
     TaskStatus status_{TaskStatus::Idle};
 
@@ -101,9 +107,6 @@ public:
     uint32_t io_flags_{0};
 
     KvRequest *req_{nullptr};
-    // TODO: main_ should be a member of class Worker, and a thread local
-    // variable of type Worker* is needed on every thread.
-    boost::context::continuation main_;
     boost::context::continuation coro_;
 };
 

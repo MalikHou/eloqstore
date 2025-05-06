@@ -2,33 +2,47 @@
 
 #include <cstdint>
 #include <memory>
-#include <set>
 #include <string>
-#include <string_view>
 #include <vector>
 
-#include "table_ident.h"
-
-#define MAPPING_BITS 2
-#define MAPPING_MASK ((1 << MAPPING_BITS) - 1)
-#define MAPPING_PHYSICAL 1
-#define MAPPING_LOGICAL (1 << 1)
+#include "types.h"
 
 namespace kvstore
 {
 class IndexPageManager;
 class MemIndexPage;
+class ManifestBuilder;
+struct KvOptions;
 
 struct MappingSnapshot
 {
-    MappingSnapshot(IndexPageManager *idx_mgr, const TableIdent *tbl);
+    MappingSnapshot(IndexPageManager *idx_mgr, const TableIdent *tbl_id);
+    MappingSnapshot(IndexPageManager *idx_mgr,
+                    const TableIdent *tbl_id,
+                    std::vector<uint64_t> tbl)
+        : idx_mgr_(idx_mgr),
+          tbl_ident_(tbl_id),
+          mapping_tbl_(std::move(tbl)) {};
     ~MappingSnapshot();
 
-    uint32_t ToFilePage(uint32_t page_id) const;
-    uint32_t GetNextFree(uint32_t page_id) const;
+    static constexpr uint8_t TypeBits = 3;
+    static constexpr uint8_t TypeMask = (1 << TypeBits) - 1;
+    enum class ValType : uint8_t
+    {
+        SwizzlingPointer = 0,
+        FilePageId,
+        PageId,
+        Invalid = TypeMask
+    };
+    static constexpr uint64_t InvalidValue = uint64_t(ValType::Invalid);
 
-    void AddFreeFilePage(uint32_t file_page);
-    void AbortFreeFilePage();
+    FilePageId ToFilePage(PageId page_id) const;
+    FilePageId ToFilePage(uint64_t val) const;
+
+    PageId GetNextFree(PageId page_id) const;
+
+    void AddFreeFilePage(FilePageId file_page);
+    void ClearFreeFilePage();
 
     /**
      * @brief Replaces the swizzling pointer with the file page Id.
@@ -36,12 +50,15 @@ struct MappingSnapshot
      * @param page
      */
     void Unswizzling(MemIndexPage *page);
-    MemIndexPage *GetSwizzlingPointer(uint32_t page_id) const;
-    void AddSwizzling(uint32_t page_id, MemIndexPage *idx_page);
-    static bool IsSwizzlingPointer(uint64_t val);
+    MemIndexPage *GetSwizzlingPointer(PageId page_id) const;
+    void AddSwizzling(PageId page_id, MemIndexPage *idx_page);
 
+    static bool IsSwizzlingPointer(uint64_t val);
     static bool IsFilePageId(uint64_t val);
-    static bool IsLogicalPageId(uint64_t val);
+    static ValType GetValType(uint64_t val);
+    static uint64_t EncodeFilePageId(FilePageId file_page_id);
+    static uint64_t EncodePageId(PageId page_id);
+    static uint64_t DecodeId(uint64_t val);
 
     void Serialize(std::string &dst) const;
 
@@ -55,60 +72,133 @@ struct MappingSnapshot
      * this snapshot.
      *
      */
-    std::vector<uint32_t> to_free_file_pages_;
+    std::vector<FilePageId> to_free_file_pages_;
+};
+
+/**
+ * @brief FilePageAllocator is used to allocate file page id.
+ */
+class FilePageAllocator
+{
+public:
+    static std::unique_ptr<FilePageAllocator> Instance(const KvOptions *opts);
+
+    FilePageAllocator(const KvOptions *opts, FilePageId max_id = 0);
+    FilePageAllocator(const FilePageAllocator &rhs) = default;
+    virtual ~FilePageAllocator() = default;
+    virtual FilePageId Allocate();
+    virtual std::unique_ptr<FilePageAllocator> Clone() = 0;
+
+    FileId CurrentFileId() const;
+    FilePageId MaxFilePageId() const;
+    uint32_t PagesPerFile() const;
+
+protected:
+    const uint8_t pages_per_file_shift_;
+    /**
+     * @brief (max_fp_id_ - 1) is the maximum allocated file page id, so
+     * max_fp_id_ is the smallest unallocated file page id.
+     */
+    FilePageId max_fp_id_;
+};
+
+/**
+ * @brief AppendAllocator is used to allocate file page id in append mode.
+ * The file page id is allocated in a sequential manner. The file page id is
+ * divided into files. Each file contains a fixed number of pages. The file id
+ * is the quotient of the file page id divided by the number of pages per file.
+ */
+class AppendAllocator : public FilePageAllocator
+{
+public:
+    AppendAllocator(const KvOptions *opts)
+        : FilePageAllocator(opts, 0), min_file_id_(0), empty_file_cnt_(0) {};
+    AppendAllocator(const KvOptions *opts,
+                    FileId min_file_id,
+                    FilePageId max_fp_id,
+                    uint32_t empty_cnt)
+        : FilePageAllocator(opts, max_fp_id),
+          min_file_id_(min_file_id),
+          empty_file_cnt_(empty_cnt) {};
+    AppendAllocator(const AppendAllocator &rhs) = default;
+    std::unique_ptr<FilePageAllocator> Clone() override;
+
+    void UpdateStat(FileId min_file_id, uint32_t hole_cnt);
+    /**
+     * @brief Calculates how many file pages this allocator used.
+     */
+    size_t SpaceSize() const;
+
+private:
+    /**
+     * @brief The first file that is not empty after last compaction.
+     */
+    FilePageId min_file_id_;
+    /**
+     * @brief The number of empty file id bigger than min_file_id_ after last
+     * compaction.
+     */
+    uint32_t empty_file_cnt_;
+};
+
+/**
+ * @brief PooledFilePages is used to allocate file page id in pooled mode.
+ * The file page id is allocated in a random manner.
+ */
+class PooledFilePages : public FilePageAllocator
+{
+public:
+    PooledFilePages(const KvOptions *opts) : FilePageAllocator(opts) {};
+    PooledFilePages(const KvOptions *opts,
+                    FilePageId next_id,
+                    std::vector<uint32_t> free_ids)
+        : FilePageAllocator(opts, next_id), free_ids_(std::move(free_ids)) {};
+    PooledFilePages(const PooledFilePages &rhs) = default;
+    std::unique_ptr<FilePageAllocator> Clone() override;
+
+    FilePageId Allocate() override;
+    void Free(std::vector<FilePageId> fp_ids);
+
+private:
+    /**
+     * @brief A list of free file page ids.
+     * uint32_t is enough to store FilePageId because ids will be reused.
+     */
+    std::vector<uint32_t> free_ids_;
 };
 
 class PageMapper
 {
 public:
-    PageMapper();
+    PageMapper(std::shared_ptr<MappingSnapshot> mapping)
+        : mapping_(std::move(mapping)) {};
     PageMapper(IndexPageManager *idx_mgr, const TableIdent *tbl_ident);
     PageMapper(const PageMapper &rhs);
 
-    uint32_t GetPage();
-    uint32_t GetFilePage();
-    void InitPages(uint32_t page_count);
-    void FreePage(uint32_t page_id);
-    void FreeFilePages(std::vector<uint32_t> file_pages);
-    void FreeFilePage(uint32_t file_page);
+    PageId GetPage();
+    void FreePage(PageId page_id);
+    FilePageAllocator *FilePgAllocator() const;
 
-    std::shared_ptr<MappingSnapshot> GetMappingSnapshot();
+    /**
+     * @brief Returns the number of valid mapping. Every mapping is a pair of
+     * logical page id and file page id.
+     */
+    uint32_t MappingCount() const;
+
+    std::shared_ptr<MappingSnapshot> GetMappingSnapshot() const;
     MappingSnapshot *GetMapping() const;
-    void UpdateMapping(uint32_t page_id, uint32_t file_page_id);
+    void UpdateMapping(PageId page_id, FilePageId file_page_id);
     uint32_t UseCount();
     void FreeMappingSnapshot();
 
-    static uint64_t EncodeFilePageId(uint32_t file_page_id);
-    static uint64_t EncodeLogicalPageId(uint32_t page_id);
-    static uint32_t DecodePageId(uint64_t val);
-
-    void Serialize(std::string &dst) const;
-    std::string_view Deserialize(std::string_view src);
-    bool EqualTo(const PageMapper &rhs) const;
-
 private:
+    const KvOptions *Options() const;
     std::vector<uint64_t> &Mapping();
 
-    uint32_t ExpandFilePage();
-    bool DequeFreePage(uint32_t page_id);
-
-    /**
-     * @brief Gets a free file page. The implementation now returns the smaller
-     * file page from the free file page pool. It's more desirable to return
-     * from a file who has most free pages. This would reduce replication
-     * amplification, when replication granularity is on files.
-     *
-     * @return The free file page Id, if the free page pool is not empty. Or,
-     * UINT32_MAX.
-     */
-    uint32_t GetFreeFilePage();
-
     std::shared_ptr<MappingSnapshot> mapping_;
-    uint32_t free_page_head_{UINT32_MAX};
-
-    std::set<uint32_t> free_file_pages_;
-    uint32_t min_file_page_id_{UINT32_MAX};
-    uint32_t max_file_page_id_{0};
+    PageId free_page_head_{MaxPageId};
+    uint32_t free_page_cnt_{0};
+    std::unique_ptr<FilePageAllocator> file_page_allocator_{nullptr};
 
     friend class Replayer;
 };

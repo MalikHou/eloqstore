@@ -22,6 +22,26 @@ if ((NOT URING_INCLUDE_PATH) OR (NOT URING_LIB))
     message(FATAL_ERROR "Fail to find liburing")
 endif()
 
+find_package(Git QUIET)
+if(GIT_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/.git")
+    option(GIT_SUBMODULE "Check submodules during build" ON)
+    if(GIT_SUBMODULE)
+        # Update submodules as needed
+        message(STATUS "Submodule update")
+        execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
+                        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                        RESULT_VARIABLE GIT_SUBMOD_RESULT)
+        if(NOT GIT_SUBMOD_RESULT EQUAL "0")
+            message(FATAL_ERROR "git submodule update --init --recursive failed with ${GIT_SUBMOD_RESULT}, please checkout submodules")
+        endif()
+    endif()
+endif()
+
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/concurrentqueue/CMakeLists.txt")
+    message(FATAL_ERROR "The submodules were not downloaded! GIT_SUBMODULE was turned off or failed. Please update submodules and try again.")
+endif()
+add_subdirectory(concurrentqueue)
+
 add_executable(io_uring_test io_uring_test.cpp)
 target_link_libraries(io_uring_test ${URING_LIB})
 
@@ -48,19 +68,26 @@ set(ELOQ_STORE_SOURCES
     mem_index_page.cpp
     index_page_manager.cpp
     task.cpp
-    write_task.cpp
     read_task.cpp
     scan_task.cpp
+    write_task.cpp
+    batch_write_task.cpp
+    truncate_task.cpp
+    compact_task.cpp
+    archive_task.cpp
     write_tree_stack.cpp
     async_io_manager.cpp
     data_page.cpp
     page_mapper.cpp
     task_manager.cpp
     eloq_store.cpp
+    shard.cpp
     root_meta.cpp
     replayer.cpp
     xxhash.c
     kill_point.cpp
+    file_gc.cpp
+    archive_crond.cpp
     test_utils.cpp)
 
 add_library(eloqstore STATIC ${ELOQ_STORE_SOURCES})

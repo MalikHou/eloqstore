@@ -20,7 +20,6 @@ enum struct KvError : uint8_t
     OutOfSpace,
     OutOfMem,
     Corrupted,
-    BadDir,
     WriteConflict,
     OpenFileLimit,
     TryAgain,
@@ -48,8 +47,6 @@ constexpr const char *ErrorString(KvError err)
         return "Out of memory";
     case KvError::Corrupted:
         return "Disk data corrupted";
-    case KvError::BadDir:
-        return "Bad directory";
     case KvError::WriteConflict:
         return "Write conflict at one table partition";
     case KvError::OpenFileLimit:

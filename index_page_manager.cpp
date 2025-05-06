@@ -13,8 +13,8 @@
 #include "page_mapper.h"
 #include "replayer.h"
 #include "root_meta.h"
-#include "table_ident.h"
 #include "task.h"
+#include "types.h"
 
 namespace kvstore
 {
@@ -161,16 +161,14 @@ KvError IndexPageManager::MakeCowRoot(const TableIdent &tbl_ident,
 }
 
 void IndexPageManager::UpdateRoot(const TableIdent &tbl_ident,
-                                  MemIndexPage *new_root,
-                                  std::unique_ptr<PageMapper> new_mapper,
-                                  uint64_t manifest_size)
+                                  CowRootMeta new_meta)
 {
     auto tbl_it = tbl_roots_.find(tbl_ident);
     assert(tbl_it != tbl_roots_.end());
     RootMeta &meta = tbl_it->second;
-    meta.root_page_ = new_root;
-    meta.mapper_ = std::move(new_mapper);
-    meta.manifest_size_ = manifest_size;
+    meta.root_page_ = new_meta.root_;
+    meta.mapper_ = std::move(new_meta.mapper_);
+    meta.manifest_size_ = new_meta.manifest_size_;
 }
 
 KvError IndexPageManager::LoadTablePartition(const TableIdent &tbl_id)
@@ -192,8 +190,8 @@ KvError IndexPageManager::LoadTablePartition(const TableIdent &tbl_id)
         CHECK_KV_ERR(err);
 
         // replay
-        Replayer replayer;
-        err = replayer.Replay(std::move(manifest), Options());
+        Replayer replayer(Options());
+        err = replayer.Replay(manifest.get());
         if (err != KvError::NoError)
         {
             LOG(ERROR) << "load evicted table: replay failed";
@@ -201,33 +199,40 @@ KvError IndexPageManager::LoadTablePartition(const TableIdent &tbl_id)
         }
 
         // load root page
-        uint32_t root_id = replayer.root_;
-        uint32_t root_fp_id;
+        PageId root_id = replayer.root_;
         MemIndexPage *root_page = nullptr;
-        if (root_id != UINT32_MAX)
+        if (root_id != MaxPageId)
         {
             root_page = AllocIndexPage();
             if (root_page == nullptr)
             {
                 return KvError::OutOfMem;
             }
-            root_fp_id = replayer.mapper_->GetMapping()->ToFilePage(root_id);
-            auto [page, err] = IoMgr()->ReadPage(
-                tbl_id, root_fp_id, std::move(root_page->page_));
+            FilePageId fp_id =
+                MappingSnapshot::DecodeId(replayer.mapping_tbl_[root_id]);
+            auto [page, err] =
+                IoMgr()->ReadPage(tbl_id, fp_id, std::move(root_page->page_));
             root_page->page_ = std::move(page);
             if (err != KvError::NoError)
             {
                 FreeIndexPage(root_page);
+                LOG(ERROR) << "load evicted table: read root file page "
+                           << fp_id << " failed: " << ErrorString(err);
+                // We only return NotFound when manifest not exist.
+                if (err == KvError::NotFound)
+                {
+                    err = KvError::Corrupted;
+                }
                 return err;
             }
             root_page->SetPageId(root_id);
-            root_page->SetFilePageId(root_fp_id);
+            root_page->SetFilePageId(fp_id);
         }
 
         auto [it, b] = tbl_roots_.try_emplace(tbl_id);
         assert(b);
         RootMeta &meta = it->second;
-        auto mapper = replayer.Mapper(this, &it->first);
+        auto mapper = replayer.GetMapper(this, &it->first);
         MappingSnapshot *mapping = mapper->GetMapping();
         meta.mapper_ = std::move(mapper);
         meta.mapping_snapshots_.insert(mapping);
@@ -250,7 +255,7 @@ KvError IndexPageManager::LoadTablePartition(const TableIdent &tbl_id)
 }
 
 std::pair<MemIndexPage *, KvError> IndexPageManager::FindPage(
-    MappingSnapshot *mapping, uint32_t page_id)
+    MappingSnapshot *mapping, PageId page_id)
 {
     // First checks swizzling pointers.
     MemIndexPage *idx_page = mapping->GetSwizzlingPointer(page_id);
@@ -294,7 +299,7 @@ std::pair<MemIndexPage *, KvError> IndexPageManager::FindPage(
             }
 
             // Read the page async.
-            uint32_t file_page_id = mapping->ToFilePage(page_id);
+            FilePageId file_page_id = mapping->ToFilePage(page_id);
             auto [page, err] = IoMgr()->ReadPage(
                 *mapping->tbl_ident_, file_page_id, std::move(new_page->page_));
             new_page->page_ = std::move(page);
@@ -328,13 +333,19 @@ void IndexPageManager::FreeMappingSnapshot(MappingSnapshot *mapping)
 {
     const TableIdent &tbl = *mapping->tbl_ident_;
     auto tbl_it = tbl_roots_.find(tbl);
-    assert(tbl_it != tbl_roots_.end());
+    if (tbl_it == tbl_roots_.end())
+    {
+        return;
+    }
     RootMeta &meta = tbl_it->second;
     // Puts back file pages freed in this mapping snapshot
     if (!mapping->to_free_file_pages_.empty())
     {
         assert(meta.mapper_ != nullptr);
-        meta.mapper_->FreeFilePages(std::move(mapping->to_free_file_pages_));
+        assert(!Options()->data_append_mode);
+        auto pool =
+            static_cast<PooledFilePages *>(meta.mapper_->FilePgAllocator());
+        pool->Free(std::move(mapping->to_free_file_pages_));
     }
     meta.mapping_snapshots_.erase(mapping);
 }
@@ -423,10 +434,10 @@ bool IndexPageManager::RecyclePage(MemIndexPage *page)
 
     // Removes the page from the active list.
     page->Deque();
-    assert(page->page_id_ != UINT32_MAX);
-    assert(page->file_page_id_ != UINT32_MAX);
-    page->page_id_ = UINT32_MAX;
-    page->file_page_id_ = UINT32_MAX;
+    assert(page->page_id_ != MaxPageId);
+    assert(page->file_page_id_ != MaxFilePageId);
+    page->page_id_ = MaxPageId;
+    page->file_page_id_ = MaxFilePageId;
     page->tbl_ident_ = nullptr;
 
     FreeIndexPage(page);
@@ -437,7 +448,7 @@ void IndexPageManager::FinishIo(MappingSnapshot *mapping,
                                 MemIndexPage *idx_page)
 {
     idx_page->tbl_ident_ = mapping->tbl_ident_;
-    mapping->AddSwizzling(idx_page->PageId(), idx_page);
+    mapping->AddSwizzling(idx_page->GetPageId(), idx_page);
 
     auto tbl_it = tbl_roots_.find(*mapping->tbl_ident_);
     assert(tbl_it != tbl_roots_.end());
@@ -485,8 +496,8 @@ KvError IndexPageManager::SeekIndex(MappingSnapshot *mapping,
 {
     IndexPageIter idx_it{node, Options()};
     idx_it.Seek(key);
-    uint32_t page_id = idx_it.PageId();
-    if (node->IsPointingToLeaf() || page_id == UINT32_MAX)
+    PageId page_id = idx_it.GetPageId();
+    if (node->IsPointingToLeaf() || page_id == MaxPageId)
     {
         // Updates the cache replacement list.
         assert(!node->IsDetached());

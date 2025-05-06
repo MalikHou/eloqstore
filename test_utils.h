@@ -5,19 +5,17 @@
 #include <string>
 
 #include "eloq_store.h"
-#include "table_ident.h"
+#include "types.h"
 
 // https://github.com/cameron314/concurrentqueue/issues/280
 #undef BLOCK_SIZE
-#include "concurrentqueue.h"
+#include "concurrentqueue/concurrentqueue.h"
 
 namespace test_util
 {
 std::string Key(uint64_t k);
 std::string Value(uint64_t val, uint32_t len = 0);
 void CheckKvEntry(const kvstore::KvEntry &left, const kvstore::KvEntry &right);
-
-uint64_t UnixTimestamp();
 
 inline uint32_t decode_key(const char *ptr)
 {
@@ -81,12 +79,13 @@ public:
     ConcurrencyTester(kvstore::EloqStore *store,
                       std::string tbl_name,
                       uint32_t n_partitions,
-                      uint8_t seg_size,
-                      uint16_t seg_count);
+                      uint16_t seg_count,
+                      uint8_t seg_size = 16);
     void Init();
     void Run(uint32_t rounds, uint32_t interval, uint16_t n_readers);
     void Clear();
 
+    static uint64_t CurrentTimestamp();
     static constexpr uint32_t average_v = 10;
 
 private:
@@ -147,16 +146,21 @@ public:
     void Finish();
     void Snapshot();
 
-    void Verify() const;
+    void Verify();
     uint32_t Size() const;
 
 private:
-    std::pair<uint32_t, uint32_t> RandChoose();
+    std::pair<kvstore::PageId, kvstore::FilePageId> RandChoose();
 
     kvstore::KvOptions options_;
+    kvstore::MemStoreMgr io_mgr_;
+    kvstore::IndexPageManager idx_mgr_;
+    kvstore::TableIdent tbl_id_;
+
     uint32_t root_id_;
     kvstore::PageMapper answer_;
-    std::unordered_map<uint32_t, uint32_t> helper_;
+    kvstore::PooledFilePages *answer_file_pages_{nullptr};
+    std::unordered_map<kvstore::PageId, kvstore::FilePageId> helper_;
 
     kvstore::ManifestBuilder builder_;
     std::string file_;

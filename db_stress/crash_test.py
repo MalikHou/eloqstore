@@ -37,7 +37,7 @@ default_params = {
     "index_page_read_queue" : lambda:random.randint(500,1000),#default 1024
     "index_buffer_pool_size" : lambda:random.randint(32768,8388608),#default UINT32_MAX
     "init_page_count" : 1 << 15,#default 1<<15
-    "num_file_pages_shift" : lambda:11,   #default 11  
+    "pages_per_file_shift" : lambda:11,   #default 11  
     "manifest_limit" : lambda:random.randint(2,16) <<20,#default 8<<20
     "fd_limit" : lambda:random.randint(500,2000),#default 1024
     "io_queue_size" : lambda:random.choice([1024, 2048,4096]),#default 4096

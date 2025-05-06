@@ -59,10 +59,10 @@ inline Page AllocPage(uint16_t page_size)
     return Page(p, std::free);
 }
 
-class PagePool
+class PagesPool
 {
 public:
-    PagePool(uint16_t page_size) : page_size_(page_size) {};
+    PagesPool(uint16_t page_size) : page_size_(page_size) {};
     Page Allocate()
     {
         if (pages_.empty())
@@ -86,5 +86,4 @@ private:
     std::vector<Page> pages_;
 };
 
-inline thread_local PagePool *page_pool;
 }  // namespace kvstore

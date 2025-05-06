@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "kv_options.h"
+#include "types.h"
 
 namespace kvstore
 {
@@ -20,7 +21,7 @@ public:
 
     void Reset();
 
-    bool Add(std::string_view key, uint32_t page_id, bool is_leaf_index);
+    bool Add(std::string_view key, PageId page_id, bool is_leaf_index);
 
     std::string_view Finish();
 

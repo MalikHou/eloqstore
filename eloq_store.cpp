@@ -3,73 +3,22 @@
 #include <glog/logging.h>
 
 #include <atomic>
-#include <boost/context/pooled_fixedsize_stack.hpp>
 #include <cassert>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <vector>
 
-#include "task_manager.h"
-
-// https://github.com/cameron314/concurrentqueue/issues/280
-#undef BLOCK_SIZE
-#include "concurrentqueue.h"
+#include "archive_crond.h"
+#include "file_gc.h"
+#include "shard.h"
 
 namespace fs = std::filesystem;
 
 namespace kvstore
 {
-class Worker
-{
-public:
-    Worker(const EloqStore *store);
-    ~Worker();
-    KvError Init(int dir_fd);
-    void Start();
-    void Stop();
-    bool AddRequest(KvRequest *req);
-
-private:
-    void Loop();
-    void OnReceiveReq(KvRequest *req);
-    void HandleReq(KvRequest *req);
-    void PollFinished();
-
-    template <typename F>
-    void StartTask(KvTask *task, KvRequest *req, F lbd)
-    {
-        task->req_ = req;
-        task->status_ = TaskStatus::Ongoing;
-        thd_task = task;
-        task->coro_ =
-            boost::context::callcc(std::allocator_arg,
-                                   stack_pool_,
-                                   [task, lbd](continuation &&sink)
-                                   {
-                                       task->main_ = std::move(sink);
-                                       KvError err = lbd();
-                                       task->req_->SetDone(err);
-                                       task->req_ = nullptr;
-                                       task->status_ = TaskStatus::Idle;
-                                       task_mgr->finished_.Enqueue(task);
-                                       return std::move(task->main_);
-                                   });
-    }
-
-    const EloqStore *store_;
-    moodycamel::ConcurrentQueue<KvRequest *> requests_;
-    std::thread thd_;
-    PagePool page_pool_;
-    std::unique_ptr<AsyncIoManager> io_mgr_;
-    IndexPageManager index_mgr_;
-    TaskManager task_mgr_;
-    boost::context::pooled_fixedsize_stack stack_pool_;
-    std::unordered_map<TableIdent, CircularQueue<KvRequest *>> write_queue_;
-};
 
 EloqStore::EloqStore(const KvOptions &opts) : options_(opts), stopped_(true)
 {
@@ -79,13 +28,16 @@ EloqStore::EloqStore(const KvOptions &opts) : options_(opts), stopped_(true)
     options_.coroutine_stack_size =
         ((options_.coroutine_stack_size + page_align - 1) & ~(page_align - 1));
 
-    if (options_.overflow_pointers < 1)
+    if (options_.overflow_pointers == 0 ||
+        options_.overflow_pointers > max_overflow_pointers)
     {
-        options_.overflow_pointers = 1;
+        LOG(FATAL) << "Invalid option overflow_pointers";
     }
-    else if (options_.overflow_pointers > max_overflow_pointers)
+
+    if (options_.max_write_batch_pages == 0 ||
+        options_.max_write_batch_pages > max_write_pages_batch)
     {
-        options_.overflow_pointers = max_overflow_pointers;
+        LOG(FATAL) << "Invalid option max_write_batch_pages";
     }
 }
 
@@ -94,11 +46,6 @@ EloqStore::~EloqStore()
     if (!IsStopped())
     {
         Stop();
-    }
-    else if (dir_fd_ >= 0)
-    {
-        // This will happen when the Start() is not successful
-        CloseDBDir();
     }
 }
 
@@ -110,80 +57,92 @@ KvError EloqStore::Start()
         CHECK_KV_ERR(err);
     }
 
-    workers_.resize(options_.num_threads);
+    shards_.resize(options_.num_threads);
     for (size_t i = 0; i < options_.num_threads; i++)
     {
-        if (workers_[i] == nullptr)
+        if (shards_[i] == nullptr)
         {
-            workers_[i] = std::make_unique<Worker>(this);
+            shards_[i] = std::make_unique<Shard>(this);
         }
-        KvError err = workers_[i]->Init(dir_fd_);
+        KvError err = shards_[i]->Init(dir_fd_);
         CHECK_KV_ERR(err);
     }
 
     stopped_.store(false, std::memory_order_relaxed);
-    for (auto &w : workers_)
+
+    if (options_.data_append_mode)
     {
-        w->Start();
+        if (options_.num_gc_threads > 0)
+        {
+            if (file_gc_ == nullptr)
+            {
+                file_gc_ = std::make_unique<FileGarbageCollector>(&options_);
+            }
+            file_gc_->Start(options_.num_gc_threads);
+            file_garbage_collector = file_gc_.get();
+        }
+        if (options_.num_retained_archives > 0 &&
+            options_.archive_interval_secs > 0)
+        {
+            if (archive_crond_ == nullptr)
+            {
+                archive_crond_ = std::make_unique<ArchiveCrond>(this);
+            }
+            archive_crond_->Start();
+        }
     }
+
+    for (auto &shard : shards_)
+    {
+        shard->Start();
+    }
+
     LOG(INFO) << "EloqStore is started.";
     return KvError::NoError;
 }
 
 KvError EloqStore::InitDBDir()
 {
-    if (fs::exists(options_.db_path))
+    const fs::path &db_path = options_.db_path;
+    if (fs::exists(db_path))
     {
-        if (!fs::is_directory(options_.db_path))
+        if (!fs::is_directory(db_path))
         {
-            LOG(ERROR) << "path " << options_.db_path << " is not directory";
-            return KvError::BadDir;
+            LOG(ERROR) << "path " << db_path << " is not directory";
+            return KvError::InvalidArgs;
         }
-        for (auto &ent : fs::directory_iterator{options_.db_path})
+        for (auto &ent : fs::directory_iterator{db_path})
         {
             if (!ent.is_directory())
             {
-                LOG(ERROR) << "entry " << ent.path() << " is not directory";
-                return KvError::BadDir;
+                LOG(ERROR) << ent.path() << " is not directory";
+                return KvError::InvalidArgs;
             }
             const std::string name = ent.path().filename().string();
             TableIdent tbl_id = TableIdent::FromString(name);
             if (tbl_id.tbl_name_.empty())
             {
-                LOG(ERROR) << "unexpected tablespace name " << name;
-                return KvError::BadDir;
+                LOG(ERROR) << "unexpected partition name " << name;
+                return KvError::InvalidArgs;
             }
-
-            fs::path wal_path = ent.path() / IouringMgr::mani_file;
+            fs::path wal_path = ent.path() / FileNameManifest;
             if (!fs::exists(wal_path))
             {
-                LOG(WARNING) << "remove incomplete tablespace " << name;
+                LOG(WARNING) << "clear incomplete partition " << name;
                 fs::remove_all(ent.path());
             }
         }
     }
     else
     {
-        fs::create_directories(options_.db_path);
+        fs::create_directories(db_path);
     }
-    dir_fd_ = open(options_.db_path.c_str(), IouringMgr::oflags_dir);
+    dir_fd_ = open(db_path.c_str(), IouringMgr::oflags_dir);
     if (dir_fd_ < 0)
     {
         return KvError::IoFail;
     }
     return KvError::NoError;
-}
-
-void EloqStore::CloseDBDir()
-{
-    if (close(dir_fd_) == 0)
-    {
-        dir_fd_ = -1;
-    }
-    else
-    {
-        LOG(ERROR) << "failed to close database directory " << strerror(errno);
-    }
 }
 
 bool EloqStore::ExecAsyn(KvRequest *req)
@@ -209,32 +168,49 @@ void EloqStore::ExecSync(KvRequest *req)
 
 bool EloqStore::SendRequest(KvRequest *req)
 {
-    req->err_ = KvError::NoError;
-    req->done_.store(false, std::memory_order_relaxed);
-
     if (stopped_.load(std::memory_order_relaxed))
     {
         return false;
     }
 
-    Worker *worker =
-        workers_[req->TableId().partition_id_ % workers_.size()].get();
-    return worker->AddRequest(req);
+    req->err_ = KvError::NoError;
+    req->done_.store(false, std::memory_order_relaxed);
+
+    Shard *shard = shards_[req->TableId().partition_id_ % shards_.size()].get();
+    return shard->AddKvRequest(req);
 }
 
 void EloqStore::Stop()
 {
-    stopped_.store(true, std::memory_order_relaxed);
-    for (auto &w : workers_)
+    if (archive_crond_ != nullptr)
     {
-        w->Stop();
+        archive_crond_->Stop();
+    }
+
+    stopped_.store(true, std::memory_order_relaxed);
+    for (auto &shard : shards_)
+    {
+        shard->Stop();
+    }
+    shards_.clear();
+
+    if (file_gc_ != nullptr)
+    {
+        file_garbage_collector = nullptr;
+        file_gc_->Stop();
     }
 
     if (dir_fd_ >= 0)
     {
-        CloseDBDir();
+        close(dir_fd_);
+        dir_fd_ = -1;
     }
     LOG(INFO) << "EloqStore is stopped.";
+}
+
+const KvOptions &EloqStore::Options() const
+{
+    return options_;
 }
 
 bool EloqStore::IsStopped() const
@@ -268,9 +244,9 @@ void KvRequest::Wait() const
     done_.wait(false, std::memory_order_acquire);
 }
 
-void ReadRequest::SetArgs(TableIdent tid, std::string_view key)
+void ReadRequest::SetArgs(TableIdent tbl_id, std::string_view key)
 {
-    tbl_id_ = std::move(tid);
+    SetTableId(std::move(tbl_id));
     key_ = key;
 }
 
@@ -279,7 +255,7 @@ void ScanRequest::SetArgs(TableIdent tbl_id,
                           std::string_view end,
                           bool begin_inclusive)
 {
-    tbl_id_ = std::move(tbl_id);
+    SetTableId(std::move(tbl_id));
     begin_key_ = begin;
     end_key_ = end;
     begin_inclusive_ = begin_inclusive;
@@ -301,9 +277,10 @@ size_t ScanRequest::ResultSize() const
     return size;
 }
 
-void WriteRequest::SetArgs(TableIdent tid, std::vector<WriteDataEntry> &&batch)
+void WriteRequest::SetArgs(TableIdent tbl_id,
+                           std::vector<WriteDataEntry> &&batch)
 {
-    tbl_id_ = std::move(tid);
+    SetTableId(std::move(tbl_id));
     batch_ = std::move(batch);
 }
 
@@ -315,10 +292,15 @@ void WriteRequest::AddWrite(std::string key,
     batch_.push_back({std::move(key), std::move(value), ts, op});
 }
 
-void TruncateRequest::SetArgs(TableIdent tid, std::string_view position)
+void TruncateRequest::SetArgs(TableIdent tbl_id, std::string_view position)
 {
-    tbl_id_ = std::move(tid);
+    SetTableId(std::move(tbl_id));
     position_ = position;
+}
+
+void ArchiveRequest::SetArgs(TableIdent tbl_id)
+{
+    SetTableId(std::move(tbl_id));
 }
 
 const TableIdent &KvRequest::TableId() const
@@ -344,210 +326,6 @@ void KvRequest::SetDone(KvError err)
     {
         // Synchronous request
         done_.notify_one();
-    }
-}
-
-Worker::Worker(const EloqStore *store)
-    : store_(store),
-      page_pool_(store->options_.data_page_size),
-      io_mgr_(AsyncIoManager::New(&store->options_)),
-      index_mgr_(io_mgr_.get()),
-      stack_pool_(store->options_.coroutine_stack_size)
-{
-}
-
-Worker::~Worker()
-{
-    if (thd_.joinable())
-    {
-        thd_.join();
-    }
-}
-
-KvError Worker::Init(int dir_fd)
-{
-    return io_mgr_->Init(dir_fd);
-}
-
-void Worker::Loop()
-{
-    while (true)
-    {
-        KvRequest *reqs[128];
-        size_t nreqs = requests_.try_dequeue_bulk(reqs, std::size(reqs));
-        for (size_t i = 0; i < nreqs; i++)
-        {
-            OnReceiveReq(reqs[i]);
-        }
-
-        if (nreqs == 0 && task_mgr_.IsIdle())
-        {
-            if (store_->IsStopped())
-            {
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
-
-        io_mgr_->Submit();
-        io_mgr_->PollComplete();
-
-        task_mgr_.ResumeScheduled();
-        PollFinished();
-    }
-}
-
-void Worker::Start()
-{
-    thd_ = std::thread(
-        [this]
-        {
-            // Set thread-local variables
-            page_pool = &page_pool_;
-            index_mgr = &index_mgr_;
-            task_mgr = &task_mgr_;
-            Loop();
-        });
-}
-
-void Worker::Stop()
-{
-    thd_.join();
-}
-
-bool Worker::AddRequest(KvRequest *req)
-{
-    return requests_.enqueue(req);
-}
-
-void Worker::OnReceiveReq(KvRequest *req)
-{
-    if (req->Type() == RequestType::Write ||
-        req->Type() == RequestType::Truncate)
-    {
-        // Try acquire lock to ensure write operation is executed
-        // sequentially on each table partition.
-        auto [it, ok] = write_queue_.try_emplace(req->tbl_id_);
-        if (!ok)
-        {
-            // blocked on queue
-            it->second.Enqueue(req);
-            return;
-        }
-    }
-
-    HandleReq(req);
-}
-
-void Worker::HandleReq(KvRequest *req)
-{
-    switch (req->Type())
-    {
-    case RequestType::Read:
-    {
-        ReadTask *task = task_mgr_.GetReadTask();
-        auto lbd = [task, req]() -> KvError
-        {
-            auto read_req = static_cast<ReadRequest *>(req);
-            KvError err = task->Read(req->TableId(),
-                                     read_req->key_,
-                                     read_req->value_,
-                                     read_req->ts_);
-            return err;
-        };
-        StartTask(task, req, lbd);
-        break;
-    }
-    case RequestType::Scan:
-    {
-        ScanTask *task = task_mgr_.GetScanTask();
-        auto lbd = [task, req]() -> KvError
-        {
-            auto scan_req = static_cast<ScanRequest *>(req);
-            return task->Scan(req->TableId(),
-                              scan_req->begin_key_,
-                              scan_req->end_key_,
-                              scan_req->begin_inclusive_,
-                              scan_req->page_entries_,
-                              scan_req->page_size_,
-                              scan_req->entries_,
-                              scan_req->has_remaining_);
-        };
-        StartTask(task, req, lbd);
-        break;
-    }
-    case RequestType::Write:
-    {
-        BatchWriteTask *task = task_mgr_.GetBatchWriteTask(req->TableId());
-        auto lbd = [task, req]() -> KvError
-        {
-            auto write_req = static_cast<WriteRequest *>(req);
-            if (write_req->batch_.empty())
-            {
-                return KvError::NoError;
-            }
-            if (!task->SetBatch(std::move(write_req->batch_)))
-            {
-                return KvError::InvalidArgs;
-            }
-            KvError err = task->Apply();
-            if (err != KvError::NoError)
-            {
-                task->Abort();
-            }
-            return err;
-        };
-        StartTask(task, req, lbd);
-        break;
-    }
-    case RequestType::Truncate:
-    {
-        TruncateTask *task = task_mgr_.GetTruncateTask(req->TableId());
-        auto lbd = [task, req]() -> KvError
-        {
-            auto trunc_req = static_cast<TruncateRequest *>(req);
-            KvError err = task->Truncate(trunc_req->position_);
-            if (err != KvError::NoError)
-            {
-                task->Abort();
-            }
-            return err;
-        };
-        StartTask(task, req, lbd);
-        break;
-    }
-    }
-}
-
-void Worker::PollFinished()
-{
-    while (task_mgr_.finished_.Size() > 0)
-    {
-        KvTask *task = task_mgr_.finished_.Peek();
-        task_mgr_.finished_.Dequeue();
-
-        if (WriteTask *wtask = dynamic_cast<WriteTask *>(task);
-            wtask != nullptr)
-        {
-            auto it = write_queue_.find(wtask->TableId());
-            assert(it != write_queue_.end());
-            if (it->second.Size() == 0)
-            {
-                // release lock
-                write_queue_.erase(it);
-            }
-            else
-            {
-                // continue execute blocked write request
-                KvRequest *req = it->second.Peek();
-                it->second.Dequeue();
-                HandleReq(req);
-            }
-        }
-
-        // Note: You can recycle the stack of this coroutine now.
-        task_mgr_.FreeTask(task);
     }
 }
 

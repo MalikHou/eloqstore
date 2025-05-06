@@ -13,33 +13,16 @@
 #include "mem_index_page.h"
 #include "page_mapper.h"
 #include "root_meta.h"
-#include "table_ident.h"
 #include "task.h"
-#include "write_op.h"
+#include "types.h"
 #include "write_tree_stack.h"
 
 namespace kvstore
 {
-class IndexPageManager;
-class MemStoreMgr;
-class WriteTask;
-class PageMapper;
-class MappingSnapshot;
-class IouringMgr;
-
-struct WriteDataEntry
-{
-    std::string key_;
-    std::string val_;
-    uint64_t timestamp_;
-    WriteOp op_;
-};
-
 class WriteTask : public KvTask
 {
 public:
-    WriteTask() = delete;
-    WriteTask(const TableIdent &tid);
+    WriteTask();
     WriteTask(const WriteTask &) = delete;
 
     virtual void Abort();
@@ -59,8 +42,8 @@ public:
     KvError write_err_{KvError::NoError};
 
 protected:
-    KvError DeleteTree(uint32_t page_id);
-    KvError DeleteDataPage(uint32_t page_id);
+    KvError DeleteTree(PageId page_id);
+    KvError DeleteDataPage(PageId page_id);
 
     /**
      * @brief Split and write overflow value into multiple pages.
@@ -94,132 +77,52 @@ protected:
     static void AdvanceDataPageIter(DataPageIter &iter, bool &is_valid);
     static void AdvanceIndexPageIter(IndexPageIter &iter, bool &is_valid);
 
-    KvError FlushManifest(uint32_t root);
+    KvError FlushManifest(PageId root_page_id);
     KvError UpdateMeta(MemIndexPage *root);
 
+    /**
+     * @brief Request shard to create a compaction task if space amplification
+     * factor is too big.
+     */
+    void CompactIfNeeded(PageMapper *mapper) const;
+    KvError TriggerFileGC() const;
+
     std::pair<uint32_t, KvError> Seek(std::string_view key);
-    std::pair<DataPage, KvError> LoadDataPage(uint32_t page_id);
-    std::pair<OverflowPage, KvError> LoadOverflowPage(uint32_t page_id);
+    std::pair<DataPage, KvError> LoadDataPage(PageId page_id);
+    std::pair<OverflowPage, KvError> LoadOverflowPage(PageId page_id);
 
-    std::pair<uint32_t, uint32_t> AllocatePage(uint32_t page_id);
-    void FreePage(uint32_t page_id);
+    std::pair<PageId, FilePageId> AllocatePage(PageId page_id);
+    void FreePage(PageId page_id);
 
-    uint32_t ToFilePage(uint32_t page_id);
+    FilePageId ToFilePage(PageId page_id);
 
     KvError WritePage(DataPage &&page);
     KvError WritePage(OverflowPage &&page);
     KvError WritePage(MemIndexPage *page);
-    KvError WritePage(VarPage page, uint32_t file_page_id);
+    KvError WritePage(VarPage page, FilePageId file_page_id);
 
     TableIdent tbl_ident_;
+    std::vector<std::unique_ptr<IndexStackEntry>> stack_;
 
     IndexPageBuilder idx_page_builder_;
     DataPageBuilder data_page_builder_;
     std::string overflow_ptrs_;
 
-    std::vector<std::unique_ptr<IndexStackEntry>> stack_;
-
     CowRootMeta cow_meta_;
     ManifestBuilder wal_builder_;
+
+    KvError FlushBatchPages();
+    /**
+     * @brief When the append-only mode is enabled, the pages ready to be
+     * written are put into this batch. The batch is then sequentially
+     * written to the disk when it is full or when a data file switch is
+     * required.
+     */
+    std::vector<VarPage> batch_pages_;
+    /**
+     * @brief First file page id of this batch of pages.
+     */
+    FilePageId batch_fp_id_{MaxFilePageId};
 };
 
-class BatchWriteTask : public WriteTask
-{
-public:
-    BatchWriteTask(const TableIdent &tid) : WriteTask(tid) {};
-    TaskType Type() const override
-    {
-        return TaskType::BatchWrite;
-    }
-    void Abort() override;
-
-    bool SetBatch(std::vector<WriteDataEntry> &&entries);
-    KvError Apply();
-
-private:
-    KvError LoadApplyingPage(uint32_t page_id);
-    KvError ApplyOnePage(size_t &cidx);
-    std::pair<MemIndexPage *, KvError> Pop();
-
-    KvError FinishIndexPage(MemIndexPage *new_page,
-                            std::string idx_page_key,
-                            uint32_t page_id,
-                            bool elevate);
-    KvError FinishDataPage(std::string_view page_view,
-                           std::string page_key,
-                           uint32_t page_id);
-
-    /**
-     * @brief Pops up the index stack such that the top index entry contains the
-     * search key.
-     *
-     * @param search_key
-     */
-    KvError SeekStack(std::string_view search_key);
-
-    std::vector<WriteDataEntry> batch_;
-    DataPage applying_page_;
-
-    /**
-     * @brief To maintain the double link list between bottom data pages, we
-     * keep at most three adjacent data pages in memory. [1] is the page
-     * ApplyOnePage currently writing to, [0] is the previous page of [1], and
-     * [2] is the next page of [1].
-     */
-    DataPage leaf_triple_[3];
-    /**
-     * @brief Get triple element at position idx.
-     *
-     * @param idx The element position, can be 0, 1 or 2.
-     */
-    DataPage *TripleElement(uint8_t idx);
-    /**
-     * @brief Load leaf data page from disk to leaf_triple_[idx].
-     *
-     * @param idx The element position, can be 0 or 2.
-     */
-    KvError LoadTripleElement(uint8_t idx, uint32_t page_id);
-
-    /**
-     * @brief Update element in leaf link list. Replace the old page at
-     * applying_page_ with new page. The new page is the first page generated by
-     * ApplyOnePage.
-     *
-     * @param page The new page.
-     * @param old_fp File page id of the old page.
-     */
-    KvError LeafLinkUpdate(DataPage &&page);
-    /**
-     * @brief Insert new page into leaf link list.
-     *
-     * @param page The new page.
-     */
-    KvError LeafLinkInsert(DataPage &&page);
-    /**
-     * @brief Delete the old data page at applying_page_ from leaf link list.
-     */
-    KvError LeafLinkDelete();
-    KvError ShiftLeafLink();
-};
-
-class TruncateTask : public WriteTask
-{
-public:
-    TruncateTask(const TableIdent &tid) : WriteTask(tid) {};
-    TaskType Type() const override
-    {
-        return TaskType::Truncate;
-    }
-    KvError Truncate(std::string_view trunc_pos);
-
-private:
-    /**
-     * @brief Truncate the data page at page_id from the trunc_pos.
-     * @return true if the page is empty after truncation.
-     */
-    std::pair<bool, KvError> TruncateDataPage(uint32_t page_id,
-                                              std::string_view trunc_pos);
-    std::pair<MemIndexPage *, KvError> TruncateIndexPage(
-        uint32_t page_id, std::string_view trunc_pos);
-};
 }  // namespace kvstore

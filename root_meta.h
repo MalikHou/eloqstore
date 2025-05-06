@@ -16,13 +16,17 @@ class ManifestBuilder
 {
 public:
     ManifestBuilder();
-    void UpdateMapping(uint32_t page_id, uint32_t file_page);
-    std::string_view Snapshot(uint32_t root_id, const PageMapper &mapper);
+    void UpdateMapping(PageId page_id, FilePageId file_page_id);
+    void DeleteMapping(PageId page_id);
+    std::string_view Snapshot(uint32_t root_id,
+                              const MappingSnapshot *mapping,
+                              FilePageId max_fp_id);
 
     std::string_view Finalize(uint32_t new_root);
     std::string_view BuffView() const;
     void Reset();
     bool Empty() const;
+    uint32_t CurrentSize() const;
 
     // checksum(8B), root_page_id(4B), log_size(4B)
     static constexpr uint16_t checksum_bytes = 8;

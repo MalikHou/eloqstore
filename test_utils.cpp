@@ -10,8 +10,8 @@
 #include "error.h"
 #include "replayer.h"
 #include "scan_task.h"
-#include "table_ident.h"
-#include "write_task.h"
+#include "types.h"
+#include "utils.h"
 
 namespace test_util
 {
@@ -44,12 +44,6 @@ void CheckKvEntry(const kvstore::KvEntry &left, const kvstore::KvEntry &right)
         CHECK(lval == rval);
     }
     CHECK(std::get<2>(left) == std::get<2>(right));
-}
-
-uint64_t UnixTimestamp()
-{
-    auto dur = std::chrono::system_clock::now().time_since_epoch();
-    return std::chrono::duration_cast<std::chrono::microseconds>(dur).count();
 }
 
 std::string FormatEntries(const std::vector<kvstore::KvEntry> &entries)
@@ -414,8 +408,8 @@ void ConcurrencyTester::Partition::FinishWrite()
 ConcurrencyTester::ConcurrencyTester(kvstore::EloqStore *store,
                                      std::string tbl_name,
                                      uint32_t n_partitions,
-                                     uint8_t seg_size,
-                                     uint16_t seg_count)
+                                     uint16_t seg_count,
+                                     uint8_t seg_size)
     : seg_size_(seg_size),
       seg_count_(seg_count),
       seg_sum_(seg_size * average_v),
@@ -438,7 +432,7 @@ void ConcurrencyTester::Wake(kvstore::KvRequest *req)
 
 void ConcurrencyTester::ExecRead(Reader *reader)
 {
-    Partition &partition = partitions_[rand() % partitions_.size()];
+    Partition &partition = partitions_[reader->id_ % partitions_.size()];
     reader->start_tick_ = partition.ticks_;
     reader->partition_id_ = partition.id_;
     reader->begin_ = (rand() % seg_count_) * seg_size_;
@@ -561,7 +555,7 @@ void ConcurrencyTester::ExecWrite(ConcurrencyTester::Partition &partition)
 {
     assert(!partition.IsWriting());
     partition.ticks_++;
-    uint64_t ts = UnixTimestamp();
+    uint64_t ts = CurrentTimestamp();
     std::vector<kvstore::WriteDataEntry> entries;
     uint32_t left = seg_sum_;
     for (uint32_t i = 0; i < partition.kvs_.size(); i++)
@@ -610,7 +604,7 @@ void ConcurrencyTester::ExecWrite(ConcurrencyTester::Partition &partition)
 
 void ConcurrencyTester::Init()
 {
-    uint64_t ts = UnixTimestamp();
+    uint64_t ts = CurrentTimestamp();
     const uint32_t kvs_num = seg_size_ * seg_count_;
     for (Partition &partition : partitions_)
     {
@@ -673,7 +667,7 @@ void ConcurrencyTester::Run(uint32_t rounds,
                             uint16_t n_readers)
 {
     uint16_t running_readers = 0;
-    auto is_finished = [&]() -> bool
+    auto is_finished = [this, &running_readers, rounds]() -> bool
     {
         for (const Partition &partition : partitions_)
         {
@@ -687,6 +681,12 @@ void ConcurrencyTester::Run(uint32_t rounds,
     };
 
     // Start readers
+    if (n_readers < partitions_.size())
+    {
+        LOG(WARNING) << "n_readers is less than partitions, reset to "
+                     << partitions_.size();
+        n_readers = partitions_.size();
+    }
     std::vector<Reader> readers(n_readers);
     for (Reader &reader : readers)
     {
@@ -694,7 +694,7 @@ void ConcurrencyTester::Run(uint32_t rounds,
         ExecRead(&reader);
     }
 
-    do
+    while (!is_finished())
     {
         uint64_t user_data;
         while (finished_reqs_.try_dequeue(user_data))
@@ -706,10 +706,6 @@ void ConcurrencyTester::Run(uint32_t rounds,
             {
                 Partition &partition = partitions_[id];
                 partition.FinishWrite();
-                if (interval == 0 && partition.FinishedRounds() < rounds)
-                {
-                    ExecWrite(partition);
-                }
                 continue;
             }
 
@@ -731,7 +727,7 @@ void ConcurrencyTester::Run(uint32_t rounds,
                 running_readers--;
             }
         }
-    } while (!is_finished());
+    }
 
     LOG(INFO) << "concurrency test statistic: verify kvs " << verify_kv_
               << ", verify sum " << verify_sum_;
@@ -748,12 +744,25 @@ void ConcurrencyTester::Clear()
     }
 }
 
-ManifestVerifier::ManifestVerifier(kvstore::KvOptions opts) : options_(opts)
+uint64_t ConcurrencyTester::CurrentTimestamp()
 {
-    answer_.InitPages(opts.init_page_count);
+    return utils::UnixTs<std::chrono::microseconds>();
 }
 
-std::pair<uint32_t, uint32_t> ManifestVerifier::RandChoose()
+ManifestVerifier::ManifestVerifier(kvstore::KvOptions opts)
+    : options_(opts),
+      io_mgr_(&options_),
+      idx_mgr_(&io_mgr_),
+      answer_(&idx_mgr_, &tbl_id_)
+{
+    if (!options_.data_append_mode)
+    {
+        answer_file_pages_ =
+            static_cast<kvstore::PooledFilePages *>(answer_.FilePgAllocator());
+    }
+}
+
+std::pair<kvstore::PageId, kvstore::FilePageId> ManifestVerifier::RandChoose()
 {
     CHECK(!helper_.empty());
     auto it = std::next(helper_.begin(), rand() % helper_.size());
@@ -767,10 +776,9 @@ uint32_t ManifestVerifier::Size() const
 
 void ManifestVerifier::NewMapping()
 {
-    uint32_t page_id = answer_.GetPage();
-    uint32_t file_page_id = answer_.GetFilePage();
+    kvstore::PageId page_id = answer_.GetPage();
+    kvstore::FilePageId file_page_id = answer_.FilePgAllocator()->Allocate();
     answer_.UpdateMapping(page_id, file_page_id);
-
     builder_.UpdateMapping(page_id, file_page_id);
     helper_[page_id] = file_page_id;
 }
@@ -780,12 +788,13 @@ void ManifestVerifier::UpdateMapping()
     auto [page_id, old_fp_id] = RandChoose();
     root_id_ = page_id;
 
-    uint32_t new_fp_id = answer_.GetFilePage();
+    kvstore::FilePageId new_fp_id = answer_.FilePgAllocator()->Allocate();
     answer_.UpdateMapping(page_id, new_fp_id);
-    answer_.FreeFilePage(old_fp_id);
-
     builder_.UpdateMapping(page_id, new_fp_id);
-
+    if (answer_file_pages_)
+    {
+        answer_file_pages_->Free({old_fp_id});
+    }
     helper_[page_id] = new_fp_id;
 }
 
@@ -795,13 +804,15 @@ void ManifestVerifier::FreeMapping()
     helper_.erase(page_id);
     if (page_id == root_id_)
     {
-        root_id_ = Size() == 0 ? UINT32_MAX : RandChoose().first;
+        root_id_ = Size() == 0 ? kvstore::MaxPageId : RandChoose().first;
     }
 
     answer_.FreePage(page_id);
-    answer_.FreeFilePage(file_page_id);
-
-    builder_.UpdateMapping(page_id, UINT32_MAX);
+    builder_.DeleteMapping(page_id);
+    if (answer_file_pages_)
+    {
+        answer_file_pages_->Free({file_page_id});
+    }
 }
 
 void ManifestVerifier::Finish()
@@ -823,21 +834,38 @@ void ManifestVerifier::Finish()
 
 void ManifestVerifier::Snapshot()
 {
-    std::string_view sv = builder_.Snapshot(root_id_, answer_);
+    kvstore::FilePageId max_fp_id = answer_.FilePgAllocator()->MaxFilePageId();
+    std::string_view sv =
+        builder_.Snapshot(root_id_, answer_.GetMapping(), max_fp_id);
     file_ = sv;
     builder_.Reset();
 }
 
-void ManifestVerifier::Verify() const
+void ManifestVerifier::Verify()
 {
-    auto file = std::make_unique<kvstore::MemStoreMgr::Manifest>(file_);
-
-    kvstore::Replayer replayer;
-    kvstore::KvError err = replayer.Replay(std::move(file), &options_);
+    kvstore::MemStoreMgr::Manifest file(file_);
+    kvstore::Replayer replayer(&options_);
+    kvstore::KvError err = replayer.Replay(&file);
     CHECK(err == kvstore::KvError::NoError);
-    auto mapper = replayer.Mapper(nullptr, nullptr);
-
     CHECK(replayer.root_ == root_id_);
-    CHECK(mapper->EqualTo(answer_));
+
+    auto get_map_tbl = [](std::vector<uint64_t> tbl)
+        -> std::unordered_map<kvstore::PageId, kvstore::FilePageId>
+    {
+        std::unordered_map<kvstore::PageId, kvstore::FilePageId> map_tbl;
+        for (kvstore::PageId page_id; uint64_t val : tbl)
+        {
+            if (kvstore::MappingSnapshot::IsFilePageId(val))
+            {
+                map_tbl[page_id] = kvstore::MappingSnapshot::DecodeId(val);
+            }
+            page_id++;
+        }
+        return map_tbl;
+    };
+    auto mapper = replayer.GetMapper(&idx_mgr_, &tbl_id_);
+    auto map_tbl_a = get_map_tbl(mapper->GetMapping()->mapping_tbl_);
+    auto map_tbl_b = get_map_tbl(answer_.GetMapping()->mapping_tbl_);
+    CHECK(map_tbl_a == map_tbl_b);
 }
 }  // namespace test_util

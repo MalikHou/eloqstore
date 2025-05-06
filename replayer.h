@@ -13,20 +13,23 @@ namespace kvstore
 class Replayer
 {
 public:
-    Replayer();
-    KvError Replay(ManifestFilePtr log, const KvOptions *opts);
-    std::unique_ptr<PageMapper> Mapper(IndexPageManager *idx_mgr,
-                                       const TableIdent *tbl_ident);
+    Replayer(const KvOptions *opts);
+    KvError Replay(ManifestFile *log);
+    std::unique_ptr<PageMapper> GetMapper(IndexPageManager *idx_mgr,
+                                          const TableIdent *tbl_ident);
 
-    uint32_t root_;
-    std::unique_ptr<PageMapper> mapper_{nullptr};
+    PageId root_;
     uint64_t file_size_;
+    std::vector<uint64_t> mapping_tbl_;
+    FilePageId max_fp_id_;
 
 private:
     KvError NextRecord(ManifestFile *log);
-    KvError ReplayMapping(std::string_view);
+    void DeserializeSnapshot(std::string_view snapshot);
+    void ReplayLog(std::string_view log);
 
+    const KvOptions *opts_;
     std::string log_buf_;
-    std::string_view mapping_;
+    std::string_view mapping_log_;
 };
 }  // namespace kvstore

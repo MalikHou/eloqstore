@@ -2,30 +2,31 @@
 
 #include <atomic>
 
+#include "batch_write_task.h"
 #include "error.h"
 #include "scan_task.h"
-#include "table_ident.h"
-#include "write_task.h"
+#include "types.h"
 
 namespace kvstore
 {
-class Worker;
+class Shard;
 
 enum class RequestType : uint8_t
 {
     Read,
     Scan,
     Write,
-    Truncate
+    Truncate,
+    Archive
 };
 
 class KvRequest
 {
 public:
     virtual RequestType Type() const = 0;
-    void SetTableId(TableIdent tbl_id);
     KvError Error() const;
     const char *ErrMessage() const;
+    void SetTableId(TableIdent tbl_id);
     const TableIdent &TableId() const;
     uint64_t UserData() const;
 
@@ -41,10 +42,10 @@ protected:
     TableIdent tbl_id_;
     uint64_t user_data_{0};
     std::function<void(KvRequest *)> callback_{nullptr};
-    std::atomic<bool> done_{false};
+    std::atomic<bool> done_{true};
     KvError err_{KvError::NoError};
 
-    friend class Worker;
+    friend class Shard;
     friend class EloqStore;
 };
 
@@ -130,6 +131,19 @@ public:
     std::string_view position_;
 };
 
+class ArchiveRequest : public KvRequest
+{
+public:
+    RequestType Type() const override
+    {
+        return RequestType::Archive;
+    }
+    void SetArgs(TableIdent tid);
+};
+
+class FileGarbageCollector;
+class ArchiveCrond;
+
 class EloqStore
 {
 public:
@@ -140,6 +154,7 @@ public:
     KvError Start();
     void Stop();
     bool IsStopped() const;
+    const KvOptions &Options() const;
 
     template <typename F>
     bool ExecAsyn(KvRequest *req, uint64_t data, F callback)
@@ -154,12 +169,14 @@ public:
 private:
     bool SendRequest(KvRequest *req);
     KvError InitDBDir();
-    void CloseDBDir();
 
-    int dir_fd_{-1};
-    std::vector<std::unique_ptr<Worker>> workers_;
-    std::atomic<bool> stopped_{true};
     KvOptions options_;
-    friend Worker;
+    int dir_fd_{-1};
+    std::vector<std::unique_ptr<Shard>> shards_;
+    std::atomic<bool> stopped_{true};
+
+    std::unique_ptr<FileGarbageCollector> file_gc_{nullptr};
+    std::unique_ptr<ArchiveCrond> archive_crond_{nullptr};
+    friend Shard;
 };
 }  // namespace kvstore

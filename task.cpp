@@ -3,13 +3,13 @@
 #include <cassert>
 
 #include "index_page_manager.h"
-#include "task_manager.h"
+#include "shard.h"
 
 namespace kvstore
 {
 void KvTask::Yield()
 {
-    main_ = main_.resume();
+    shard->main_ = shard->main_.resume();
 }
 
 void KvTask::Resume()
@@ -17,7 +17,7 @@ void KvTask::Resume()
     if (status_ != TaskStatus::Ongoing)
     {
         status_ = TaskStatus::Ongoing;
-        task_mgr->scheduled_.Enqueue(this);
+        shard->scheduled_.Enqueue(this);
     }
 }
 
@@ -64,10 +64,10 @@ void KvTask::FinishIo(bool is_sync_io)
 }
 
 std::pair<Page, KvError> KvTask::LoadPage(const TableIdent &tbl_id,
-                                          uint32_t file_page_id)
+                                          FilePageId file_page_id)
 {
     auto [page, err] =
-        IoMgr()->ReadPage(tbl_id, file_page_id, page_pool->Allocate());
+        IoMgr()->ReadPage(tbl_id, file_page_id, shard->PagePool()->Allocate());
     if (err != KvError::NoError)
     {
         return {Page(nullptr, std::free), err};
@@ -76,8 +76,8 @@ std::pair<Page, KvError> KvTask::LoadPage(const TableIdent &tbl_id,
 }
 
 std::pair<DataPage, KvError> KvTask::LoadDataPage(const TableIdent &tbl_id,
-                                                  uint32_t page_id,
-                                                  uint32_t file_page_id)
+                                                  PageId page_id,
+                                                  FilePageId file_page_id)
 {
     auto [page, err] = LoadPage(tbl_id, file_page_id);
     if (err != KvError::NoError)
@@ -88,7 +88,7 @@ std::pair<DataPage, KvError> KvTask::LoadDataPage(const TableIdent &tbl_id,
 }
 
 std::pair<OverflowPage, KvError> KvTask::LoadOverflowPage(
-    const TableIdent &tbl_id, uint32_t page_id, uint32_t file_page_id)
+    const TableIdent &tbl_id, PageId page_id, FilePageId file_page_id)
 {
     auto [page, err] = LoadPage(tbl_id, file_page_id);
     if (err != KvError::NoError)
@@ -103,20 +103,16 @@ std::pair<std::string, KvError> KvTask::GetOverflowValue(
     const MappingSnapshot *mapping,
     std::string_view encoded_ptrs)
 {
-    std::array<uint32_t, max_overflow_pointers> ids_buf;
+    std::array<FilePageId, max_overflow_pointers> ids_buf;
     // Decode and convert overflow pointers (logical) to file page ids.
     auto to_file_page_ids =
-        [&](std::string_view encoded_ptrs) -> std::span<uint32_t>
+        [&](std::string_view encoded_ptrs) -> std::span<FilePageId>
     {
-        uint8_t n = DecodeOverflowPointers(encoded_ptrs, ids_buf);
-        for (uint8_t i = 0; i < n; i++)
-        {
-            ids_buf[i] = mapping->ToFilePage(ids_buf[i]);
-        }
+        uint8_t n = DecodeOverflowPointers(encoded_ptrs, ids_buf, mapping);
         return {ids_buf.data(), n};
     };
 
-    std::span<uint32_t> page_ids = to_file_page_ids(encoded_ptrs);
+    std::span<FilePageId> page_ids = to_file_page_ids(encoded_ptrs);
     std::vector<Page> pages;
     std::string value;
     value.reserve(page_ids.size() * OverflowPage::Capacity(Options(), false));
@@ -130,7 +126,7 @@ std::pair<std::string, KvError> KvTask::GetOverflowValue(
         uint8_t i = 0;
         for (Page &pg : pages)
         {
-            OverflowPage page(UINT32_MAX, std::move(pg));
+            OverflowPage page(MaxPageId, std::move(pg));
             value.append(page.GetValue());
             if (++i == pages.size())
             {
@@ -144,15 +140,33 @@ std::pair<std::string, KvError> KvTask::GetOverflowValue(
 }
 
 uint8_t KvTask::DecodeOverflowPointers(
-    std::string_view encoded,
-    std::span<uint32_t, max_overflow_pointers> pointers)
+    std::string_view encoded, std::span<PageId, max_overflow_pointers> pointers)
 {
-    assert(encoded.size() % sizeof(uint32_t) == 0);
+    assert(encoded.size() % sizeof(PageId) == 0);
     uint8_t n_ptrs = 0;
     while (!encoded.empty())
     {
-        pointers[n_ptrs++] = DecodeFixed32(encoded.data());
-        encoded = encoded.substr(sizeof(uint32_t));
+        pointers[n_ptrs] = DecodeFixed32(encoded.data());
+        encoded = encoded.substr(sizeof(PageId));
+        n_ptrs++;
+    }
+    assert(n_ptrs <= max_overflow_pointers);
+    return n_ptrs;
+}
+
+uint8_t KvTask::DecodeOverflowPointers(
+    std::string_view encoded,
+    std::span<FilePageId, max_overflow_pointers> pointers,
+    const MappingSnapshot *mapping)
+{
+    assert(encoded.size() % sizeof(PageId) == 0);
+    uint8_t n_ptrs = 0;
+    while (!encoded.empty())
+    {
+        PageId page_id = DecodeFixed32(encoded.data());
+        pointers[n_ptrs] = mapping->ToFilePage(page_id);
+        encoded = encoded.substr(sizeof(PageId));
+        n_ptrs++;
     }
     assert(n_ptrs <= max_overflow_pointers);
     return n_ptrs;
@@ -160,9 +174,9 @@ uint8_t KvTask::DecodeOverflowPointers(
 
 void WaitingZone::Sleep(KvTask *task)
 {
-    tasks_.Enqueue(thd_task);
-    thd_task->status_ = TaskStatus::Blocked;
-    thd_task->Yield();
+    tasks_.Enqueue(task);
+    task->status_ = TaskStatus::Blocked;
+    task->Yield();
 }
 
 void WaitingZone::WakeOne()
@@ -193,16 +207,16 @@ void WaitingZone::WakeAll()
 
 AsyncIoManager *IoMgr()
 {
-    return index_mgr->IoMgr();
+    return shard->IndexManager()->IoMgr();
 }
 
 const KvOptions *Options()
 {
-    return index_mgr->Options();
+    return shard->Options();
 }
 
 const Comparator *Comp()
 {
-    return Options()->comparator_;
+    return shard->Options()->comparator_;
 }
 }  // namespace kvstore

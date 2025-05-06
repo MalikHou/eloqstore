@@ -19,17 +19,25 @@ ManifestBuilder::ManifestBuilder()
     buff_.resize(header_bytes);
 }
 
-void ManifestBuilder::UpdateMapping(uint32_t page_id, uint32_t file_page)
+void ManifestBuilder::UpdateMapping(PageId page_id, FilePageId file_page_id)
 {
     PutVarint32(&buff_, page_id);
-    PutVarint32(&buff_, file_page);
+    PutVarint64(&buff_, MappingSnapshot::EncodeFilePageId(file_page_id));
+}
+
+void ManifestBuilder::DeleteMapping(PageId page_id)
+{
+    PutVarint32(&buff_, page_id);
+    PutVarint64(&buff_, MappingSnapshot::InvalidValue);
 }
 
 std::string_view ManifestBuilder::Snapshot(uint32_t root_id,
-                                           const PageMapper &mapper)
+                                           const MappingSnapshot *mapping,
+                                           FilePageId max_fp_id)
 {
     Reset();
-    mapper.Serialize(buff_);
+    PutVarint64(&buff_, max_fp_id);
+    mapping->Serialize(buff_);
     return Finalize(root_id);
 }
 
@@ -41,6 +49,11 @@ void ManifestBuilder::Reset()
 bool ManifestBuilder::Empty() const
 {
     return buff_.size() <= header_bytes;
+}
+
+uint32_t ManifestBuilder::CurrentSize() const
+{
+    return buff_.size();
 }
 
 std::string_view ManifestBuilder::Finalize(uint32_t new_root)

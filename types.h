@@ -10,8 +10,23 @@
 
 namespace kvstore
 {
+using PageId = uint32_t;
+constexpr PageId MaxPageId = UINT32_MAX;
+
+using FilePageId = uint64_t;
+constexpr FilePageId MaxFilePageId = UINT64_MAX;
+
+using FileId = uint64_t;
+static constexpr FileId MaxFileId = UINT64_MAX;
+
+constexpr char FileNameSeparator = '_';
+static constexpr char FileNameData[] = "data";
+static constexpr char FileNameManifest[] = "manifest";
+static constexpr char FileNameTmpfile[] = "tmpfile";
+
 struct TableIdent
 {
+    static constexpr char Separator = '-';
     friend bool operator==(const TableIdent &lhs, const TableIdent &rhs)
     {
         return lhs.tbl_name_ == rhs.tbl_name_ &&
@@ -31,12 +46,12 @@ struct TableIdent
 
 inline std::string TableIdent::ToString() const
 {
-    return tbl_name_ + '-' + std::to_string(partition_id_);
+    return tbl_name_ + Separator + std::to_string(partition_id_);
 }
 
 inline TableIdent TableIdent::FromString(const std::string &str)
 {
-    size_t p = str.find('-');
+    size_t p = str.find(Separator);
     if (p == std::string::npos)
     {
         return {};
@@ -71,9 +86,10 @@ inline bool TableIdent::IsValid() const
 
 inline std::ostream &operator<<(std::ostream &out, const TableIdent &tid)
 {
-    out << tid.tbl_name_ << '-' << tid.partition_id_;
+    out << tid.tbl_name_ << TableIdent::Separator << tid.partition_id_;
     return out;
 }
+
 }  // namespace kvstore
 
 template <>

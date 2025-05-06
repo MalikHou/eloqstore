@@ -32,7 +32,7 @@ DEFINE_uint32(io_queue_size, 4096, "size of io_queue");
 DEFINE_uint32(buf_ring_size, 1 << 10, "size of buf_ring");
 DEFINE_uint32(coroutine_stack_size, 1 << 17, "size of coroutine stack");
 DEFINE_uint32(data_page_size, 1 << 12, "size of datapage");
-DEFINE_uint32(num_file_pages_shift, 11, "nums of filepage shift");
+DEFINE_uint32(pages_per_file_shift, 11, "nums of filepage shift");
 
 int main(int argc, char **argv)
 {
@@ -57,7 +57,7 @@ int main(int argc, char **argv)
     opts.manifest_limit = FLAGS_manifest_limit;
     opts.init_page_count = FLAGS_init_page_count;
     opts.num_threads = FLAGS_num_threads;
-    opts.num_file_pages_shift = FLAGS_num_file_pages_shift;
+    opts.pages_per_file_shift = FLAGS_pages_per_file_shift;
 
     kvstore::KillPoint::GetInstance().kill_odds_ = FLAGS_kill_odds;
 
@@ -74,8 +74,8 @@ int main(int argc, char **argv)
                 test_util::ConcurrencyTester tester(&store,
                                                     std::move(tbl_name),
                                                     FLAGS_n_partitions,
-                                                    FLAGS_seg_size,
-                                                    FLAGS_seg_count);
+                                                    FLAGS_seg_count,
+                                                    FLAGS_seg_size);
                 tester.Init();
                 tester.Run(
                     FLAGS_rounds, FLAGS_write_interval, FLAGS_num_readers);

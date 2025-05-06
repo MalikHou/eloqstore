@@ -110,7 +110,7 @@ std::string MemIndexPage::String(const KvOptions *opts) const
     {
         str.push_back('I');
     }
-    str.append(std::to_string(PageId()));
+    str.append(std::to_string(GetPageId()));
     str.push_back('|');
     IndexPageIter iter(this, opts);
     while (iter.HasNext())
@@ -119,7 +119,7 @@ std::string MemIndexPage::String(const KvOptions *opts) const
         str.push_back('[');
         str.append(iter.Key());
         str.push_back(':');
-        str.append(std::to_string(iter.PageId()));
+        str.append(std::to_string(iter.GetPageId()));
         str.push_back(']');
     }
     str.push_back('}');
@@ -206,7 +206,7 @@ void IndexPageIter::Invalidate()
     curr_offset_ = restart_offset_;
     curr_restart_idx_ = restart_num_;
     key_.clear();
-    page_id_ = UINT32_MAX;
+    page_id_ = MaxPageId;
 }
 
 const char *IndexPageIter::DecodeEntry(const char *ptr,
@@ -399,7 +399,7 @@ void IndexPageIter::Reset()
     curr_offset_ = MemIndexPage::leftmost_ptr_offset;
     curr_restart_idx_ = 0;
     key_.clear();
-    page_id_ = UINT32_MAX;
+    page_id_ = MaxPageId;
 }
 
 void IndexPageIter::Advance(std::string_view &key, uint32_t &page_id)
@@ -408,12 +408,12 @@ void IndexPageIter::Advance(std::string_view &key, uint32_t &page_id)
     {
         Next();
         key = Key();
-        page_id = PageId();
+        page_id = GetPageId();
     }
     else
     {
         key = std::string_view{};
-        page_id = UINT32_MAX;
+        page_id = MaxPageId;
     }
 }
 }  // namespace kvstore
