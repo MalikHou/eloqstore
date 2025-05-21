@@ -14,6 +14,7 @@ class Shard;
 enum class RequestType : uint8_t
 {
     Read,
+    Floor,
     Scan,
     Write,
     Truncate,
@@ -65,6 +66,27 @@ public:
     uint64_t ts_{0};
 };
 
+/**
+ * @brief Read the biggest key not greater than the search key.
+ * @return KvError::NotFound if such a key not exists.
+ */
+class FloorRequest : public KvRequest
+{
+public:
+    RequestType Type() const override
+    {
+        return RequestType::Floor;
+    }
+    void SetArgs(TableIdent tid, std::string_view key);
+
+    // input
+    std::string_view key_;
+    // output
+    std::string floor_key_;
+    std::string value_;
+    uint64_t ts_{0};
+};
+
 class ScanRequest : public KvRequest
 {
 public:
@@ -104,6 +126,9 @@ public:
     bool has_remaining_;
 };
 
+/**
+ * @brief Batch write atomically.
+ */
 class WriteRequest : public KvRequest
 {
 public:

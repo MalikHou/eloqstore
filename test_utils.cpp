@@ -98,6 +98,11 @@ MapVerifier::~MapVerifier()
     }
 }
 
+void MapVerifier::Upsert(uint64_t key)
+{
+    Upsert(key, key + 1);
+}
+
 void MapVerifier::Upsert(uint64_t begin, uint64_t end)
 {
     LOG(INFO) << "Upsert(" << begin << ',' << end << ')';
@@ -210,12 +215,33 @@ void MapVerifier::Read(std::string_view key)
     if (req.Error() == kvstore::KvError::NoError)
     {
         kvstore::KvEntry ret(key, req.value_, req.ts_);
-        CHECK(answer_.at(std::string(key)) == ret);
+        CheckKvEntry(answer_.at(std::string(key)), ret);
     }
     else
     {
         CHECK(req.Error() == kvstore::KvError::NotFound);
         CHECK(answer_.find(std::string(key)) == answer_.end());
+    }
+}
+
+void MapVerifier::Floor(std::string_view key)
+{
+    LOG(INFO) << "Floor(" << key << ')';
+
+    kvstore::FloorRequest req;
+    req.SetArgs(tid_, key);
+    eloq_store_->ExecSync(&req);
+    auto it_lb = answer_.upper_bound(std::string(key));
+    if (it_lb != answer_.begin())
+    {
+        it_lb--;
+        CHECK(req.Error() == kvstore::KvError::NoError);
+        kvstore::KvEntry ret(req.floor_key_, req.value_, req.ts_);
+        CheckKvEntry(it_lb->second, ret);
+    }
+    else
+    {
+        CHECK(req.Error() == kvstore::KvError::NotFound);
     }
 }
 

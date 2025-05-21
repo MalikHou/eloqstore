@@ -30,27 +30,76 @@ KvError ReadTask::Read(const TableIdent &tbl_id,
     CHECK_KV_ERR(err_load);
 
     DataPageIter iter{&page, Options()};
-    iter.Seek(search_key);
-    std::string_view seek_key = iter.Key();
-    if (!seek_key.empty() && seek_key == search_key)
-    {
-        if (iter.IsOverflow())
-        {
-            auto ret = GetOverflowValue(tbl_id, mapping.get(), iter.Value());
-            CHECK_KV_ERR(ret.second);
-            value = std::move(ret.first);
-        }
-        else
-        {
-            value = iter.Value();
-        }
-        timestamp = iter.Timestamp();
-        return KvError::NoError;
-    }
-    else
+    bool found = iter.Seek(search_key);
+    if (!found || Comp()->Compare(iter.Key(), search_key) != 0)
     {
         return KvError::NotFound;
     }
+
+    if (iter.IsOverflow())
+    {
+        auto ret = GetOverflowValue(tbl_id, mapping.get(), iter.Value());
+        CHECK_KV_ERR(ret.second);
+        value = std::move(ret.first);
+    }
+    else
+    {
+        value = iter.Value();
+    }
+    timestamp = iter.Timestamp();
+    return KvError::NoError;
 }
 
+KvError ReadTask::Floor(const TableIdent &tbl_id,
+                        std::string_view search_key,
+                        std::string &floor_key,
+                        std::string &value,
+                        uint64_t &timestamp)
+{
+    auto [meta, err] = shard->IndexManager()->FindRoot(tbl_id);
+    CHECK_KV_ERR(err);
+    if (meta->root_page_ == nullptr)
+    {
+        return KvError::NotFound;
+    }
+    auto mapping = meta->mapper_->GetMappingSnapshot();
+
+    PageId page_id;
+    err = shard->IndexManager()->SeekIndex(
+        mapping.get(), tbl_id, meta->root_page_, search_key, page_id);
+    CHECK_KV_ERR(err);
+    FilePageId file_page = mapping->ToFilePage(page_id);
+    auto [page, err_load] = LoadDataPage(tbl_id, page_id, file_page);
+    CHECK_KV_ERR(err_load);
+
+    DataPageIter iter{&page, Options()};
+    if (!iter.SeekFloor(search_key))
+    {
+        PageId page_id = page.PrevPageId();
+        if (page_id == MaxPageId)
+        {
+            return KvError::NotFound;
+        }
+        FilePageId file_page = mapping->ToFilePage(page_id);
+        auto [prev_page, err] = LoadDataPage(tbl_id, page_id, file_page);
+        CHECK_KV_ERR(err);
+        page = std::move(prev_page);
+        iter.Reset(&page, Options()->data_page_size);
+        bool found = iter.SeekFloor(search_key);
+        CHECK(found);
+    }
+    floor_key = iter.Key();
+    if (iter.IsOverflow())
+    {
+        auto ret = GetOverflowValue(tbl_id, mapping.get(), iter.Value());
+        CHECK_KV_ERR(ret.second);
+        value = std::move(ret.first);
+    }
+    else
+    {
+        value = iter.Value();
+    }
+    timestamp = iter.Timestamp();
+    return KvError::NoError;
+}
 }  // namespace kvstore

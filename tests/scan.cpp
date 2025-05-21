@@ -73,3 +73,27 @@ TEST_CASE("paginate the scan results", "[scan]")
     verify.Upsert(1, 3);
     verify.Scan(0, 10, 0, 1000);
 }
+
+TEST_CASE("read floor", "[read]")
+{
+    kvstore::EloqStore *store = InitStore(mem_store_opts);
+    MapVerifier verify(test_tbl_id, store, false);
+    verify.SetValueSize(1000);
+    verify.Upsert(2, 12);
+    verify.WriteRnd(20, 50, 0, 30);
+
+    // overflow value
+    verify.SetValueSize(10000);
+    verify.Upsert(15);
+
+    for (int i = 51; i >= 0; i--)
+    {
+        verify.Floor(Key(i));
+    }
+
+    verify.WriteRnd(5, 50);
+    for (int i = 51; i >= 0; i--)
+    {
+        verify.Floor(Key(i));
+    }
+}

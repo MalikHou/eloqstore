@@ -23,6 +23,7 @@ KvError ScanTask::Scan(const TableIdent &tbl_id,
                        std::vector<KvEntry> &result,
                        bool &has_remaining)
 {
+    assert(page_entries > 0 && page_size > 0);
     result.clear();
     has_remaining = false;
     size_t result_size = 0;
@@ -46,8 +47,8 @@ KvError ScanTask::Scan(const TableIdent &tbl_id,
     data_page_ = std::move(page);
 
     iter_.Reset(&data_page_, Options()->data_page_size);
-    iter_.Seek(begin_key);
-    if (iter_.Key().empty() && (err = Next(mapping.get())) != KvError::NoError)
+    if (!iter_.Seek(begin_key) &&
+        (err = Next(mapping.get())) != KvError::NoError)
     {
         goto End;
     }

@@ -142,6 +142,22 @@ void Shard::HandleReq(KvRequest *req)
         StartTask(task, req, lbd);
         break;
     }
+    case RequestType::Floor:
+    {
+        ReadTask *task = task_mgr_.GetReadTask();
+        auto lbd = [task, req]() -> KvError
+        {
+            auto floor_req = static_cast<FloorRequest *>(req);
+            KvError err = task->Floor(req->TableId(),
+                                      floor_req->key_,
+                                      floor_req->floor_key_,
+                                      floor_req->value_,
+                                      floor_req->ts_);
+            return err;
+        };
+        StartTask(task, req, lbd);
+        break;
+    }
     case RequestType::Scan:
     {
         ScanTask *task = task_mgr_.GetScanTask();

@@ -205,7 +205,90 @@ bool DataPageIter::Next()
     return ParseNextKey();
 }
 
-void DataPageIter::Seek(std::string_view search_key)
+bool DataPageIter::SeekFloor(std::string_view search_key)
+{
+    auto [equal, ceil_point] = SearchRegion(search_key);
+    if (equal)
+    {
+        SeekToRestart(ceil_point);
+        ParseNextKey();
+        return true;
+    }
+    else if (ceil_point == 0)
+    {
+        // All keys in this page are bigger than search_key.
+        return false;
+    }
+
+    uint16_t last_offset = restart_offset_;
+    std::string key;
+    std::string_view value = {};
+    bool overflow;
+    uint64_t timestamp = 0;
+
+    assert(ceil_point <= restart_num_);
+    uint16_t limit =
+        ceil_point < restart_num_ ? RestartOffset(ceil_point) : restart_offset_;
+    // Linear searches the region before the ceiling restart point.
+    SeekToRestart(ceil_point - 1);
+    while (curr_offset_ < limit)
+    {
+        ParseNextKey();
+        if (cmp_->Compare(Key(), search_key) > 0)
+        {
+            break;
+        }
+        last_offset = curr_offset_;
+        key = Key();
+        value = Value();
+        overflow = IsOverflow();
+        timestamp = Timestamp();
+    }
+    curr_offset_ = last_offset;
+    key_ = std::move(key);
+    value_ = value;
+    overflow_ = overflow;
+    timestamp_ = timestamp;
+    return true;
+}
+
+bool DataPageIter::Seek(std::string_view search_key)
+{
+    auto [equal, ceil_point] = SearchRegion(search_key);
+    if (equal || ceil_point == 0)
+    {
+        assert(ceil_point < restart_num_);
+        // The search key matches a restart point or is smaller than the first
+        // restart point. Positions to the restart point.
+        SeekToRestart(ceil_point);
+        ParseNextKey();
+        return true;
+    }
+    else
+    {
+        assert(ceil_point > 0 && ceil_point <= restart_num_);
+        uint16_t limit = ceil_point < restart_num_ ? RestartOffset(ceil_point)
+                                                   : restart_offset_;
+        // Linear searches the region before the ceiling restart point.
+        SeekToRestart(ceil_point - 1);
+        while (curr_offset_ < limit)
+        {
+            ParseNextKey();
+            std::string_view data_key = Key();
+            if (cmp_->Compare(data_key, search_key) >= 0)
+            {
+                // Finds the ceiling of the search key.
+                return true;
+            }
+        }
+        // The search key is greater than all data keys in the region prior to
+        // the ceiling restart point. The offset now points to the ceiling
+        // restart point or the page end.
+        return ParseNextKey();
+    }
+}
+
+std::pair<bool, uint16_t> DataPageIter::SearchRegion(std::string_view key) const
 {
     assert(restart_num_ > 0);
 
@@ -221,20 +304,17 @@ void DataPageIter::Seek(std::string_view search_key)
         size_t mid = left + step;
         uint16_t region_offset = RestartOffset(mid);
         uint32_t shared, non_shared, val_len;
+        bool overflow;
         const char *key_ptr = DecodeEntry(page_.data() + region_offset,
                                           page_.data() + restart_offset_,
                                           &shared,
                                           &non_shared,
                                           &val_len,
-                                          &overflow_);
-        if (key_ptr == nullptr || shared != 0)
-        {
-            Invalidate();
-            return;
-        }
+                                          &overflow);
+        assert(key_ptr != nullptr && shared == 0);
 
         std::string_view pivot{key_ptr, non_shared};
-        cmp_ret = cmp_->Compare(pivot, search_key);
+        cmp_ret = cmp_->Compare(pivot, key);
         if (cmp_ret < 0)
         {
             left = mid + 1;
@@ -245,42 +325,7 @@ void DataPageIter::Seek(std::string_view search_key)
             cnt = step;
         }
     }
-
-    if (cmp_ret == 0 || left == 0)
-    {
-        assert(left < restart_num_);
-        // The search key matches a restart point or is smaller than the first
-        // restart point. Positions to the restart point.
-        SeekToRestart(left);
-        ParseNextKey();
-    }
-    else
-    {
-        assert(left > 0 && left <= restart_num_);
-        uint16_t limit =
-            left < restart_num_ ? RestartOffset(left) : restart_offset_;
-        // Linear searches the region before the ceiling restart point.
-        SeekToRestart(left - 1);
-        while (curr_offset_ < limit)
-        {
-            if (!ParseNextKey())
-            {
-                Invalidate();
-                return;
-            }
-
-            std::string_view data_key = Key();
-            if (cmp_->Compare(data_key, search_key) >= 0)
-            {
-                // Finds the ceiling of the search key.
-                return;
-            }
-        }
-        // The search key is greater than all data keys in the region prior to
-        // the ceiling restart point. The offset now points to the ceiling
-        // restart point or the page end.
-        ParseNextKey();
-    }
+    return {cmp_ret == 0, left};
 }
 
 uint16_t DataPageIter::RestartOffset(uint16_t restart_idx) const

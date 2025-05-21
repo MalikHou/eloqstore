@@ -74,9 +74,29 @@ public:
 
     bool HasNext() const;
     bool Next();
-    void Seek(std::string_view search_key);
+
+    /**
+     * @brief Seeks to the first key in the page equal to or greater than the
+     * search key.
+     */
+    bool Seek(std::string_view search_key);
+
+    /**
+     * @brief Seek to the last key in the page not greater than search_key.
+     * @return false if such a key not exists.
+     */
+    bool SeekFloor(std::string_view search_key);
 
 private:
+    /**
+     * @brief Searches the first region whose start key is no less than the
+     * search key.
+     * @return <false, region-idx> if the start key of region at region-idx is
+     * greater than the search key.
+     * @return <true, region-idx> if the search key exactly equal to the start
+     * key of the region at region-idx.
+     */
+    std::pair<bool, uint16_t> SearchRegion(std::string_view key) const;
     uint16_t RestartOffset(uint16_t restart_idx) const;
     void SeekToRestart(uint16_t restart_idx);
     bool ParseNextKey();

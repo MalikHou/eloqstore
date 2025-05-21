@@ -250,6 +250,12 @@ void ReadRequest::SetArgs(TableIdent tbl_id, std::string_view key)
     key_ = key;
 }
 
+void FloorRequest::SetArgs(TableIdent tbl_id, std::string_view key)
+{
+    SetTableId(std::move(tbl_id));
+    key_ = key;
+}
+
 void ScanRequest::SetArgs(TableIdent tbl_id,
                           std::string_view begin,
                           std::string_view end,

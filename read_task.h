@@ -20,6 +20,15 @@ public:
                  std::string &value,
                  uint64_t &timestamp);
 
+    /**
+     * @brief Read the biggest key not greater than the search key.
+     */
+    KvError Floor(const TableIdent &tbl_id,
+                  std::string_view search_key,
+                  std::string &floor_key,
+                  std::string &value,
+                  uint64_t &timestamp);
+
     TaskType Type() const override
     {
         return TaskType::Read;
