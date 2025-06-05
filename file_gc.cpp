@@ -1,5 +1,6 @@
 #include "file_gc.h"
 
+#include <boost/algorithm/string/predicate.hpp>
 #include <filesystem>
 #include <fstream>
 #include <unordered_set>
@@ -103,14 +104,19 @@ KvError FileGarbageCollector::Execute(const KvOptions *opts,
     // Scan all archives and data files.
     for (auto &ent : fs::directory_iterator{dir_path})
     {
-        const std::string name = ent.path().filename().string();
+        const std::string name = ent.path().filename();
+        if (boost::algorithm::ends_with(name, TmpSuffix))
+        {
+            // Skip temporary files.
+            continue;
+        }
         auto ret = ParseFileName(name);
         if (ret.first == FileNameManifest)
         {
             if (!ret.second.empty())
             {
                 uint64_t ts = std::stoull(ret.second.data());
-                if (ts < mapping_ts)
+                if (ts <= mapping_ts)
                 {
                     archives.emplace_back(ts);
                 }

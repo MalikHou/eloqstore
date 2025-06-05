@@ -24,13 +24,12 @@ class DataPage
 {
 public:
     DataPage() = default;
-    DataPage(PageId page_id, uint16_t page_size = 0);
+    DataPage(PageId page_id);
     DataPage(PageId page_id, Page page)
         : page_id_(page_id), page_(std::move(page)) {};
     DataPage(const DataPage &) = delete;
     DataPage(DataPage &&rhs);
     DataPage &operator=(DataPage &&);
-    ~DataPage();
 
     static uint16_t const page_size_offset = page_type_offset + sizeof(uint8_t);
     static uint16_t const prev_page_offset =
@@ -54,7 +53,7 @@ public:
 
 private:
     PageId page_id_{MaxPageId};
-    Page page_{nullptr, std::free};
+    Page page_{false};
 };
 
 std::ostream &operator<<(std::ostream &out, DataPage const &page);
@@ -145,8 +144,6 @@ public:
                  std::span<PageId> pointers = {});
     OverflowPage(const OverflowPage &) = delete;
     OverflowPage(OverflowPage &&rhs);
-    ~OverflowPage();
-    void Clear();
     void SetPageId(PageId page_id);
     PageId GetPageId() const;
     char *PagePtr() const;
@@ -168,6 +165,6 @@ public:
 
 private:
     PageId page_id_{MaxPageId};
-    Page page_{nullptr, std::free};
+    Page page_{false};
 };
 }  // namespace kvstore

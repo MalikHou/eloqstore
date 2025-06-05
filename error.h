@@ -16,14 +16,17 @@ enum struct KvError : uint8_t
     InvalidArgs,
     NotFound,
     NotRunning,
+    Corrupted,
     EndOfFile,
     OutOfSpace,
     OutOfMem,
-    Corrupted,
     OpenFileLimit,
     TryAgain,
     Busy,
-    IoFail,
+    Timeout,
+    NoPermission,
+    CloudErr,
+    IoFail
 };
 
 constexpr const char *ErrorString(KvError err)
@@ -54,8 +57,27 @@ constexpr const char *ErrorString(KvError err)
         return "Device or resource busy";
     case KvError::IoFail:
         return "I/O failure";
+    case KvError::CloudErr:
+        return "Cloud service is unavailable";
+    case KvError::Timeout:
+        return "Operation timeout";
+    case KvError::NoPermission:
+        return "Operation not permitted";
     }
     return "Unknown error";
+}
+
+constexpr bool IsRetryableErr(KvError err)
+{
+    switch (err)
+    {
+    case KvError::OpenFileLimit:
+    case KvError::Busy:
+    case KvError::TryAgain:
+        return true;
+    default:
+        return false;
+    }
 }
 
 }  // namespace kvstore

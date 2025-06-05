@@ -165,18 +165,7 @@ KvError TruncateTask::Truncate(std::string_view trunc_pos)
     auto ret = TruncateIndexPage(cow_meta_.root_->GetPageId(), trunc_pos);
     CHECK_KV_ERR(ret.second);
     MemIndexPage *new_root = ret.first;
-
-    if (new_root != nullptr)
-    {
-        // Prevent the root page from being evicted before update RootMeta.
-        new_root->Pin();
-        err = UpdateMeta(new_root);
-        new_root->Unpin();
-    }
-    else
-    {
-        err = UpdateMeta(nullptr);
-    }
+    err = UpdateMeta(new_root);
     return err;
 }
 
@@ -233,7 +222,7 @@ std::pair<bool, KvError> TruncateTask::TruncateDataPage(
     else
     {
         // This currently updated data page will become the new tail data page.
-        DataPage new_page(page_id, Options()->data_page_size);
+        DataPage new_page(page_id);
         std::string_view page_view = data_page_builder_.Finish();
         memcpy(new_page.PagePtr(), page_view.data(), page_view.size());
         new_page.SetNextPageId(MaxPageId);

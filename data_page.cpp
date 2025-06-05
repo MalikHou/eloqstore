@@ -9,25 +9,12 @@
 
 #include "coding.h"
 #include "kv_options.h"
-#include "shard.h"
 
 namespace kvstore
 {
-DataPage::DataPage(PageId page_id, uint16_t page_size) : page_id_(page_id)
+DataPage::DataPage(PageId page_id) : page_id_(page_id)
 {
-    if (page_size == 0)
-    {
-        return;
-    }
-
-    if (shard != nullptr)
-    {
-        page_ = shard->PagePool()->Allocate();
-    }
-    else
-    {
-        page_ = AllocPage(page_size);
-    }
+    page_ = Page{true};
 }
 
 DataPage::DataPage(DataPage &&rhs)
@@ -46,44 +33,39 @@ DataPage &DataPage::operator=(DataPage &&other)
     return *this;
 }
 
-DataPage::~DataPage()
-{
-    Clear();
-}
-
 bool DataPage::IsEmpty() const
 {
-    return page_ == nullptr;
+    return page_.Ptr() == nullptr;
 }
 
 uint16_t DataPage::ContentLength() const
 {
-    return DecodeFixed16(page_.get() + page_size_offset);
+    return DecodeFixed16(page_.Ptr() + page_size_offset);
 }
 
 uint16_t DataPage::RestartNum() const
 {
-    return DecodeFixed16(page_.get() + ContentLength() - sizeof(uint16_t));
+    return DecodeFixed16(page_.Ptr() + ContentLength() - sizeof(uint16_t));
 }
 
 PageId DataPage::PrevPageId() const
 {
-    return DecodeFixed32(page_.get() + prev_page_offset);
+    return DecodeFixed32(page_.Ptr() + prev_page_offset);
 }
 
 PageId DataPage::NextPageId() const
 {
-    return DecodeFixed32(page_.get() + next_page_offset);
+    return DecodeFixed32(page_.Ptr() + next_page_offset);
 }
 
 void DataPage::SetPrevPageId(PageId page_id)
 {
-    EncodeFixed32(page_.get() + prev_page_offset, page_id);
+    EncodeFixed32(page_.Ptr() + prev_page_offset, page_id);
 }
 
 void DataPage::SetNextPageId(PageId page_id)
 {
-    EncodeFixed32(page_.get() + next_page_offset, page_id);
+    EncodeFixed32(page_.Ptr() + next_page_offset, page_id);
 }
 
 void DataPage::SetPageId(PageId page_id)
@@ -98,7 +80,7 @@ PageId DataPage::GetPageId() const
 
 char *DataPage::PagePtr() const
 {
-    return page_.get();
+    return page_.Ptr();
 }
 
 Page DataPage::GetPtr()
@@ -113,17 +95,7 @@ void DataPage::SetPtr(Page ptr)
 
 void DataPage::Clear()
 {
-    if (page_ != nullptr)
-    {
-        if (shard != nullptr)
-        {
-            shard->PagePool()->Free(std::move(page_));
-        }
-        else
-        {
-            page_ = nullptr;
-        }
-    }
+    page_.Free();
 }
 
 std::ostream &operator<<(std::ostream &out, DataPage const &page)
@@ -450,7 +422,7 @@ const char *DataPageIter::DecodeEntry(const char *p,
 OverflowPage::OverflowPage(PageId page_id, Page page)
     : page_id_(page_id), page_(std::move(page))
 {
-    assert(TypeOfPage(page_.get()) == PageType::Overflow);
+    assert(TypeOfPage(page_.Ptr()) == PageType::Overflow);
 }
 
 OverflowPage::OverflowPage(PageId page_id,
@@ -464,21 +436,14 @@ OverflowPage::OverflowPage(PageId page_id,
         return;
     }
 
-    if (shard != nullptr)
-    {
-        page_ = shard->PagePool()->Allocate();
-    }
-    else
-    {
-        page_ = AllocPage(opts->data_page_size);
-    }
+    page_ = Page(true);
 
-    SetPageType(page_.get(), PageType::Overflow);
+    SetPageType(page_.Ptr(), PageType::Overflow);
 
-    EncodeFixed16(page_.get() + OverflowPage::page_size_offset, val.size());
-    memcpy(page_.get() + OverflowPage::value_offset, val.data(), val.size());
+    EncodeFixed16(page_.Ptr() + OverflowPage::page_size_offset, val.size());
+    memcpy(page_.Ptr() + OverflowPage::value_offset, val.data(), val.size());
 
-    char *dst = (page_.get() + opts->data_page_size - 1);
+    char *dst = (page_.Ptr() + opts->data_page_size - 1);
     *dst = pointers.size();
     if (!pointers.empty())
     {
@@ -497,34 +462,14 @@ OverflowPage::OverflowPage(OverflowPage &&rhs)
 {
 }
 
-OverflowPage::~OverflowPage()
-{
-    Clear();
-}
-
-void OverflowPage::Clear()
-{
-    if (page_ != nullptr)
-    {
-        if (shard != nullptr)
-        {
-            shard->PagePool()->Free(std::move(page_));
-        }
-        else
-        {
-            page_ = nullptr;
-        }
-    }
-}
-
 uint16_t OverflowPage::ValueSize() const
 {
-    return DecodeFixed16(page_.get() + page_size_offset);
+    return DecodeFixed16(page_.Ptr() + page_size_offset);
 }
 
 std::string_view OverflowPage::GetValue() const
 {
-    return {page_.get() + value_offset, ValueSize()};
+    return {page_.Ptr() + value_offset, ValueSize()};
 }
 
 void OverflowPage::SetPageId(PageId page_id)
@@ -539,7 +484,7 @@ PageId OverflowPage::GetPageId() const
 
 char *OverflowPage::PagePtr() const
 {
-    return page_.get();
+    return page_.Ptr();
 }
 
 uint16_t OverflowPage::Capacity(const KvOptions *options, bool end)
@@ -556,7 +501,7 @@ uint16_t OverflowPage::Capacity(const KvOptions *options, bool end)
 
 uint8_t OverflowPage::NumPointers(const KvOptions *options) const
 {
-    return *(page_.get() + options->data_page_size - 1);
+    return *(page_.Ptr() + options->data_page_size - 1);
 }
 
 std::string_view OverflowPage::GetEncodedPointers(
@@ -568,7 +513,7 @@ std::string_view OverflowPage::GetEncodedPointers(
         return {};
     }
     char *ptr =
-        page_.get() + options->data_page_size - 1 - (n * sizeof(uint32_t));
+        page_.Ptr() + options->data_page_size - 1 - (n * sizeof(uint32_t));
     return {ptr, n * sizeof(uint32_t)};
 }
 

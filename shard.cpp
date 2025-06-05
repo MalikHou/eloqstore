@@ -4,27 +4,19 @@ namespace kvstore
 {
 Shard::Shard(const EloqStore *store)
     : store_(store),
-      page_pool_(store->options_.data_page_size),
-      io_mgr_(AsyncIoManager::New(&store->options_)),
+      page_pool_(&store->options_),
+      io_mgr_(AsyncIoManager::Instance(store)),
       index_mgr_(io_mgr_.get()),
       stack_pool_(store->options_.coroutine_stack_size)
 {
 }
 
-Shard::~Shard()
+KvError Shard::Init()
 {
-    if (thd_.joinable())
-    {
-        thd_.join();
-    }
+    return io_mgr_->Init(this);
 }
 
-KvError Shard::Init(std::span<int> root_fds)
-{
-    return io_mgr_->Init(root_fds);
-}
-
-void Shard::Loop()
+void Shard::WorkLoop()
 {
     while (true)
     {
@@ -35,7 +27,7 @@ void Shard::Loop()
             OnReceivedReq(reqs[i]);
         }
 
-        if (nreqs == 0 && task_mgr_.IsIdle())
+        if (nreqs == 0 && task_mgr_.NumActive() == 0)
         {
             if (store_->IsStopped())
             {
@@ -59,7 +51,8 @@ void Shard::Start()
         [this]
         {
             shard = this;
-            Loop();
+            io_mgr_->Start();
+            WorkLoop();
         });
 }
 
@@ -75,7 +68,8 @@ bool Shard::AddKvRequest(KvRequest *req)
 
 void Shard::AddCompactRequest(const TableIdent &tbl_id)
 {
-    write_queue_[tbl_id].Enqueue(uint64_t(QueueElement::Compact));
+    assert(pending_queues_.find(tbl_id) != pending_queues_.end());
+    pending_queues_[tbl_id].SetCompact(true);
 }
 
 IndexPageManager *Shard::IndexManager()
@@ -105,25 +99,23 @@ const KvOptions *Shard::Options() const
 
 void Shard::OnReceivedReq(KvRequest *req)
 {
-    if (req->Type() == RequestType::Write ||
-        req->Type() == RequestType::Truncate ||
-        req->Type() == RequestType::Archive)
+    if (auto wreq = dynamic_cast<WriteRequest *>(req); wreq != nullptr)
     {
         // Try acquire lock to ensure write operation is executed
         // sequentially on each table partition.
-        auto [it, ok] = write_queue_.try_emplace(req->tbl_id_);
+        auto [it, ok] = pending_queues_.try_emplace(req->tbl_id_);
         if (!ok)
         {
-            // Blocked on queue because of other write task.
-            it->second.Enqueue(uint64_t(req));
+            // Wait on pending write queue because of other write task.
+            it->second.PushBack(wreq);
             return;
         }
     }
 
-    HandleReq(req);
+    ProcessReq(req);
 }
 
-void Shard::HandleReq(KvRequest *req)
+void Shard::ProcessReq(KvRequest *req)
 {
     switch (req->Type())
     {
@@ -176,12 +168,12 @@ void Shard::HandleReq(KvRequest *req)
         StartTask(task, req, lbd);
         break;
     }
-    case RequestType::Write:
+    case RequestType::BatchWrite:
     {
         BatchWriteTask *task = task_mgr_.GetBatchWriteTask(req->TableId());
         auto lbd = [task, req]() -> KvError
         {
-            auto write_req = static_cast<WriteRequest *>(req);
+            auto write_req = static_cast<BatchWriteRequest *>(req);
             if (write_req->batch_.empty())
             {
                 return KvError::NoError;
@@ -245,10 +237,11 @@ void Shard::ResumeScheduled()
 {
     while (scheduled_.Size() > 0)
     {
-        thd_task = scheduled_.Peek();
+        running_ = scheduled_.Peek();
         scheduled_.Dequeue();
-        thd_task->coro_ = thd_task->coro_.resume();
+        running_->coro_ = running_->coro_.resume();
     }
+    running_ = nullptr;
 }
 
 void Shard::PollFinished()
@@ -258,8 +251,7 @@ void Shard::PollFinished()
         KvTask *task = finished_.Peek();
         finished_.Dequeue();
 
-        if (WriteTask *wtask = dynamic_cast<WriteTask *>(task);
-            wtask != nullptr)
+        if (auto *wtask = dynamic_cast<WriteTask *>(task); wtask != nullptr)
         {
             OnWriteFinished(wtask->TableId());
         }
@@ -271,33 +263,71 @@ void Shard::PollFinished()
 
 void Shard::OnWriteFinished(const TableIdent &tbl_id)
 {
-    auto it = write_queue_.find(tbl_id);
-    assert(it != write_queue_.end());
-    if (it->second.Size() == 0)
+    auto it = pending_queues_.find(tbl_id);
+    assert(it != pending_queues_.end());
+    PendingWriteQueue &pending = it->second;
+    if (pending.Empty())
     {
-        // Clear lock queue.
-        write_queue_.erase(it);
+        if (!pending.HasCompact())
+        {
+            // No more write requests, remove the lock queue.
+            pending_queues_.erase(it);
+            return;
+        }
+        pending.SetCompact(false);
+        StartCompact(tbl_id);
         return;
     }
-    uint64_t val = it->second.Peek();
-    it->second.Dequeue();
-    switch (val & uint64_t(QueueElement::Mask))
+
+    WriteRequest *req = pending.PopFront();
+    // Continue execute the next pending write request.
+    ProcessReq(req);
+}
+
+void Shard::PendingWriteQueue::SetCompact(bool val)
+{
+    compact_ = val;
+}
+
+bool Shard::PendingWriteQueue::HasCompact() const
+{
+    return compact_;
+}
+
+void Shard::PendingWriteQueue::PushBack(WriteRequest *req)
+{
+    if (tail_ == nullptr)
     {
-    case uint64_t(QueueElement::KvRequest):
+        assert(head_ == nullptr);
+        head_ = tail_ = req;
+    }
+    else
     {
-        // Continue execute the next write request.
-        KvRequest *req = reinterpret_cast<KvRequest *>(val);
-        HandleReq(req);
-        break;
+        assert(head_ != nullptr);
+        req->next_ = nullptr;
+        tail_->next_ = req;
+        tail_ = req;
     }
-    case uint64_t(QueueElement::Compact):
+}
+
+WriteRequest *Shard::PendingWriteQueue::PopFront()
+{
+    WriteRequest *req = head_;
+    if (req != nullptr)
     {
-        StartCompact(tbl_id);
-        break;
+        head_ = req->next_;
+        if (head_ == nullptr)
+        {
+            tail_ = nullptr;
+        }
+        req->next_ = nullptr;  // Clear next pointer for safety.
     }
-    default:
-        LOG(FATAL) << "Invalid write queue element type";
-    }
+    return req;
+}
+
+bool Shard::PendingWriteQueue::Empty() const
+{
+    return head_ == nullptr;
 }
 
 }  // namespace kvstore

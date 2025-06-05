@@ -71,16 +71,11 @@ void ArchiveCrond::StartArchiving()
 {
     LOG(INFO) << "Start archiving all partitions";
     const uint32_t archive_batch = store_->Options().max_archive_tasks;
-    std::vector<TableIdent> table_ids;
-    table_ids.reserve(archive_batch);
     std::vector<ArchiveRequest> requests(archive_batch);
-    size_t total_partitions = 0;
     size_t fail_cnt = 0;
-
     auto do_archiving = [&](std::span<TableIdent> tbl_ids)
     {
         const size_t batch_size = tbl_ids.size();
-        total_partitions += batch_size;
         for (size_t i = 0; i < batch_size; i++)
         {
             requests[i].SetArgs(std::move(tbl_ids[i]));
@@ -98,8 +93,12 @@ void ArchiveCrond::StartArchiving()
         }
     };
 
+    std::vector<TableIdent> table_ids;
+    table_ids.reserve(archive_batch);
+    size_t total_partitions = 0;
     for (const fs::path &db_path : store_->Options().store_path)
     {
+        table_ids.clear();
         for (auto &ent : fs::directory_iterator{db_path})
         {
             if (!ent.is_directory())
@@ -114,18 +113,16 @@ void ArchiveCrond::StartArchiving()
                 continue;
             }
             table_ids.emplace_back(std::move(tbl_id));
-
-            assert(table_ids.size() <= archive_batch);
-            if (table_ids.size() == archive_batch)
-            {
-                do_archiving(table_ids);
-                table_ids.clear();
-            }
         }
-    }
-    if (!table_ids.empty())
-    {
-        do_archiving(table_ids);
+        total_partitions += table_ids.size();
+
+        for (size_t i = 0; i < table_ids.size(); i += archive_batch)
+        {
+            auto it_begin = table_ids.begin() + i;
+            const size_t size =
+                std::min(size_t(archive_batch), table_ids.size() - i);
+            do_archiving({it_begin, size});
+        }
     }
 
     LOG(INFO) << "Finished archiving " << total_partitions << " partitions, "

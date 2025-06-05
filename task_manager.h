@@ -26,50 +26,61 @@ public:
     void FreeTask(KvTask *task);
 
     uint32_t NumActive() const;
-    bool IsIdle() const;
 
 private:
     template <typename T>
     class TaskPool
     {
     public:
+        TaskPool(uint32_t size)
+        {
+            if (size > 0)
+            {
+                init_pool_ = std::make_unique<T[]>(size);
+                for (uint32_t i = 0; i < size; i++)
+                {
+                    FreeTask(&init_pool_[i]);
+                }
+            }
+        };
+
         T *GetTask()
         {
-            if (free_tasks_.empty())
+            if (free_head_ != nullptr)
             {
-                auto task = std::make_unique<T>();
-                free_tasks_.push_back(task.get());
-                tasks_pool_.emplace_back(std::move(task));
+                // Reuse a free task.
+                T *task = free_head_;
+                free_head_ = static_cast<T *>(task->next_);
+                task->next_ = nullptr;
+                return task;
             }
-            T *task = free_tasks_.back();
-            free_tasks_.pop_back();
-            return task;
+            auto &task = ext_pool_.emplace_back(std::make_unique<T>());
+            return task.get();
         }
 
         void FreeTask(T *task)
         {
-            free_tasks_.push_back(task);
-        }
-
-        uint32_t NumActive() const
-        {
-            return tasks_pool_.size() - free_tasks_.size();
-        }
-        bool IsIdle() const
-        {
-            return tasks_pool_.size() == free_tasks_.size();
+            task->next_ = free_head_;
+            free_head_ = task;
         }
 
     private:
-        std::vector<std::unique_ptr<T>> tasks_pool_;
-        std::vector<T *> free_tasks_;
+        std::unique_ptr<T[]> init_pool_{nullptr};
+        std::vector<std::unique_ptr<T>> ext_pool_;
+        T *free_head_{nullptr};
+
+        // TODO(zhanghao): TaskPool should have a capacity limit.
+        // Push KvRequest that need new KvTask to the back of this list when
+        // capacity limit is reached.
+        // KvRequest* head_{nullptr}, tail_{nullptr};
     };
 
-    TaskPool<BatchWriteTask> batch_write_pool_;
-    TaskPool<TruncateTask> truncate_pool_;
-    TaskPool<CompactTask> compact_pool_;
-    TaskPool<ArchiveTask> archive_pool_;
-    TaskPool<ReadTask> read_pool_;
-    TaskPool<ScanTask> scan_pool_;
+    TaskPool<BatchWriteTask> batch_write_pool_{1024};
+    TaskPool<TruncateTask> truncate_pool_{512};
+    TaskPool<CompactTask> compact_pool_{1024};
+    TaskPool<ArchiveTask> archive_pool_{256};
+    TaskPool<ReadTask> read_pool_{2048};
+    TaskPool<ScanTask> scan_pool_{2048};
+    size_t num_active_{0};
 };
 }  // namespace kvstore

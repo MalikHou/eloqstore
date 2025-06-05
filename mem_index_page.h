@@ -28,19 +28,13 @@ public:
     static uint16_t const leftmost_ptr_offset =
         page_size_offset + sizeof(uint16_t);
 
-    /**
-     * @brief Constructs an in-memory index page.
-     *
-     * @param page_size The maximal allowed page size is 64KB
-     */
-    explicit MemIndexPage(uint16_t page_size);
-
+    MemIndexPage(bool alloc = true) : page_(alloc) {};
     uint16_t ContentLength() const;
     uint16_t RestartNum() const;
 
     char *PagePtr() const
     {
-        return page_.get();
+        return page_.Ptr();
     }
 
     void Deque();
@@ -119,7 +113,7 @@ private:
      */
     uint32_t ref_cnt_{0};
 
-    Page page_{nullptr, std::free};
+    Page page_;
 
     /**
      * @brief A doubly-linked list of in-memory pages for cache replacement. An

@@ -14,19 +14,14 @@
 
 namespace kvstore
 {
-MemIndexPage::MemIndexPage(uint16_t page_size)
-{
-    page_ = AllocPage(page_size);
-}
-
 uint16_t MemIndexPage::ContentLength() const
 {
-    return DecodeFixed16(page_.get() + page_size_offset);
+    return DecodeFixed16(page_.Ptr() + page_size_offset);
 }
 
 uint16_t MemIndexPage::RestartNum() const
 {
-    return DecodeFixed16(page_.get() + ContentLength() - sizeof(uint16_t));
+    return DecodeFixed16(page_.Ptr() + ContentLength() - sizeof(uint16_t));
 }
 
 void MemIndexPage::Deque()
@@ -96,7 +91,7 @@ void MemIndexPage::EnqueNext(MemIndexPage *new_page)
 
 bool MemIndexPage::IsPointingToLeaf() const
 {
-    return TypeOfPage(page_.get()) == PageType::LeafIndex;
+    return TypeOfPage(page_.Ptr()) == PageType::LeafIndex;
 }
 
 std::string MemIndexPage::String(const KvOptions *opts) const

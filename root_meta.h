@@ -52,7 +52,8 @@ struct RootMeta
     RootMeta() = default;
     RootMeta(const RootMeta &rhs) = delete;
     RootMeta(RootMeta &&rhs) = default;
-    bool Evict();
+    void Pin();
+    void Unpin();
 
     MemIndexPage *root_page_{nullptr};
     std::unique_ptr<PageMapper> mapper_{nullptr};

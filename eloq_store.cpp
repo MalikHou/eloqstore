@@ -1,6 +1,7 @@
 #include "eloq_store.h"
 
 #include <glog/logging.h>
+#include <sys/resource.h>
 
 #include <atomic>
 #include <cassert>
@@ -20,22 +21,38 @@ namespace kvstore
 
 EloqStore::EloqStore(const KvOptions &opts) : options_(opts), stopped_(true)
 {
-    CHECK((options_.data_page_size & (page_align - 1)) == 0);
-
-    // Align stack size
-    options_.coroutine_stack_size =
-        ((options_.coroutine_stack_size + page_align - 1) & ~(page_align - 1));
+    if ((options_.data_page_size & (page_align - 1)) != 0)
+    {
+        LOG(FATAL) << "Option data_page_size is not page aligned";
+    }
+    if ((options_.coroutine_stack_size & (page_align - 1)) != 0)
+    {
+        LOG(FATAL) << "Option coroutine_stack_size is not page aligned";
+    }
 
     if (options_.overflow_pointers == 0 ||
         options_.overflow_pointers > max_overflow_pointers)
     {
         LOG(FATAL) << "Invalid option overflow_pointers";
     }
-
     if (options_.max_write_batch_pages == 0 ||
         options_.max_write_batch_pages > max_write_pages_batch)
     {
         LOG(FATAL) << "Invalid option max_write_batch_pages";
+    }
+
+    if (!options_.cloud_store_path.empty())
+    {
+        if (options_.num_gc_threads > 0)
+        {
+            LOG(FATAL)
+                << "num_gc_threads must be 0 when cloud store is enabled";
+        }
+        if (options_.local_space_limit == 0)
+        {
+            LOG(FATAL)
+                << "Must set local_space_limit when cloud store is enabled ";
+        }
     }
 }
 
@@ -49,12 +66,17 @@ EloqStore::~EloqStore()
 
 KvError EloqStore::Start()
 {
+    eloqstore = this;
+    // Initialize
     if (!options_.store_path.empty())
     {
-        KvError err = InitDBDir();
+        KvError err = InitStoreSpace();
         CHECK_KV_ERR(err);
     }
-
+    if (!options_.cloud_store_path.empty())
+    {
+        obj_store_ = std::make_unique<ObjectStore>(&options_);
+    }
     shards_.resize(options_.num_threads);
     for (size_t i = 0; i < options_.num_threads; i++)
     {
@@ -62,10 +84,11 @@ KvError EloqStore::Start()
         {
             shards_[i] = std::make_unique<Shard>(this);
         }
-        KvError err = shards_[i]->Init(root_fds_);
+        KvError err = shards_[i]->Init();
         CHECK_KV_ERR(err);
     }
 
+    // Start threads.
     stopped_.store(false, std::memory_order_relaxed);
 
     if (options_.data_append_mode)
@@ -77,7 +100,6 @@ KvError EloqStore::Start()
                 file_gc_ = std::make_unique<FileGarbageCollector>(&options_);
             }
             file_gc_->Start(options_.num_gc_threads);
-            file_garbage_collector = file_gc_.get();
         }
         if (options_.num_retained_archives > 0 &&
             options_.archive_interval_secs > 0)
@@ -90,6 +112,11 @@ KvError EloqStore::Start()
         }
     }
 
+    if (!options_.cloud_store_path.empty())
+    {
+        obj_store_->Start();
+    }
+
     for (auto &shard : shards_)
     {
         shard->Start();
@@ -99,8 +126,30 @@ KvError EloqStore::Start()
     return KvError::NoError;
 }
 
-KvError EloqStore::InitDBDir()
+KvError EloqStore::InitStoreSpace()
 {
+    rlimit fd_limit;
+    int res = getrlimit(RLIMIT_NOFILE, &fd_limit);
+    if (res < 0)
+    {
+        LOG(ERROR) << "failed to read open file limit: " << strerror(errno);
+        return ToKvError(res);
+    }
+    uint32_t opt_limit = options_.fd_limit * options_.num_threads;
+    if (fd_limit.rlim_cur < opt_limit)
+    {
+        LOG(INFO) << "increase open file limit from " << fd_limit.rlim_cur
+                  << "(hard=" << fd_limit.rlim_max << ") to " << opt_limit;
+        fd_limit.rlim_cur = opt_limit;
+        if (setrlimit(RLIMIT_NOFILE, &fd_limit) != 0)
+        {
+            LOG(ERROR) << "failed to increase open file limit: "
+                       << strerror(errno);
+            return KvError::OpenFileLimit;
+        }
+    }
+
+    const bool cloud_store = !options_.cloud_store_path.empty();
     for (const fs::path &store_path : options_.store_path)
     {
         if (fs::exists(store_path))
@@ -108,6 +157,11 @@ KvError EloqStore::InitDBDir()
             if (!fs::is_directory(store_path))
             {
                 LOG(ERROR) << "path " << store_path << " is not directory";
+                return KvError::InvalidArgs;
+            }
+            if (cloud_store && !std::filesystem::is_empty(store_path))
+            {
+                LOG(ERROR) << store_path << " is not empty in cloud store mode";
                 return KvError::InvalidArgs;
             }
             for (auto &ent : fs::directory_iterator{store_path})
@@ -197,13 +251,16 @@ void EloqStore::Stop()
     {
         shard->Stop();
     }
-    shards_.clear();
-
+    if (obj_store_ != nullptr)
+    {
+        obj_store_->Stop();
+    }
     if (file_gc_ != nullptr)
     {
-        file_garbage_collector = nullptr;
         file_gc_->Stop();
     }
+
+    shards_.clear();
 
     for (int fd : root_fds_)
     {
@@ -232,6 +289,11 @@ void KvRequest::SetTableId(TableIdent tbl_id)
 KvError KvRequest::Error() const
 {
     return err_;
+}
+
+bool KvRequest::RetryableErr() const
+{
+    return IsRetryableErr(err_);
 }
 
 const char *KvRequest::ErrMessage() const
@@ -289,17 +351,17 @@ size_t ScanRequest::ResultSize() const
     return size;
 }
 
-void WriteRequest::SetArgs(TableIdent tbl_id,
-                           std::vector<WriteDataEntry> &&batch)
+void BatchWriteRequest::SetArgs(TableIdent tbl_id,
+                                std::vector<WriteDataEntry> &&batch)
 {
     SetTableId(std::move(tbl_id));
     batch_ = std::move(batch);
 }
 
-void WriteRequest::AddWrite(std::string key,
-                            std::string value,
-                            uint64_t ts,
-                            WriteOp op)
+void BatchWriteRequest::AddWrite(std::string key,
+                                 std::string value,
+                                 uint64_t ts,
+                                 WriteOp op)
 {
     batch_.push_back({std::move(key), std::move(value), ts, op});
 }

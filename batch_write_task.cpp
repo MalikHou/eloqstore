@@ -147,10 +147,11 @@ bool BatchWriteTask::SetBatch(std::vector<WriteDataEntry> &&entries)
         }
     }
 
+    // Limit max key length to half of page size.
+    uint16_t max_key_len = Options()->data_page_size >> 1;
     for (WriteDataEntry &ent : entries)
     {
-        // Limit key size to 2048 bytes.
-        if (ent.key_.empty() || ent.key_.size() > max_key_size)
+        if (ent.key_.empty() || ent.key_.size() > max_key_len)
         {
             return false;
         }
@@ -220,18 +221,7 @@ KvError BatchWriteTask::Apply()
         CHECK_KV_ERR(err);
         new_root = new_page;
     }
-
-    if (new_root != nullptr)
-    {
-        // Prevent the root page from being evicted before update RootMeta.
-        new_root->Pin();
-        err = UpdateMeta(new_root);
-        new_root->Unpin();
-    }
-    else
-    {
-        err = UpdateMeta(nullptr);
-    }
+    err = UpdateMeta(new_root);
     return err;
 }
 
@@ -819,7 +809,7 @@ KvError BatchWriteTask::FinishDataPage(std::string_view page_view,
 {
     PageId new_page_id =
         page_id == MaxPageId ? cow_meta_.mapper_->GetPage() : page_id;
-    DataPage new_page(new_page_id, Options()->data_page_size);
+    DataPage new_page(new_page_id);
     memcpy(new_page.PagePtr(), page_view.data(), page_view.size());
 
     if (page_id == MaxPageId)

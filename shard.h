@@ -2,6 +2,7 @@
 
 #include <boost/context/pooled_fixedsize_stack.hpp>
 
+#include "absl/container/flat_hash_map.h"
 #include "eloq_store.h"
 #include "task_manager.h"
 
@@ -15,8 +16,7 @@ class Shard
 {
 public:
     Shard(const EloqStore *store);
-    ~Shard();
-    KvError Init(std::span<int> root_fds);
+    KvError Init();
     void Start();
     void Stop();
     bool AddKvRequest(KvRequest *req);
@@ -28,17 +28,19 @@ public:
     TaskManager *TaskMgr();
     PagesPool *PagePool();
 
+    const EloqStore *store_;
     boost::context::continuation main_;
+    KvTask *running_;
     CircularQueue<KvTask *> scheduled_;
     CircularQueue<KvTask *> finished_;
 
 private:
-    void Loop();
+    void WorkLoop();
     void ResumeScheduled();
     void PollFinished();
 
     void OnReceivedReq(KvRequest *req);
-    void HandleReq(KvRequest *req);
+    void ProcessReq(KvRequest *req);
     void StartCompact(const TableIdent &tbl_id);
     void OnWriteFinished(const TableIdent &tbl_id);
 
@@ -47,13 +49,14 @@ private:
     {
         task->req_ = req;
         task->status_ = TaskStatus::Ongoing;
-        thd_task = task;
+        running_ = task;
         task->coro_ = boost::context::callcc(std::allocator_arg,
                                              stack_pool_,
-                                             [task, lbd](continuation &&sink)
+                                             [lbd](continuation &&sink)
                                              {
                                                  shard->main_ = std::move(sink);
                                                  KvError err = lbd();
+                                                 KvTask *task = ThdTask();
                                                  if (task->req_ != nullptr)
                                                  {
                                                      task->req_->SetDone(err);
@@ -66,7 +69,6 @@ private:
                                              });
     }
 
-    const EloqStore *store_;
     moodycamel::ConcurrentQueue<KvRequest *> requests_;
     std::thread thd_;
     PagesPool page_pool_;
@@ -75,12 +77,21 @@ private:
     TaskManager task_mgr_;
     boost::context::pooled_fixedsize_stack stack_pool_;
 
-    enum class QueueElement : uint8_t
+    class PendingWriteQueue
     {
-        KvRequest = 0,
-        Compact,
-        Mask = 7
+    public:
+        void SetCompact(bool val);
+        bool HasCompact() const;
+
+        void PushBack(WriteRequest *req);
+        WriteRequest *PopFront();
+        bool Empty() const;
+
+    private:
+        bool compact_{false};
+        WriteRequest *head_{nullptr};
+        WriteRequest *tail_{nullptr};
     };
-    std::unordered_map<TableIdent, CircularQueue<uint64_t>> write_queue_;
+    absl::flat_hash_map<TableIdent, PendingWriteQueue> pending_queues_;
 };
 }  // namespace kvstore

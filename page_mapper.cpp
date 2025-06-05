@@ -81,7 +81,7 @@ MappingSnapshot *PageMapper::GetMapping() const
 
 uint32_t PageMapper::UseCount()
 {
-    return mapping_ == nullptr ? 0 : mapping_.use_count();
+    return mapping_.use_count();
 }
 
 void PageMapper::FreeMappingSnapshot()

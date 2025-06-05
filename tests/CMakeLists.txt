@@ -13,6 +13,7 @@ set(UTEST_SOURCES
     persist.cpp
     manifest.cpp
     concurrency.cpp
+    cloud.cpp
 )
 
 string( REPLACE ".cpp" "" BASENAMES_UTEST "${UTEST_SOURCES}" )

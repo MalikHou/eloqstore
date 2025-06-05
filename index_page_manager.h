@@ -104,9 +104,9 @@ private:
      * accessed.
      *
      */
-    MemIndexPage active_head_{0};
-    MemIndexPage active_tail_{0};
-    MemIndexPage free_head_{0};
+    MemIndexPage active_head_{false};
+    MemIndexPage active_tail_{false};
+    MemIndexPage free_head_{false};
 
     /**
      * @brief A pool of index pages.

@@ -116,7 +116,7 @@ TEST_CASE("detect corrupted page", "[persist][checksum]")
             entries.emplace_back(
                 Key(idx), std::to_string(idx), 1, kvstore::WriteOp::Upsert);
         }
-        kvstore::WriteRequest req;
+        kvstore::BatchWriteRequest req;
         req.SetArgs(tbl_id, std::move(entries));
         store->ExecSync(&req);
     }
@@ -163,7 +163,7 @@ TEST_CASE("overflow kv", "[persist][overflow_kv]")
     const uint32_t biggest = (128 << 20);
     MapVerifier verifier(tbl_id, store);
 
-    kvstore::WriteRequest write_req;
+    kvstore::BatchWriteRequest write_req;
     write_req.SetTableId(tbl_id);
 
     for (uint32_t sz = 1; sz <= biggest; sz <<= 1)

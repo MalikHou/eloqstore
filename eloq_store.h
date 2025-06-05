@@ -16,7 +16,7 @@ enum class RequestType : uint8_t
     Read,
     Floor,
     Scan,
-    Write,
+    BatchWrite,
     Truncate,
     Archive
 };
@@ -26,6 +26,7 @@ class KvRequest
 public:
     virtual RequestType Type() const = 0;
     KvError Error() const;
+    bool RetryableErr() const;
     const char *ErrMessage() const;
     void SetTableId(TableIdent tbl_id);
     const TableIdent &TableId() const;
@@ -126,15 +127,26 @@ public:
     bool has_remaining_;
 };
 
+class WriteRequest : public KvRequest
+{
+public:
+    /**
+     * @brief Link to the next pending write request that has been received but
+     * not yet processed. And user may use this to manage a chain of free
+     * WriteRequests.
+     */
+    WriteRequest *next_{nullptr};
+};
+
 /**
  * @brief Batch write atomically.
  */
-class WriteRequest : public KvRequest
+class BatchWriteRequest : public WriteRequest
 {
 public:
     RequestType Type() const override
     {
-        return RequestType::Write;
+        return RequestType::BatchWrite;
     }
     void SetArgs(TableIdent tid, std::vector<WriteDataEntry> &&batch);
     void AddWrite(std::string key, std::string value, uint64_t ts, WriteOp op);
@@ -143,7 +155,7 @@ public:
     std::vector<WriteDataEntry> batch_;
 };
 
-class TruncateRequest : public KvRequest
+class TruncateRequest : public WriteRequest
 {
 public:
     RequestType Type() const override
@@ -156,7 +168,7 @@ public:
     std::string_view position_;
 };
 
-class ArchiveRequest : public KvRequest
+class ArchiveRequest : public WriteRequest
 {
 public:
     RequestType Type() const override
@@ -193,15 +205,19 @@ public:
 
 private:
     bool SendRequest(KvRequest *req);
-    KvError InitDBDir();
+    KvError InitStoreSpace();
 
-    KvOptions options_;
+    const KvOptions options_;
     std::vector<int> root_fds_;
     std::vector<std::unique_ptr<Shard>> shards_;
     std::atomic<bool> stopped_{true};
 
     std::unique_ptr<FileGarbageCollector> file_gc_{nullptr};
     std::unique_ptr<ArchiveCrond> archive_crond_{nullptr};
-    friend Shard;
+    std::unique_ptr<ObjectStore> obj_store_{nullptr};
+    friend class Shard;
+    friend class AsyncIoManager;
+    friend class IouringMgr;
+    friend class WriteTask;
 };
 }  // namespace kvstore

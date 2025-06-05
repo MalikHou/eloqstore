@@ -2,7 +2,7 @@
 
 #include <iostream>
 
-#include "test_utils.h"
+#include "../test_utils.h"
 
 DEFINE_string(db_path, "", "path to database");
 DEFINE_string(partition, "", "table partition id");

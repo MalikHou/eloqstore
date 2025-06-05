@@ -265,9 +265,7 @@ void WriteTask::WritePageCallback(VarPage page, KvError err)
     }
     case VarPageType::DataPage:
     case VarPageType::OverflowPage:
-        break;
     case VarPageType::Page:
-        shard->PagePool()->Free(std::move(std::get<Page>(page)));
         break;
     }
 }
@@ -404,7 +402,6 @@ KvError WriteTask::FlushManifest(PageId root_page_id)
 
 KvError WriteTask::UpdateMeta(MemIndexPage *root)
 {
-    assert(root == nullptr || root->IsPinned());
     KvError err;
     const KvOptions *opts = Options();
     // Flush data pages.
@@ -422,13 +419,34 @@ KvError WriteTask::UpdateMeta(MemIndexPage *root)
         CHECK_KV_ERR(err);
     }
 
+    PageId root_pg_id = MaxPageId;
+    if (root != nullptr)
+    {
+        // Prevent the root page from being evicted before update RootMeta.
+        root->Pin();
+        root_pg_id = root->GetPageId();
+    }
+
     err = IoMgr()->SyncData(tbl_ident_);
-    CHECK_KV_ERR(err);
+    if (err != KvError::NoError)
+    {
+        if (root != nullptr)
+        {
+            root->Unpin();
+        }
+        return err;
+    }
 
     // Update meta data in storage and then in memory.
-    PageId root_id = root != nullptr ? root->GetPageId() : MaxPageId;
-    err = FlushManifest(root_id);
-    CHECK_KV_ERR(err);
+    err = FlushManifest(root_pg_id);
+    if (err != KvError::NoError)
+    {
+        if (root != nullptr)
+        {
+            root->Unpin();
+        }
+        return err;
+    }
 
     if (opts->data_append_mode)
     {
@@ -437,6 +455,10 @@ KvError WriteTask::UpdateMeta(MemIndexPage *root)
 
     cow_meta_.root_ = root;
     shard->IndexManager()->UpdateRoot(tbl_ident_, std::move(cow_meta_));
+    if (root != nullptr)
+    {
+        root->Unpin();
+    }
     return KvError::NoError;
 }
 
@@ -469,7 +491,12 @@ void WriteTask::CompactIfNeeded(PageMapper *mapper) const
 
 KvError WriteTask::TriggerFileGC() const
 {
-    assert(file_garbage_collector != nullptr);
+    if (eloqstore->file_gc_ == nullptr)
+    {
+        // File garbage collector is not enabled.
+        return KvError::NoError;
+    }
+
     auto [meta, err] = shard->IndexManager()->FindRoot(tbl_ident_);
     CHECK_KV_ERR(err);
 
@@ -477,7 +504,7 @@ KvError WriteTask::TriggerFileGC() const
     auto mapping = mapper->GetMappingSnapshot();
     uint64_t ts = utils::UnixTs<chrono::microseconds>();
     FileId cur_file_id = mapper->FilePgAllocator()->CurrentFileId();
-    file_garbage_collector->AddTask(std::move(mapping), ts, cur_file_id);
+    eloqstore->file_gc_->AddTask(std::move(mapping), ts, cur_file_id);
     return KvError::NoError;
 }
 

@@ -14,7 +14,7 @@ TEST_CASE("concurrently write to partition", "[concurrency]")
 {
     kvstore::EloqStore *store = InitStore(mem_store_opts);
     kvstore::TableIdent tbl_id("concurrent-write", 1);
-    kvstore::WriteRequest requests[128];
+    kvstore::BatchWriteRequest requests[128];
     const uint32_t batch = 100;
     for (int i = 0; i < std::size(requests); i++)
     {
@@ -28,13 +28,13 @@ TEST_CASE("concurrently write to partition", "[concurrency]")
             ent.op_ = kvstore::WriteOp::Upsert;
         }
 
-        kvstore::WriteRequest &req = requests[i];
+        kvstore::BatchWriteRequest &req = requests[i];
         req.SetArgs(tbl_id, std::move(entries));
         bool ok = store->ExecAsyn(&req, 0, [](kvstore::KvRequest *req) {});
         REQUIRE(ok);
     }
 
-    for (kvstore::WriteRequest &req : requests)
+    for (kvstore::BatchWriteRequest &req : requests)
     {
         while (!req.IsDone())
         {
@@ -61,7 +61,7 @@ TEST_CASE("easy concurrency test", "[persist][concurrency]")
     kvstore::EloqStore *store = InitStore(default_opts);
     ConcurrencyTester tester(store, "t1", 1, 32);
     tester.Init();
-    tester.Run(5, 32, 20);
+    tester.Run(20, 5, 32);
     tester.Clear();
 }
 
@@ -77,7 +77,7 @@ TEST_CASE("hard concurrency test", "[persist][concurrency]")
     kvstore::EloqStore *store = InitStore(options);
     ConcurrencyTester tester(store, "t1", 10, 1000);
     tester.Init();
-    tester.Run(10, 600, 5000);
+    tester.Run(5000, 10, 600);
     tester.Clear();
 }
 
@@ -91,6 +91,6 @@ TEST_CASE("stress append only mode", "[persist][append]")
 
     ConcurrencyTester tester(store, "t1", 4, 1024);
     tester.Init();
-    tester.Run(10, 10, 1000);
+    tester.Run(1000, 10, 10);
     tester.Clear();
 }

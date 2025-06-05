@@ -66,11 +66,10 @@ void KvTask::FinishIo(bool is_sync_io)
 std::pair<Page, KvError> KvTask::LoadPage(const TableIdent &tbl_id,
                                           FilePageId file_page_id)
 {
-    auto [page, err] =
-        IoMgr()->ReadPage(tbl_id, file_page_id, shard->PagePool()->Allocate());
+    auto [page, err] = IoMgr()->ReadPage(tbl_id, file_page_id, Page(true));
     if (err != KvError::NoError)
     {
-        return {Page(nullptr, std::free), err};
+        return {Page(false), err};
     }
     return {std::move(page), KvError::NoError};
 }
@@ -172,37 +171,103 @@ uint8_t KvTask::DecodeOverflowPointers(
     return n_ptrs;
 }
 
-void WaitingZone::Sleep(KvTask *task)
+void WaitingZone::Wait(KvTask *task)
 {
-    tasks_.Enqueue(task);
+    PushBack(task);
     task->status_ = TaskStatus::Blocked;
     task->Yield();
 }
 
 void WaitingZone::WakeOne()
 {
-    if (tasks_.Size() > 0)
+    if (KvTask *task = PopFront(); task != nullptr)
     {
-        KvTask *task = tasks_.Peek();
-        tasks_.Dequeue();
         task->Resume();
     }
 }
 
 void WaitingZone::WakeN(size_t n)
 {
-    n = std::min(n, tasks_.Size());
     for (size_t i = 0; i < n; i++)
     {
-        KvTask *task = tasks_.Peek();
-        tasks_.Dequeue();
+        KvTask *task = PopFront();
+        if (task == nullptr)
+        {
+            break;  // No more tasks to wake.
+        }
         task->Resume();
     }
 }
 
 void WaitingZone::WakeAll()
 {
-    WakeN(tasks_.Size());
+    while (true)
+    {
+        KvTask *task = PopFront();
+        if (task == nullptr)
+        {
+            break;
+        }
+        task->Resume();
+    }
+}
+
+bool WaitingZone::Empty() const
+{
+    return head_ == nullptr;
+}
+
+void WaitingZone::PushBack(KvTask *task)
+{
+    if (tail_ == nullptr)
+    {
+        assert(head_ == nullptr);
+        head_ = tail_ = task;
+    }
+    else
+    {
+        assert(head_ != nullptr);
+        task->next_ = nullptr;
+        tail_->next_ = task;
+        tail_ = task;
+    }
+}
+
+KvTask *WaitingZone::PopFront()
+{
+    KvTask *task = head_;
+    if (task != nullptr)
+    {
+        head_ = task->next_;
+        if (head_ == nullptr)
+        {
+            tail_ = nullptr;
+        }
+        task->next_ = nullptr;  // Clear next pointer for safety.
+    }
+    return task;
+}
+
+void WaitingSeat::Wait(KvTask *task)
+{
+    assert(task != nullptr && task_ == nullptr);
+    task_ = task;
+    task->status_ = TaskStatus::Blocked;
+    task->Yield();
+}
+
+void WaitingSeat::Wake()
+{
+    if (task_ != nullptr)
+    {
+        task_->Resume();
+        task_ = nullptr;
+    }
+}
+
+KvTask *ThdTask()
+{
+    return shard->running_;
 }
 
 AsyncIoManager *IoMgr()
@@ -212,11 +277,11 @@ AsyncIoManager *IoMgr()
 
 const KvOptions *Options()
 {
-    return shard->Options();
+    return &eloqstore->Options();
 }
 
 const Comparator *Comp()
 {
-    return shard->Options()->comparator_;
+    return Options()->comparator_;
 }
 }  // namespace kvstore

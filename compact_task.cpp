@@ -42,9 +42,6 @@ KvError CompactTask::CompactDataFile()
     err = shard->IndexManager()->MakeCowRoot(tbl_ident_, cow_meta_);
     CHECK_KV_ERR(err);
     assert(cow_meta_.root_ != nullptr);
-    // Prevent the meta data from being evicted.
-    MemIndexPage *root = cow_meta_.root_;
-    root->Pin();
 
     allocator =
         static_cast<AppendAllocator *>(cow_meta_.mapper_->FilePgAllocator());
@@ -124,23 +121,14 @@ KvError CompactTask::CompactDataFile()
             }
             err = IoMgr()->ReadPages(
                 tbl_ident_, move_batch_fp_ids, move_batch_buf);
-            if (err != KvError::NoError)
-            {
-                root->Unpin();
-                return err;
-            }
+            CHECK_KV_ERR(err);
             // Write these pages to the new file.
             for (uint32_t i = 0; i < batch_size; i++)
             {
                 PageId page_id = batch_ids[i].second;
                 auto [_, fp_id] = AllocatePage(page_id);
                 err = WritePage(std::move(move_batch_buf[i]), fp_id);
-                if (err != KvError::NoError)
-                {
-                    // TODO: put Page back to page_pool for reusing.
-                    root->Unpin();
-                    return err;
-                }
+                CHECK_KV_ERR(err);
             }
         }
         if (min_file_id != end_file_id)
@@ -155,14 +143,10 @@ KvError CompactTask::CompactDataFile()
     assert(meta->mapper_->DebugStat());
 
     err = UpdateMeta(cow_meta_.root_);
-    root->Unpin();
     CHECK_KV_ERR(err);
 
-    if (file_garbage_collector != nullptr)
-    {
-        err = TriggerFileGC();
-        assert(err == KvError::NoError);
-    }
+    err = TriggerFileGC();
+    assert(err == KvError::NoError);
     return KvError::NoError;
 }
 }  // namespace kvstore

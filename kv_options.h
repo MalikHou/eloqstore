@@ -13,14 +13,13 @@ constexpr uint8_t max_overflow_pointers = 128;
 constexpr uint16_t max_read_pages_batch = max_overflow_pointers;
 constexpr uint16_t max_write_pages_batch = 256;
 
-constexpr uint16_t max_key_size = 2048;
-
 struct KvOptions
 {
+    int LoadFromIni(const char *path);
     bool operator==(const KvOptions &other) const = default;
 
     /**
-     * @brief Amount of threads.
+     * @brief Number of shards (threads).
      */
     uint16_t num_threads = 1;
 
@@ -31,25 +30,25 @@ struct KvOptions
     uint32_t init_page_count = 1 << 15;
 
     /**
-     * @brief Max amount of cached index pages per thread.
+     * @brief Max amount of cached index pages per shard.
      */
-    uint32_t index_buffer_pool_size = UINT32_MAX;
+    uint32_t index_buffer_pool_size = 1 << 15;
     /**
      * @brief Limit manifest file size.
      */
-    uint64_t manifest_limit = 16 << 20;  // 16MB
+    uint32_t manifest_limit = 8 << 20;  // 8MB
     /**
-     * @brief Max amount of opened files per thread.
+     * @brief Max amount of opened files per shard.
      */
-    uint32_t fd_limit = 1024;
+    uint32_t fd_limit = 4096;
     /**
-     * @brief Size of io-uring submission queue per thread.
+     * @brief Size of io-uring submission queue per shard.
      */
     uint32_t io_queue_size = 4096;
     /**
-     * @brief Max amount of inflight write IO per thread.
+     * @brief Max amount of inflight write IO per shard.
      */
-    uint32_t max_inflight_write = 4096;
+    uint32_t max_inflight_write = 64 << 10;
     /**
      * @brief The maximum number of pages per batch for the write task.
      */
@@ -63,7 +62,7 @@ struct KvOptions
      * @brief Size of coroutine stack.
      * According to the latest test results, at least 16KB is required.
      */
-    uint32_t coroutine_stack_size = 16 * 1024;
+    uint32_t coroutine_stack_size = 32 * 1024;
 
     /**
      * @brief Limit number of retained archives.
@@ -86,12 +85,28 @@ struct KvOptions
      * bigger than this value.
      * Only take effect when data_append_mode is enabled.
      */
-    uint8_t file_amplify_factor = 2;
+    uint8_t file_amplify_factor = 4;
     /**
      * @brief Number of background file GC threads.
      * Only take effect when data_append_mode is enabled.
      */
     uint16_t num_gc_threads = 1;
+    /**
+     * @brief Limit total size of local files per shard.
+     * Only take effect when cloud store is enabled.
+     */
+    size_t local_space_limit = size_t(1) << 40;  // 1TB
+    /**
+     * @brief Reserved space ratio for new created/download files.
+     * At most (local_space_limit / reserve_space_ratio) bytes is reserved.
+     * Only take effect when cloud store is enabled.
+     */
+    uint16_t reserve_space_ratio = 100;
+    /**
+     * @brief Number of threads used by rclone to upload/download files.
+     * Only take effect when cloud store is enabled.
+     */
+    uint16_t rclone_threads = 1;
 
     /* NOTE:
      * The following options will be persisted in storage, so after the first
@@ -105,6 +120,12 @@ struct KvOptions
      * will be used if this is empty.
      */
     std::vector<std::string> store_path;
+    /**
+     * @brief Storage path on cloud service.
+     * Store all data locally if this is empty.
+     * Example: eloq-s3:mybucket/kvstore
+     */
+    std::string cloud_store_path;
 
     /**
      * @brief Size of B+Tree index/data node (page).
@@ -113,6 +134,7 @@ struct KvOptions
     uint16_t data_page_size = 1 << 12;  // 4KB
 
     size_t FilePageOffsetMask() const;
+    size_t DataFileSize() const;
     /**
      * @brief Amount of pages per data file (1 << pages_per_file_shift).
      */
@@ -128,10 +150,4 @@ struct KvOptions
      */
     bool data_append_mode = false;
 };
-
-inline size_t KvOptions::FilePageOffsetMask() const
-{
-    return (1 << pages_per_file_shift) - 1;
-}
-
 }  // namespace kvstore

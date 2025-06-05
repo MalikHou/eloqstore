@@ -53,6 +53,4 @@ private:
     std::vector<std::thread> workers_;
 };
 
-inline FileGarbageCollector *file_garbage_collector;
-
 }  // namespace kvstore

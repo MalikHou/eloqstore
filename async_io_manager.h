@@ -17,6 +17,7 @@
 
 #include "error.h"
 #include "kv_options.h"
+#include "object_store.h"
 #include "task.h"
 #include "types.h"
 
@@ -46,15 +47,18 @@ enum class VarPageType : uint8_t
     Page
 };
 
+class EloqStore;
+
 class AsyncIoManager
 {
 public:
     AsyncIoManager(const KvOptions *opts) : options_(opts) {};
     virtual ~AsyncIoManager() = default;
-    static std::unique_ptr<AsyncIoManager> New(const KvOptions *opts);
+    static std::unique_ptr<AsyncIoManager> Instance(const EloqStore *store);
 
     /** These methods are provided for worker thread. */
-    virtual KvError Init(std::span<int> root_fds) = 0;
+    virtual KvError Init(Shard *shard) = 0;
+    virtual void Start() {};
     virtual void Submit() = 0;
     virtual void PollComplete() = 0;
 
@@ -97,7 +101,7 @@ class IouringMgr : public AsyncIoManager
 public:
     IouringMgr(const KvOptions *opts);
     ~IouringMgr() override;
-    KvError Init(std::span<int> root_fds) override;
+    KvError Init(Shard *shard) override;
     void Submit() override;
     void PollComplete() override;
 
@@ -131,15 +135,7 @@ public:
 
     static constexpr uint64_t oflags_dir = O_DIRECTORY | O_RDONLY;
 
-private:
-    enum class UserDataType : uint8_t
-    {
-        KvTask,
-        ReadReq,
-        WriteReq,
-        FsyncReq
-    };
-
+protected:
     class PartitionFiles;
     using FdIdx = std::pair<int, bool>;
     class LruFD
@@ -172,9 +168,8 @@ private:
         void EnqueNext(LruFD *new_fd);
 
         static constexpr FileId kDirectory = MaxFileId;
-        static constexpr FileId kManifest = MaxFileId - 1;
-        static constexpr FileId kTmpFile = MaxFileId - 2;
-        static constexpr FileId kMaxDataFile = MaxFileId - 3;
+        static constexpr FileId kManifest = kDirectory - 1;
+        static constexpr FileId kMaxDataFile = kManifest - 1;
 
         static constexpr int FdEmpty = -1;
         static constexpr int FdLocked = -2;
@@ -186,9 +181,24 @@ private:
         PartitionFiles *const tbl_;
         const FileId file_id_;
         uint32_t ref_count_{0};
-        std::vector<KvTask *> loading_;
+        WaitingZone waiting_;
         LruFD *prev_{nullptr};
         LruFD *next_{nullptr};
+    };
+
+    enum class UserDataType : uint8_t
+    {
+        KvTask,
+        BaseReq,
+        ReadReq,
+        WriteReq
+    };
+
+    struct BaseReq
+    {
+        BaseReq(KvTask *task = nullptr) : task_(task) {};
+        KvTask *task_;
+        int io_res_{0};
     };
 
     struct ReadReq
@@ -197,23 +207,13 @@ private:
         ReadReq(KvTask *task, LruFD::Ref fd, uint32_t offset);
         ReadReq(ReadReq &&other) = default;
         ReadReq &operator=(ReadReq &&) = default;
-        ~ReadReq();
 
         KvTask *task_;
         LruFD::Ref fd_ref_;
         uint32_t offset_;
 
         int io_res_{0};
-        Page page_{nullptr, std::free};
-    };
-
-    struct FsyncReq
-    {
-        FsyncReq(KvTask *task, LruFD::Ref fd)
-            : task_(task), fd_ref_(std::move(fd)) {};
-        KvTask *task_;
-        LruFD::Ref fd_ref_;
-        int io_res_{0};
+        Page page_{false};
     };
 
     struct WriteReq
@@ -236,16 +236,19 @@ private:
     class Manifest : public ManifestFile
     {
     public:
-        Manifest(IouringMgr *io_mgr, LruFD::Ref &&fd)
-            : io_mgr_(io_mgr), fd_(std::move(fd)) {};
+        Manifest(IouringMgr *io_mgr, LruFD::Ref fd, uint64_t size);
+        ~Manifest();
         KvError Read(char *dst, size_t n) override;
 
     private:
+        static constexpr uint32_t buf_size = 1 << 20;
         IouringMgr *io_mgr_;
         LruFD::Ref fd_;
-        uint64_t offset_{0};
-        // TODO(zhanghao): use selected ring buffer API
-        // char *buff_; // options_->data_page_size
+        uint64_t file_size_;
+        uint64_t file_offset_{0};
+        std::unique_ptr<char, decltype(&std::free)> buf_{nullptr, &std::free};
+        uint16_t buf_end_{0};
+        uint16_t buf_offset_{0};
     };
 
     static std::pair<void *, UserDataType> DecodeUserData(uint64_t user_data);
@@ -260,55 +263,85 @@ private:
     uint32_t AllocRegisterIndex();
     void FreeRegisterIndex(uint32_t idx);
 
+    // Low-level io operation. Very simple wrap on syscall.
     io_uring_sqe *GetSQE(UserDataType type, const void *user_ptr);
-    // Low-level io operation
-    int CreateDir(FdIdx dir_fd, const char *path);
+    int MakeDir(FdIdx dir_fd, const char *path);
     int OpenAt(FdIdx dir_fd,
                const char *path,
                uint64_t flags,
                uint64_t mode = 0);
     int Read(FdIdx fd, char *dst, size_t n, uint64_t offset);
-    std::pair<Page, int> ReadPage(FdIdx fd, Page ptr, uint32_t offset);
-    void ReadPage(ReadReq *req);
-    Page SwapPage(Page page, uint16_t buf_id);
     int Write(FdIdx fd, const char *src, size_t n, uint64_t offset);
-    int Fdatasync(LruFD::Ref fd);
     int Fdatasync(FdIdx fd);
+    int Statx(int fd, const char *path, struct statx *result);
     int Rename(FdIdx dir_fd, const char *old_path, const char *new_path);
-    int CloseFile(int fd);
-    KvError CloseFile(LruFD::Ref fd_ref);
+    int Close(int fd);
     int RegisterFile(int fd);
     int UnregisterFile(int idx);
     int Fallocate(FdIdx fd, uint64_t size);
-    KvError AtomicWriteFile(const TableIdent &tbl_id,
-                            const char *name,
-                            std::string_view content,
-                            LruFD::Ref result);
+    int UnlinkAt(FdIdx dir_fd, const char *path, bool rmdir);
+    Page SwapPage(Page page, uint16_t buf_id);
 
-    FdIdx GetRootFD(const TableIdent &tbl_id) const;
+    /**
+     * @brief Write content to a file with given name in the directory.
+     * This is often used to write snapshot of manifest atomically.
+     */
+    virtual int WriteSnapshot(LruFD::Ref dir_fd,
+                              std::string_view name,
+                              std::string_view content);
+    virtual int CreateFile(LruFD::Ref dir_fd, FileId file_id);
+    virtual int OpenFile(const TableIdent &tbl_id, FileId file_id, bool direct);
+    virtual KvError SyncFile(LruFD::Ref fd);
+    virtual KvError SyncFiles(const TableIdent &tbl_id,
+                              std::span<LruFD::Ref> fds);
+    virtual KvError CloseFile(LruFD::Ref fd_ref);
+
+    static FdIdx GetRootFD(const TableIdent &tbl_id);
     /**
      * @brief Get file descripter if it is already opened.
      */
     LruFD::Ref GetOpenedFD(const TableIdent &tbl_id, FileId file_id);
     /**
-     * @brief Get a file descripter slot for the file, evict the least recently
-     * used file if the limit is reached.
+     * @brief Get a file descripter slot for the file.
      */
     LruFD::Ref GetFDSlot(const TableIdent &tbl_id, FileId file_id);
+    /**
+     * @brief Open file if already exists. Only data file is opened with
+     * O_DIRECT by default. Set `direct` to true to open manifest with O_DIRECT.
+     */
     std::pair<LruFD::Ref, KvError> OpenFD(const TableIdent &tbl_id,
-                                          FileId file_id);
+                                          FileId file_id,
+                                          bool direct = false);
+    /**
+     * @brief Open file or create it if not exists. This method can be used to
+     * open data-file/manifest or create data-file, but not create manifest.
+     * Only data file is opened with O_DIRECT by default. Set `direct` to true
+     * to open manifest with O_DIRECT.
+     */
     std::pair<LruFD::Ref, KvError> OpenOrCreateFD(const TableIdent &tbl_id,
                                                   FileId file_id,
+                                                  bool direct = false,
                                                   bool create = true);
     bool EvictFD();
 
-    WriteReq *AllocWriteReq(LruFD::Ref fd, VarPage page);
-    void FreeWriteReq(WriteReq *req);
-    std::vector<std::unique_ptr<WriteReq>> write_reqs_pool_;
-    WriteReq free_write_reqs_;
-    WaitingZone waiting_write_;
+    class WriteReqPool
+    {
+    public:
+        WriteReqPool(uint32_t pool_size);
+        WriteReq *Alloc(LruFD::Ref fd, VarPage page);
+        void Free(WriteReq *req);
 
-    std::span<int> root_fds_;
+    private:
+        std::unique_ptr<WriteReq[]> pool_;
+        WriteReq *free_list_;
+        WaitingZone waiting_;
+    };
+
+    /**
+     * @brief This is only used in non-append mode.
+     */
+    std::unique_ptr<WriteReqPool> write_req_pool_{nullptr};
+
     std::unordered_map<TableIdent, PartitionFiles> tables_;
     LruFD lru_fd_head_{nullptr, MaxFileId};
     LruFD lru_fd_tail_{nullptr, MaxFileId};
@@ -326,11 +359,100 @@ private:
     uint32_t prepared_sqe_{0};
 };
 
+class CloudStoreMgr : public IouringMgr
+{
+public:
+    CloudStoreMgr(const KvOptions *opts, ObjectStore *obj_store);
+    void Start() override;
+    void PollComplete() override;
+    KvError SwitchManifest(const TableIdent &tbl_id,
+                           std::string_view snapshot) override;
+    KvError CreateArchive(const TableIdent &tbl_id,
+                          std::string_view snapshot,
+                          uint64_t ts) override;
+
+private:
+    int CreateFile(LruFD::Ref dir_fd, FileId file_id) override;
+    int OpenFile(const TableIdent &tbl_id,
+                 FileId file_id,
+                 bool direct) override;
+    KvError SyncFile(LruFD::Ref fd) override;
+    KvError SyncFiles(const TableIdent &tbl_id,
+                      std::span<LruFD::Ref> fds) override;
+    KvError CloseFile(LruFD::Ref fd) override;
+
+    KvError DownloadFile(const TableIdent &tbl_id, FileId file_id);
+    KvError UploadFiles(const TableIdent &tbl_id,
+                        std::vector<std::string> filenames);
+
+    bool DequeClosedFile(const FileKey &key);
+    void EnqueClosedFile(FileKey key);
+    bool HasEvictableFile() const;
+    int ReserveCacheSpace(size_t size);
+
+    static std::string ToFilename(FileId file_id);
+    size_t EstimateFileSize(FileId file_id) const;
+    size_t EstimateFileSize(std::string_view filename) const;
+
+    struct CachedFile
+    {
+        CachedFile() = default;
+        const FileKey *key_;
+        bool evicting_{false};
+        WaitingSeat waiting_;
+
+        void Deque()
+        {
+            prev_->next_ = next_;
+            next_->prev_ = prev_;
+            prev_ = nullptr;
+            next_ = nullptr;
+        }
+        void EnqueNext(CachedFile *node)
+        {
+            node->next_ = next_;
+            node->next_->prev_ = node;
+            next_ = node;
+            node->prev_ = this;
+        }
+        CachedFile *prev_{nullptr};
+        CachedFile *next_{nullptr};
+    };
+
+    /**
+     * @brief Locally cached files that are not currently opened.
+     */
+    std::unordered_map<FileKey, CachedFile> closed_files_;
+    CachedFile lru_file_head_;
+    CachedFile lru_file_tail_;
+    size_t used_local_space_{0};
+
+    /**
+     * @brief A background task to evict cached files when local space is full.
+     */
+    class FileCleaner : public KvTask
+    {
+    public:
+        FileCleaner(CloudStoreMgr *io_mgr) : io_mgr_(io_mgr) {};
+        TaskType Type() const override;
+        void Run();
+
+        WaitingZone requesting_;
+
+    private:
+        CloudStoreMgr *io_mgr_;
+    };
+
+    FileCleaner file_cleaner_;
+
+    ObjectStore *obj_store_;
+};
+
 class MemStoreMgr : public AsyncIoManager
 {
 public:
     MemStoreMgr(const KvOptions *opts);
-    KvError Init(std::span<int> root_fds) override;
+    KvError Init(Shard *shard) override;
     void Submit() override {};
     void PollComplete() override {};
 

@@ -4,7 +4,6 @@
 
 #include <cassert>
 #include <cstdint>
-#include <memory>
 #include <string>
 #include <string_view>
 
@@ -74,21 +73,15 @@ std::string_view ManifestBuilder::BuffView() const
     return buff_;
 }
 
-bool RootMeta::Evict()
+void RootMeta::Pin()
 {
-    if (ref_cnt_ == 1 && mapping_snapshots_.size() == 1 &&
-        mapper_->UseCount() == 1)
-    {
-        assert(root_page_ != nullptr);
-        assert(*mapping_snapshots_.begin() == mapper_->GetMapping());
-        mapper_->FreeMappingSnapshot();
-        assert(mapping_snapshots_.empty());
-        mapper_ = nullptr;
-        root_page_ = nullptr;
-        ref_cnt_--;
-        return true;
-    }
-    return false;
+    ref_cnt_++;
+}
+
+void RootMeta::Unpin()
+{
+    assert(ref_cnt_ > 0);
+    ref_cnt_--;
 }
 
 }  // namespace kvstore

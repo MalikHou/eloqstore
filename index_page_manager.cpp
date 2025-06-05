@@ -55,8 +55,8 @@ MemIndexPage *IndexPageManager::AllocIndexPage()
     {
         if (!IsFull())
         {
-            auto &new_page = index_pages_.emplace_back(
-                std::make_unique<MemIndexPage>(Options()->data_page_size));
+            auto &new_page =
+                index_pages_.emplace_back(std::make_unique<MemIndexPage>());
             next_free = new_page.get();
         }
         else
@@ -73,7 +73,7 @@ MemIndexPage *IndexPageManager::AllocIndexPage()
         }
     }
     assert(next_free->IsDetached());
-
+    assert(!next_free->IsPinned());
     return next_free;
 }
 
@@ -157,6 +157,8 @@ KvError IndexPageManager::MakeCowRoot(const TableIdent &tbl_ident,
         return err;
     }
     meta->mapping_snapshots_.insert(cow_meta.mapper_->GetMapping());
+    // RootMeta is referenced by this new MappingSnapshot.
+    meta->Pin();
     return KvError::NoError;
 }
 
@@ -177,9 +179,9 @@ KvError IndexPageManager::LoadTablePartition(const TableIdent &tbl_id)
     auto &loading = it_loading->second;
     if (!success)
     {
-        loading.emplace_back(thd_task);
-        thd_task->status_ = TaskStatus::Blocked;
-        thd_task->Yield();
+        loading.emplace_back(ThdTask());
+        ThdTask()->status_ = TaskStatus::Blocked;
+        ThdTask()->Yield();
         return KvError::NoError;
     }
 
@@ -236,6 +238,7 @@ KvError IndexPageManager::LoadTablePartition(const TableIdent &tbl_id)
         MappingSnapshot *mapping = mapper->GetMapping();
         meta.mapper_ = std::move(mapper);
         meta.mapping_snapshots_.insert(mapping);
+        meta.Pin();
         meta.manifest_size_ = replayer.file_size_;
         if (root_page)
         {
@@ -266,9 +269,9 @@ std::pair<MemIndexPage *, KvError> IndexPageManager::FindPage(
         {
             // There is already a read request issuing an async read on the same
             // page. Waits for the request in the waiting queue.
-            it->second->pending_tasks_.emplace_back(thd_task);
-            thd_task->status_ = TaskStatus::Blocked;
-            thd_task->Yield();
+            it->second->pending_tasks_.emplace_back(ThdTask());
+            ThdTask()->status_ = TaskStatus::Blocked;
+            ThdTask()->Yield();
             // When resumed, the read request should have loaded the page,
             // unless the page is evicted again or corrupted.
             idx_page = mapping->GetSwizzlingPointer(page_id);
@@ -348,6 +351,7 @@ void IndexPageManager::FreeMappingSnapshot(MappingSnapshot *mapping)
         pool->Free(std::move(mapping->to_free_file_pages_));
     }
     meta.mapping_snapshots_.erase(mapping);
+    meta.Unpin();
 }
 
 void IndexPageManager::Unswizzling(MemIndexPage *page)
@@ -399,9 +403,9 @@ void IndexPageManager::EvictRootIfEmpty(
     std::unordered_map<TableIdent, RootMeta>::iterator root_it)
 {
     RootMeta &meta = root_it->second;
-    if (meta.root_page_ == nullptr && meta.mapping_snapshots_.empty() &&
-        meta.ref_cnt_ == 0)
+    if (meta.ref_cnt_ == 0)
     {
+        DLOG(INFO) << "metadata of " << root_it->first << " is evicted";
         tbl_roots_.erase(root_it);
     }
 }
@@ -414,15 +418,19 @@ bool IndexPageManager::RecyclePage(MemIndexPage *page)
     RootMeta &meta = tbl_it->second;
     if (meta.root_page_ == page)
     {
-        if (!meta.Evict())
+        // Evict this if it is only referenced by the root page and mapper.
+        if (meta.ref_cnt_ == 2 && meta.mapper_->UseCount() == 1)
+        {
+            meta.mapper_ = nullptr;
+            meta.root_page_ = nullptr;
+        }
+        else
         {
             return false;
         }
     }
     else
     {
-        assert(meta.ref_cnt_ > 0);
-        --meta.ref_cnt_;
         // Unswizzling the page pointer in all mapping snapshots.
         auto &mappings = meta.mapping_snapshots_;
         for (auto &mapping : mappings)
@@ -430,6 +438,7 @@ bool IndexPageManager::RecyclePage(MemIndexPage *page)
             mapping->Unswizzling(page);
         }
     }
+    meta.Unpin();
     EvictRootIfEmpty(tbl_it);
 
     // Removes the page from the active list.
@@ -452,7 +461,7 @@ void IndexPageManager::FinishIo(MappingSnapshot *mapping,
 
     auto tbl_it = tbl_roots_.find(*mapping->tbl_ident_);
     assert(tbl_it != tbl_roots_.end());
-    ++tbl_it->second.ref_cnt_;
+    tbl_it->second.Pin();
 
     assert(idx_page->IsDetached());
     EnqueuIndexPage(idx_page);
@@ -477,9 +486,9 @@ IndexPageManager::ReadReq *IndexPageManager::GetFreeReadReq()
     ReadReq *first = free_read_head_.next_;
     while (first == nullptr)
     {
-        waiting_zone_.Enqueue(thd_task);
-        thd_task->status_ = TaskStatus::Blocked;
-        thd_task->Yield();
+        waiting_zone_.Enqueue(ThdTask());
+        ThdTask()->status_ = TaskStatus::Blocked;
+        ThdTask()->Yield();
         first = free_read_head_.next_;
     }
 

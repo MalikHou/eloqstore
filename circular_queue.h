@@ -11,7 +11,14 @@ class CircularQueue
 public:
     CircularQueue(size_t capacity = 8) : head_(0), cnt_(0), capacity_(capacity)
     {
-        vec_ = std::make_unique<T[]>(capacity);
+        if (capacity_ == 0)
+        {
+            vec_ = nullptr;
+        }
+        else
+        {
+            vec_ = std::make_unique<T[]>(capacity);
+        }
     }
 
     CircularQueue(CircularQueue &&rhs)
@@ -39,13 +46,17 @@ public:
 
     ~CircularQueue() = default;
 
-    void Reset()
+    void Reset(size_t new_cap)
     {
         head_ = 0;
         cnt_ = 0;
-        if (capacity_ > 8)
+        capacity_ = new_cap;
+        if (capacity_ == 0)
         {
-            capacity_ = 8;
+            vec_ = nullptr;
+        }
+        else
+        {
             vec_ = std::make_unique<T[]>(capacity_);
         }
     }
@@ -54,6 +65,10 @@ public:
     {
         if (cnt_ == 0)
         {
+            if (capacity_ == 0)
+            {
+                Reset(8);
+            }
             vec_[0] = item;
             head_ = 0;
             cnt_ = 1;
@@ -91,6 +106,10 @@ public:
     {
         if (cnt_ == 0)
         {
+            if (capacity_ == 0)
+            {
+                Reset(8);
+            }
             vec_[0] = std::move(item);
             head_ = 0;
             cnt_ = 1;
@@ -133,6 +152,10 @@ public:
     {
         if (cnt_ == 0)
         {
+            if (capacity_ == 0)
+            {
+                Reset(8);
+            }
             vec_[0] = item;
             head_ = 0;
             cnt_ = 1;

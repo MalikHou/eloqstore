@@ -50,40 +50,51 @@ inline static bool ValidatePageChecksum(char *p, uint16_t pgsz)
 
 inline static size_t page_align = sysconf(_SC_PAGESIZE);
 
-using Page = std::unique_ptr<char, decltype(&std::free)>;
-
-inline Page AllocPage(uint16_t page_size)
+class Page
 {
-    char *p = (char *) std::aligned_alloc(page_align, page_size);
-    assert(p);
-    return Page(p, std::free);
-}
+public:
+    Page(bool alloc);
+    Page(char *ptr);
+    Page(Page &&other) noexcept;
+    Page &operator=(Page &&other) noexcept;
+    Page(const Page &) = delete;
+    Page &operator=(const Page &) = delete;
+    ~Page();
+    void Free();
+    char *Ptr() const;
+
+private:
+    char *ptr_;
+};
+
+struct KvOptions;
 
 class PagesPool
 {
 public:
-    PagesPool(uint16_t page_size) : page_size_(page_size) {};
-    Page Allocate()
-    {
-        if (pages_.empty())
-        {
-            return AllocPage(page_size_);
-        }
-        else
-        {
-            Page page = std::move(pages_.back());
-            pages_.pop_back();
-            return page;
-        }
-    }
-    void Free(Page page)
-    {
-        pages_.emplace_back(std::move(page));
-    }
+    using UPtr = std::unique_ptr<char, decltype(&std::free)>;
+    PagesPool(const KvOptions *options);
+    char *Allocate();
+    void Free(char *ptr);
 
 private:
-    const uint16_t page_size_;
-    std::vector<Page> pages_;
+    void Extend(size_t pages);
+
+    struct FreePage
+    {
+        FreePage *next_;
+    };
+
+    struct MemChunk
+    {
+        UPtr uptr_;
+        size_t size_;
+    };
+
+    const KvOptions *options_;
+    std::vector<MemChunk> chunks_;
+    FreePage *free_head_;
+    size_t free_cnt_;
 };
 
 }  // namespace kvstore

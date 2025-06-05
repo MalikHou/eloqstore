@@ -42,6 +42,10 @@ if(NOT EXISTS "${PROJECT_SOURCE_DIR}/concurrentqueue/CMakeLists.txt")
 endif()
 add_subdirectory(concurrentqueue)
 
+add_subdirectory(abseil)
+
+set(INI_SOURCES ${PROJECT_SOURCE_DIR}/inih/ini.c ${PROJECT_SOURCE_DIR}/inih/cpp/INIReader.cpp)
+
 add_executable(io_uring_test io_uring_test.cpp)
 target_link_libraries(io_uring_test ${URING_LIB})
 
@@ -78,6 +82,7 @@ set(ELOQ_STORE_SOURCES
     write_tree_stack.cpp
     async_io_manager.cpp
     data_page.cpp
+    page.cpp
     page_mapper.cpp
     task_manager.cpp
     eloq_store.cpp
@@ -88,18 +93,16 @@ set(ELOQ_STORE_SOURCES
     kill_point.cpp
     file_gc.cpp
     archive_crond.cpp
-    test_utils.cpp)
+    object_store.cpp
+    kv_options.cpp)
 
-add_library(eloqstore STATIC ${ELOQ_STORE_SOURCES})
+add_library(eloqstore STATIC ${ELOQ_STORE_SOURCES} ${INI_SOURCES})
 
 target_include_directories(eloqstore PUBLIC ${ELOQ_STORE_INCLUDE})
-target_link_libraries(eloqstore PRIVATE ${URING_LIB} Boost::context glog::glog)
+target_link_libraries(eloqstore PRIVATE ${URING_LIB} Boost::context glog::glog absl::flat_hash_map)
 
 add_library(test_util STATIC test_utils.cpp)
-target_link_libraries(test_util PRIVATE eloqstore)
-
-add_executable(test_client test_client.cpp)
-target_link_libraries(test_client PRIVATE test_util)
+target_link_libraries(test_util PUBLIC eloqstore)
 
 add_executable(io_test io_test.cpp)
 target_link_libraries(io_test ${URING_LIB})

@@ -15,13 +15,12 @@
 
 namespace test_util
 {
-std::string Key(uint64_t k)
+std::string Key(uint64_t key, uint16_t len)
 {
-    constexpr int sz = 12;
     std::stringstream ss;
-    ss << std::setw(sz) << std::setfill('0') << k;
+    ss << std::setw(len) << std::setfill('0') << key;
     std::string kstr = ss.str();
-    CHECK(kstr.size() == sz);
+    assert(kstr.size() == len);
     return kstr;
 }
 
@@ -46,13 +45,45 @@ void CheckKvEntry(const kvstore::KvEntry &left, const kvstore::KvEntry &right)
     CHECK(std::get<2>(left) == std::get<2>(right));
 }
 
+void EncodeKey(char *dst, uint32_t key)
+{
+    kvstore::EncodeFixed32(dst, kvstore::ToBigEndian(key));
+}
+
+void EncodeKey(std::string *dst, uint32_t key)
+{
+    kvstore::PutFixed32(dst, kvstore::ToBigEndian(key));
+}
+
+uint32_t DecodeKey(const std::string &key)
+{
+    return __builtin_bswap32(kvstore::DecodeFixed32(key.data()));
+}
+
+void EncodeValue(std::string *dst, uint32_t val)
+{
+    kvstore::PutFixed32(dst, val);
+    assert(dst->size() == sizeof(uint32_t));
+    if (val > dst->size())
+    {
+        dst->resize(val, '*');
+    }
+}
+
+uint32_t DecodeValue(const std::string &val)
+{
+    uint32_t v = kvstore::DecodeFixed32(val.data());
+    CHECK(v == val.size() || v < sizeof(uint32_t));
+    return v;
+}
+
 std::string FormatEntries(const std::vector<kvstore::KvEntry> &entries)
 {
     std::string kvs_str;
     for (auto &[k, v, _] : entries)
     {
-        uint32_t key = decode_key(k.data());
-        uint32_t val = kvstore::DecodeFixed32(v.data());
+        uint32_t key = DecodeKey(k);
+        uint32_t val = DecodeValue(v);
         kvs_str.push_back('{');
         kvs_str.append(std::to_string(key));
         kvs_str.push_back(':');
@@ -69,8 +100,8 @@ std::pair<std::string, kvstore::KvError> Scan(kvstore::EloqStore *store,
 {
     char begin_buf[sizeof(uint32_t)];
     char end_buf[sizeof(uint32_t)];
-    kvstore::EncodeFixed32(begin_buf, kvstore::ToBigEndian(begin));
-    kvstore::EncodeFixed32(end_buf, kvstore::ToBigEndian(end));
+    EncodeKey(begin_buf, begin);
+    EncodeKey(end_buf, end);
     std::string_view begin_key(begin_buf, sizeof(uint32_t));
     std::string_view end_key(end_buf, sizeof(uint32_t));
     kvstore::ScanRequest req;
@@ -85,8 +116,12 @@ std::pair<std::string, kvstore::KvError> Scan(kvstore::EloqStore *store,
 
 MapVerifier::MapVerifier(kvstore::TableIdent tid,
                          kvstore::EloqStore *store,
-                         bool validate)
-    : tid_(std::move(tid)), eloq_store_(store), auto_validate_(validate)
+                         bool validate,
+                         uint16_t key_len)
+    : tid_(std::move(tid)),
+      eloq_store_(store),
+      auto_validate_(validate),
+      key_len_(key_len)
 {
 }
 
@@ -110,11 +145,11 @@ void MapVerifier::Upsert(uint64_t begin, uint64_t end)
     std::vector<kvstore::WriteDataEntry> entries;
     for (size_t idx = begin; idx < end; ++idx)
     {
-        std::string key = Key(idx);
+        std::string key = Key(idx, key_len_);
         std::string val = Value(ts_ + idx, val_size_);
         entries.emplace_back(key, val, ts_, kvstore::WriteOp::Upsert);
     }
-    kvstore::WriteRequest req;
+    kvstore::BatchWriteRequest req;
     req.SetArgs(tid_, std::move(entries));
     ExecWrite(&req);
 }
@@ -126,10 +161,10 @@ void MapVerifier::Delete(uint64_t begin, uint64_t end)
     std::vector<kvstore::WriteDataEntry> entries;
     for (size_t idx = begin; idx < end; ++idx)
     {
-        std::string key = Key(idx);
+        std::string key = Key(idx, key_len_);
         entries.emplace_back(key, "", ts_, kvstore::WriteOp::Delete);
     }
-    kvstore::WriteRequest req;
+    kvstore::BatchWriteRequest req;
     req.SetArgs(tid_, std::move(entries));
     ExecWrite(&req);
 }
@@ -139,7 +174,7 @@ void MapVerifier::Truncate(uint64_t position)
     LOG(INFO) << "Truncate(" << position << ')';
 
     kvstore::TruncateRequest req;
-    std::string key = Key(position);
+    std::string key = Key(position, key_len_);
     if (answer_.empty())
     {
         req.SetArgs(tid_, key);
@@ -171,7 +206,7 @@ void MapVerifier::WriteRnd(uint64_t begin,
             continue;
         }
 
-        std::string key = Key(idx);
+        std::string key = Key(idx, key_len_);
         uint64_t ts = ts_;
         if ((rand() % max) < del)
         {
@@ -186,7 +221,7 @@ void MapVerifier::WriteRnd(uint64_t begin,
                 std::move(key), std::move(val), ts, kvstore::WriteOp::Upsert);
         }
     }
-    kvstore::WriteRequest req;
+    kvstore::BatchWriteRequest req;
     req.SetArgs(tid_, std::move(entries));
     ExecWrite(&req);
 }
@@ -202,7 +237,7 @@ void MapVerifier::Clean()
 
 void MapVerifier::Read(uint64_t key)
 {
-    Read(Key(key));
+    Read(Key(key, key_len_));
 }
 
 void MapVerifier::Read(std::string_view key)
@@ -250,7 +285,7 @@ void MapVerifier::Scan(uint64_t begin,
                        size_t page_entries,
                        size_t page_size)
 {
-    Scan(Key(begin), Key(end), page_entries, page_size);
+    Scan(Key(begin, key_len_), Key(end, key_len_), page_entries, page_size);
 }
 
 void MapVerifier::Scan(std::string_view begin,
@@ -332,9 +367,9 @@ void MapVerifier::ExecWrite(kvstore::KvRequest *req)
 {
     switch (req->Type())
     {
-    case kvstore::RequestType::Write:
+    case kvstore::RequestType::BatchWrite:
     {
-        const auto wreq = static_cast<kvstore::WriteRequest *>(req);
+        const auto wreq = static_cast<kvstore::BatchWriteRequest *>(req);
         for (const kvstore::WriteDataEntry &ent : wreq->batch_)
         {
             auto it = answer_.find(ent.key_);
@@ -426,6 +461,11 @@ uint32_t ConcurrencyTester::Partition::FinishedRounds() const
 
 void ConcurrencyTester::Partition::FinishWrite()
 {
+    if (req_.RetryableErr())
+    {
+        LOG(WARNING) << "write error " << req_.ErrMessage();
+        return;
+    }
     CHECK(req_.Error() == kvstore::KvError::NoError);
     verify_cnt_ = 0;
     ticks_++;
@@ -435,15 +475,18 @@ ConcurrencyTester::ConcurrencyTester(kvstore::EloqStore *store,
                                      std::string tbl_name,
                                      uint32_t n_partitions,
                                      uint16_t seg_count,
-                                     uint8_t seg_size)
-    : seg_size_(seg_size),
+                                     uint8_t seg_size,
+                                     uint32_t val_size)
+    : val_size_(val_size),
+      seg_size_(seg_size),
       seg_count_(seg_count),
-      seg_sum_(seg_size * average_v),
+      seg_sum_(seg_size * val_size),
       tbl_name_(std::move(tbl_name)),
       partitions_(n_partitions),
       finished_reqs_(n_partitions),
       store_(store)
 {
+    CHECK(val_size >= sizeof(uint32_t));
     for (uint32_t i = 0; i < n_partitions; i++)
     {
         partitions_[i].id_ = i;
@@ -458,15 +501,13 @@ void ConcurrencyTester::Wake(kvstore::KvRequest *req)
 
 void ConcurrencyTester::ExecRead(Reader *reader)
 {
-    Partition &partition = partitions_[reader->id_ % partitions_.size()];
+    reader->partition_id_ = (reader->partition_id_ + 1) % partitions_.size();
+    const Partition &partition = partitions_[reader->partition_id_];
     reader->start_tick_ = partition.ticks_;
-    reader->partition_id_ = partition.id_;
     reader->begin_ = (rand() % seg_count_) * seg_size_;
     reader->end_ = reader->begin_ + seg_size_;
-    kvstore::EncodeFixed32(reader->begin_key_,
-                           kvstore::ToBigEndian(reader->begin_));
-    kvstore::EncodeFixed32(reader->end_key_,
-                           kvstore::ToBigEndian(reader->end_));
+    EncodeKey(reader->begin_key_, reader->begin_);
+    EncodeKey(reader->end_key_, reader->end_);
     std::string_view begin_key(reader->begin_key_, sizeof(uint32_t));
     std::string_view end_key(reader->end_key_, sizeof(uint32_t));
     reader->req_.SetArgs({tbl_name_, partition.id_}, begin_key, end_key);
@@ -477,20 +518,25 @@ void ConcurrencyTester::ExecRead(Reader *reader)
     CHECK(ok);
 }
 
-void ConcurrencyTester::VerifyRead(Reader *reader)
+void ConcurrencyTester::VerifyRead(Reader *reader, uint32_t write_pause)
 {
+    if (reader->req_.RetryableErr())
+    {
+        LOG(WARNING) << "read error " << reader->req_.ErrMessage();
+        return;
+    }
     CHECK(reader->req_.Error() == kvstore::KvError::NoError);
     const uint32_t key_begin = reader->begin_;
     const uint32_t key_end = reader->end_;
     const uint16_t seg_id = key_begin / seg_size_;
     const uint32_t partition_id = reader->partition_id_;
-    const Partition &partition = partitions_[partition_id];
+    Partition &partition = partitions_[partition_id];
     const auto &entries = reader->req_.entries_;
 
     uint64_t sum_val = 0;
     for (auto &ent : entries)
     {
-        uint32_t val = kvstore::DecodeFixed32(std::get<1>(ent).data());
+        uint32_t val = DecodeValue(std::get<1>(ent));
         sum_val += val;
     }
     if (seg_sum_ != sum_val)
@@ -511,8 +557,8 @@ void ConcurrencyTester::VerifyRead(Reader *reader)
                 key_ans++;
             }
 
-            uint32_t key_res = decode_key(k.data());
-            uint32_t val_res = kvstore::DecodeFixed32(v.data());
+            uint32_t key_res = DecodeKey(k);
+            uint32_t val_res = DecodeValue(v);
             CHECK(key_res < key_end);
             if (key_ans != key_res || partition.kvs_[key_ans] != val_res)
             {
@@ -524,8 +570,14 @@ void ConcurrencyTester::VerifyRead(Reader *reader)
         }
         verify_kv_++;
     }
+    reader->verify_cnt_++;
+    partition.verify_cnt_++;
 
-    partitions_[partition_id].verify_cnt_++;
+    if (!partition.IsWriting() && partition.verify_cnt_ >= write_pause)
+    {
+        // Trigger next write.
+        ExecWrite(partition);
+    }
 }
 
 // Tester: {100:5}{102:9}{103:2}
@@ -583,18 +635,21 @@ void ConcurrencyTester::ExecWrite(ConcurrencyTester::Partition &partition)
     partition.ticks_++;
     uint64_t ts = CurrentTimestamp();
     std::vector<kvstore::WriteDataEntry> entries;
+    const size_t total_size = partition.kvs_.size();
     uint32_t left = seg_sum_;
-    for (uint32_t i = 0; i < partition.kvs_.size(); i++)
+    uint32_t i = (rand() % seg_count_) * seg_size_;
+    for (; i < total_size; i++)
     {
         uint32_t new_val = 0;
-        if ((i + 1) % seg_size_ == 0)
+        const bool last = (i + 1) % seg_size_ == 0;
+        if (last)
         {
             new_val = left;
             left = seg_sum_;
         }
         else if (rand() % 3 != 0)
         {
-            new_val = rand() % (average_v * 3);
+            new_val = rand() % (val_size_ * 3);
             new_val = std::min(new_val, left);
             left -= new_val;
         }
@@ -604,7 +659,7 @@ void ConcurrencyTester::ExecWrite(ConcurrencyTester::Partition &partition)
             if (partition.kvs_[i] != 0)
             {
                 kvstore::WriteDataEntry &ent = entries.emplace_back();
-                kvstore::PutFixed32(&ent.key_, kvstore::ToBigEndian(i));
+                EncodeKey(&ent.key_, i);
                 ent.timestamp_ = ts;
                 ent.op_ = kvstore::WriteOp::Delete;
             }
@@ -612,12 +667,20 @@ void ConcurrencyTester::ExecWrite(ConcurrencyTester::Partition &partition)
         else
         {
             kvstore::WriteDataEntry &ent = entries.emplace_back();
-            kvstore::PutFixed32(&ent.key_, kvstore::ToBigEndian(i));
-            kvstore::PutFixed32(&ent.val_, new_val);
+            EncodeKey(&ent.key_, i);
+            EncodeValue(&ent.val_, new_val);
             ent.timestamp_ = ts;
             ent.op_ = kvstore::WriteOp::Upsert;
         }
         partition.kvs_[i] = new_val;
+
+        if (last)
+        {
+            if ((rand() & 1) == 0)
+            {
+                i += seg_size_;
+            }
+        }
     }
 
     partition.req_.SetArgs({tbl_name_, partition.id_}, std::move(entries));
@@ -648,8 +711,8 @@ void ConcurrencyTester::Init()
             CHECK(scan_req.entries_.size() <= partition.kvs_.size());
             for (auto &[k, v, _] : scan_req.entries_)
             {
-                uint32_t key_res = decode_key(k.data());
-                uint32_t val_res = kvstore::DecodeFixed32(v.data());
+                uint32_t key_res = DecodeKey(k);
+                uint32_t val_res = DecodeValue(v);
                 CHECK(key_res < partition.kvs_.size());
                 partition.kvs_[key_res] = val_res;
             }
@@ -672,13 +735,13 @@ void ConcurrencyTester::Init()
         }
 
         // Initialize partition KVs
-        partition.kvs_.resize(kvs_num, average_v);
+        partition.kvs_.resize(kvs_num, val_size_);
         std::vector<kvstore::WriteDataEntry> entries;
         for (uint32_t i = 0; i < kvs_num; i++)
         {
             kvstore::WriteDataEntry &ent = entries.emplace_back();
-            kvstore::PutFixed32(&ent.key_, kvstore::ToBigEndian(i));
-            kvstore::PutFixed32(&ent.val_, average_v);
+            EncodeKey(&ent.key_, i);
+            EncodeValue(&ent.val_, val_size_);
             ent.timestamp_ = ts;
             ent.op_ = kvstore::WriteOp::Upsert;
         }
@@ -688,65 +751,60 @@ void ConcurrencyTester::Init()
     }
 }
 
-void ConcurrencyTester::Run(uint32_t rounds,
-                            uint32_t interval,
-                            uint16_t n_readers)
+void ConcurrencyTester::Run(uint16_t n_readers,
+                            uint32_t ops,
+                            uint32_t write_pause)
 {
     uint16_t running_readers = 0;
-    auto is_finished = [this, &running_readers, rounds]() -> bool
+    auto is_finished = [this, &running_readers]() -> bool
     {
+        if (running_readers > 0)
+        {
+            return false;
+        }
         for (const Partition &partition : partitions_)
         {
-            if (partition.FinishedRounds() < rounds)
+            if (partition.IsWriting())
             {
                 return false;
             }
         }
-
-        return running_readers == 0;
+        return true;
     };
 
     // Start readers
-    if (n_readers < partitions_.size())
-    {
-        LOG(WARNING) << "n_readers is less than partitions, reset to "
-                     << partitions_.size();
-        n_readers = partitions_.size();
-    }
+    CHECK(n_readers * ops >= partitions_.size());
     std::vector<Reader> readers(n_readers);
     for (Reader &reader : readers)
     {
         reader.id_ = running_readers++;
+        reader.partition_id_ = reader.id_ % partitions_.size();
         ExecRead(&reader);
     }
 
     while (!is_finished())
     {
         uint64_t user_data;
-        while (finished_reqs_.try_dequeue(user_data))
+        finished_reqs_.wait_dequeue(user_data);
+        bool is_write = (user_data & (uint64_t(1) << 63));
+        uint32_t id = (user_data & ((uint64_t(1) << 63) - 1));
+
+        if (is_write)
         {
-            bool is_write = (user_data & (uint64_t(1) << 63));
-            uint32_t id = (user_data & ((uint64_t(1) << 63) - 1));
-
-            if (is_write)
+            Partition &partition = partitions_[id];
+            partition.FinishWrite();
+            if (write_pause == 0 && partition.FinishedRounds() < ops)
             {
-                Partition &partition = partitions_[id];
-                partition.FinishWrite();
-                continue;
+                ExecWrite(partition);
             }
-
+        }
+        else
+        {
             Reader &reader = readers[id];
-            Partition &partition = partitions_[reader.partition_id_];
-            VerifyRead(&reader);
-            if (partition.FinishedRounds() < rounds)
+            VerifyRead(&reader, write_pause);
+            if (reader.verify_cnt_ < ops)
             {
                 ExecRead(&reader);
-
-                // Pause between each round of write
-                if (partition.verify_cnt_ >= interval && !partition.IsWriting())
-                {
-                    ExecWrite(partition);
-                }
             }
             else
             {
@@ -772,7 +830,7 @@ void ConcurrencyTester::Clear()
 
 uint64_t ConcurrencyTester::CurrentTimestamp()
 {
-    return utils::UnixTs<std::chrono::microseconds>();
+    return utils::UnixTs<std::chrono::nanoseconds>();
 }
 
 ManifestVerifier::ManifestVerifier(kvstore::KvOptions opts)

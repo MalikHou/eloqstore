@@ -4,7 +4,6 @@
 #include <cassert>
 #include <cstdint>
 
-#include "circular_queue.h"
 #include "comparator.h"
 #include "data_page.h"
 #include "error.h"
@@ -21,10 +20,11 @@ class TaskManager;
 class PagesPool;
 class MappingSnapshot;
 class Shard;
+class EloqStore;
 
+inline EloqStore *eloqstore;
 inline thread_local Shard *shard;
-inline thread_local KvTask *thd_task;
-
+KvTask *ThdTask();
 AsyncIoManager *IoMgr();
 const KvOptions *Options();
 const Comparator *Comp();
@@ -45,7 +45,8 @@ enum struct TaskType
     BatchWrite,
     Truncate,
     Compact,
-    Archive
+    Archive,
+    EvictFile
 };
 
 using boost::context::continuation;
@@ -100,26 +101,39 @@ public:
         std::span<FilePageId, max_overflow_pointers> pointers,
         const MappingSnapshot *mapping);
 
-    TaskStatus status_{TaskStatus::Idle};
-
     uint32_t inflight_io_{0};
     int io_res_{0};
     uint32_t io_flags_{0};
 
+    TaskStatus status_{TaskStatus::Idle};
     KvRequest *req_{nullptr};
     boost::context::continuation coro_;
+    KvTask *next_{nullptr};
 };
 
 class WaitingZone
 {
 public:
-    WaitingZone(size_t capacity = 8) : tasks_(capacity) {};
-    void Sleep(KvTask *task);
+    void Wait(KvTask *task);
     void WakeOne();
     void WakeN(size_t n);
     void WakeAll();
+    bool Empty() const;
 
 private:
-    CircularQueue<KvTask *> tasks_;
+    void PushBack(KvTask *task);
+    KvTask *PopFront();
+
+    KvTask *head_{nullptr}, *tail_{nullptr};
+};
+
+class WaitingSeat
+{
+public:
+    void Wait(KvTask *task);
+    void Wake();
+
+private:
+    KvTask *task_{nullptr};
 };
 }  // namespace kvstore

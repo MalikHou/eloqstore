@@ -1,5 +1,6 @@
 #pragma once
 
+#include <boost/functional/hash.hpp>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -23,13 +24,13 @@ static constexpr FileId MaxFileId = UINT64_MAX;
 constexpr char FileNameSeparator = '_';
 static constexpr char FileNameData[] = "data";
 static constexpr char FileNameManifest[] = "manifest";
-static constexpr char FileNameTmpfile[] = "tmpfile";
+static constexpr char TmpSuffix[] = ".tmp";
 
 namespace fs = std::filesystem;
 
 struct TableIdent
 {
-    static constexpr char separator = '#';
+    static constexpr char separator = '.';
     friend bool operator==(const TableIdent &lhs, const TableIdent &rhs)
     {
         return lhs.tbl_name_ == rhs.tbl_name_ &&
@@ -37,6 +38,9 @@ struct TableIdent
     }
     friend std::ostream &operator<<(std::ostream &os, const TableIdent &point);
 
+    TableIdent() = default;
+    TableIdent(std::string tbl_name, uint32_t id)
+        : tbl_name_(std::move(tbl_name)), partition_id_(id) {};
     std::string ToString() const;
     static TableIdent FromString(const std::string &str);
     uint8_t DiskIndex(uint8_t num_disks) const;
@@ -63,8 +67,8 @@ inline TableIdent TableIdent::FromString(const std::string &str)
 
     try
     {
-        uint32_t num = std::stoul(str.data() + p + 1);
-        return {str.substr(0, p), num};
+        uint32_t id = std::stoul(str.data() + p + 1);
+        return {str.substr(0, p), id};
     }
     catch (...)
     {
@@ -85,11 +89,6 @@ inline fs::path TableIdent::StorePath(std::span<const std::string> disks) const
     return partition_path;
 }
 
-inline size_t TableIdent::Hash() const
-{
-    return std::hash<std::string>()(tbl_name_) * 23 + partition_id_;
-}
-
 inline bool TableIdent::IsValid() const
 {
     return !tbl_name_.empty();
@@ -101,6 +100,16 @@ inline std::ostream &operator<<(std::ostream &out, const TableIdent &tid)
     return out;
 }
 
+struct FileKey
+{
+    bool operator==(const FileKey &other) const
+    {
+        return tbl_id_ == other.tbl_id_ && filename_ == other.filename_;
+    }
+    TableIdent tbl_id_;
+    std::string filename_;
+};
+
 }  // namespace kvstore
 
 template <>
@@ -108,6 +117,20 @@ struct std::hash<kvstore::TableIdent>
 {
     std::size_t operator()(const kvstore::TableIdent &tbl_ident) const
     {
-        return tbl_ident.Hash();
+        size_t seed = 0;
+        boost::hash_combine(seed, tbl_ident.tbl_name_);
+        boost::hash_combine(seed, tbl_ident.partition_id_);
+        return seed;
+    }
+};
+
+template <>
+struct std::hash<kvstore::FileKey>
+{
+    std::size_t operator()(const kvstore::FileKey &file_key) const
+    {
+        size_t seed = std::hash<kvstore::TableIdent>()(file_key.tbl_id_);
+        boost::hash_combine(seed, file_key.filename_);
+        return seed;
     }
 };
