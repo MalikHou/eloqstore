@@ -57,7 +57,7 @@ struct KvOptions
      * @brief Size of io-uring selected buffer ring.
      * It must be a power-of 2, and can be up to 32768.
      */
-    uint16_t buf_ring_size = 1 << 10;
+    uint16_t buf_ring_size = 1 << 12;
     /**
      * @brief Size of coroutine stack.
      * According to the latest test results, at least 16KB is required.

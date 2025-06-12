@@ -287,7 +287,7 @@ KvError WriteTask::FlushBatchPages()
 
 KvError WriteTask::WaitWrite()
 {
-    WaitAsynIo();
+    WaitIo();
     KvError err = write_err_;
     write_err_ = KvError::NoError;
     return err;

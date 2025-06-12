@@ -190,7 +190,6 @@ protected:
     {
         KvTask,
         BaseReq,
-        ReadReq,
         WriteReq
     };
 
@@ -198,22 +197,8 @@ protected:
     {
         BaseReq(KvTask *task = nullptr) : task_(task) {};
         KvTask *task_;
-        int io_res_{0};
-    };
-
-    struct ReadReq
-    {
-        ReadReq() : task_(nullptr) {};
-        ReadReq(KvTask *task, LruFD::Ref fd, uint32_t offset);
-        ReadReq(ReadReq &&other) = default;
-        ReadReq &operator=(ReadReq &&) = default;
-
-        KvTask *task_;
-        LruFD::Ref fd_ref_;
-        uint32_t offset_;
-
-        int io_res_{0};
-        Page page_{false};
+        int res_{0};
+        uint32_t flags_{0};
     };
 
     struct WriteReq

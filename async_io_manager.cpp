@@ -171,7 +171,7 @@ std::pair<Page, KvError> IouringMgr::ReadPage(const TableIdent &tbl_id,
             sqe->buf_group = buf_group_;
             sqe->flags |= IOSQE_BUFFER_SELECT;
             io_uring_prep_read(sqe, fd.first, NULL, 0, offset);
-            res = ThdTask()->WaitSyncIo();
+            res = ThdTask()->WaitIoResult();
             if (ThdTask()->io_flags_ & IORING_CQE_F_BUFFER)
             {
                 uint16_t buf_id =
@@ -208,6 +208,21 @@ KvError IouringMgr::ReadPages(const TableIdent &tbl_id,
                               std::vector<Page> &pages)
 {
     assert(page_ids.size() <= max_read_pages_batch);
+
+    struct ReadReq : public BaseReq
+    {
+        ReadReq() = default;
+        ReadReq(KvTask *task, LruFD::Ref fd, uint32_t offset)
+            : BaseReq(task),
+              fd_ref_(std::move(fd)),
+              offset_(offset),
+              page_(true) {};
+
+        LruFD::Ref fd_ref_;
+        uint32_t offset_;
+        Page page_{false};
+    };
+
     // ReadReq is a temporary object, so we allocate it on stack.
     std::array<ReadReq, max_read_pages_batch> reqs_buf;
     std::span<ReadReq> reqs(reqs_buf.data(), page_ids.size());
@@ -228,7 +243,7 @@ KvError IouringMgr::ReadPages(const TableIdent &tbl_id,
     auto send_req = [this](ReadReq *req)
     {
         auto [fd, registered] = req->fd_ref_.FdPair();
-        io_uring_sqe *sqe = GetSQE(UserDataType::ReadReq, req);
+        io_uring_sqe *sqe = GetSQE(UserDataType::BaseReq, req);
         if (registered)
         {
             sqe->flags |= IOSQE_FIXED_FILE;
@@ -244,7 +259,13 @@ KvError IouringMgr::ReadPages(const TableIdent &tbl_id,
         bool all_finished = true;
         for (ReadReq &req : reqs)
         {
-            int res = req.io_res_;
+            int res = req.res_;
+            if (req.flags_ & IORING_CQE_F_BUFFER)
+            {
+                uint16_t buf_id = req.flags_ >> IORING_CQE_BUFFER_SHIFT;
+                req.page_ = SwapPage(std::move(req.page_), buf_id);
+            }
+
             KvError err = ToKvError(res);
             if ((res >= 0 && res < options_->data_page_size) ||
                 err == KvError::TryAgain)
@@ -257,7 +278,7 @@ KvError IouringMgr::ReadPages(const TableIdent &tbl_id,
                 // Wait for all of the inflight io requests to complete to avoid
                 // PollComplete access invalid ReadReq* on this function stack
                 // after returned.
-                ThdTask()->WaitAsynIo();
+                ThdTask()->WaitIo();
                 return err;
             }
         }
@@ -266,7 +287,7 @@ KvError IouringMgr::ReadPages(const TableIdent &tbl_id,
             break;
         }
         // Retry until all requests are completed.
-        ThdTask()->WaitAsynIo();
+        ThdTask()->WaitIo();
     }
 
     // Validate result pages.
@@ -365,7 +386,7 @@ KvError IouringMgr::WritePages(const TableIdent &tbl_id,
     }
     io_uring_prep_writev(sqe, fd, iov.data(), num_pages, offset);
 
-    int ret = ThdTask()->WaitSyncIo();
+    int ret = ThdTask()->WaitIoResult();
     if (ret < 0)
     {
         return ToKvError(ret);
@@ -414,7 +435,7 @@ KvError IouringMgr::AbortWrite(const TableIdent &tbl_id)
 {
     // Wait all WriteReq finished to avoid PollComplete access this WriteTask
     // from WriteReq.task_ after aborted.
-    ThdTask()->WaitAsynIo();
+    ThdTask()->WaitIo();
 
     // Clear dirty flag on all LruFD.
     auto it_tbl = tables_.find(tbl_id);
@@ -674,9 +695,9 @@ void IouringMgr::PollComplete()
     {
         cnt++;
 
-        auto [ptr, typ] = DecodeUserData(cqe->user_data);
+        auto [ptr, type] = DecodeUserData(cqe->user_data);
         KvTask *task;
-        switch (typ)
+        switch (type)
         {
         case UserDataType::KvTask:
             task = static_cast<KvTask *>(ptr);
@@ -686,19 +707,8 @@ void IouringMgr::PollComplete()
         case UserDataType::BaseReq:
         {
             BaseReq *req = static_cast<BaseReq *>(ptr);
-            req->io_res_ = cqe->res;
-            task = req->task_;
-            break;
-        }
-        case UserDataType::ReadReq:
-        {
-            ReadReq *req = static_cast<ReadReq *>(ptr);
-            req->io_res_ = cqe->res;
-            if (cqe->flags & IORING_CQE_F_BUFFER)
-            {
-                uint16_t buf_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-                req->page_ = SwapPage(std::move(req->page_), buf_id);
-            }
+            req->res_ = cqe->res;
+            req->flags_ = cqe->flags;
             task = req->task_;
             break;
         }
@@ -727,7 +737,7 @@ void IouringMgr::PollComplete()
         default:
             assert(false);
         }
-        task->FinishIo(typ == UserDataType::KvTask);
+        task->FinishIo();
     }
 
     io_uring_cq_advance(&ring_, cnt);
@@ -742,7 +752,7 @@ int IouringMgr::MakeDir(FdIdx dir_fd, const char *path)
         sqe->flags |= IOSQE_FIXED_FILE;
     }
     io_uring_prep_mkdirat(sqe, dir_fd.first, path, 0775);
-    int res = ThdTask()->WaitSyncIo();
+    int res = ThdTask()->WaitIoResult();
     if (res < 0)
     {
         LOG(ERROR) << "mkdirat " << path << " failed " << strerror(-res);
@@ -810,7 +820,7 @@ int IouringMgr::OpenAt(FdIdx dir_fd,
     }
     open_how how = {.flags = flags, .mode = mode, .resolve = 0};
     io_uring_prep_openat2(sqe, dir_fd.first, path, &how);
-    return ThdTask()->WaitSyncIo();
+    return ThdTask()->WaitIoResult();
 }
 
 int IouringMgr::Read(FdIdx fd, char *dst, size_t n, uint64_t offset)
@@ -821,7 +831,7 @@ int IouringMgr::Read(FdIdx fd, char *dst, size_t n, uint64_t offset)
         sqe->flags |= IOSQE_FIXED_FILE;
     }
     io_uring_prep_read(sqe, fd.first, dst, n, offset);
-    return ThdTask()->WaitSyncIo();
+    return ThdTask()->WaitIoResult();
 }
 
 Page IouringMgr::SwapPage(Page page, uint16_t buf_id)
@@ -845,7 +855,7 @@ int IouringMgr::Write(FdIdx fd, const char *src, size_t n, uint64_t offset)
         sqe->flags |= IOSQE_FIXED_FILE;
     }
     io_uring_prep_write(sqe, fd.first, src, n, offset);
-    return ThdTask()->WaitSyncIo();
+    return ThdTask()->WaitIoResult();
 }
 
 KvError IouringMgr::SyncFile(LruFD::Ref fd)
@@ -884,18 +894,18 @@ KvError IouringMgr::SyncFiles(const TableIdent &tbl_id,
         }
         io_uring_prep_fsync(sqe, fd, IORING_FSYNC_DATASYNC);
     }
-    ThdTask()->WaitAsynIo();
+    ThdTask()->WaitIo();
 
     // Check results.
     KvError err = KvError::NoError;
     for (const FsyncReq &req : reqs)
     {
-        if (req.io_res_ < 0)
+        if (req.res_ < 0)
         {
-            err = ToKvError(req.io_res_);
+            err = ToKvError(req.res_);
             LOG(ERROR) << "fsync file failed " << tbl_id << '@'
                        << req.fd_ref_.Get()->file_id_ << " : "
-                       << strerror(-req.io_res_);
+                       << strerror(-req.res_);
         }
         else
         {
@@ -913,7 +923,7 @@ int IouringMgr::Fdatasync(FdIdx fd)
         sqe->flags |= IOSQE_FIXED_FILE;
     }
     io_uring_prep_fsync(sqe, fd.first, IORING_FSYNC_DATASYNC);
-    return ThdTask()->WaitSyncIo();
+    return ThdTask()->WaitIoResult();
 }
 
 int IouringMgr::Statx(int fd, const char *path, struct statx *result)
@@ -921,7 +931,7 @@ int IouringMgr::Statx(int fd, const char *path, struct statx *result)
     io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, ThdTask());
     io_uring_prep_statx(
         sqe, fd, path, AT_EMPTY_PATH, STATX_BASIC_STATS, result);
-    return ThdTask()->WaitSyncIo();
+    return ThdTask()->WaitIoResult();
 }
 
 int IouringMgr::Rename(FdIdx dir_fd, const char *old_path, const char *new_path)
@@ -933,14 +943,14 @@ int IouringMgr::Rename(FdIdx dir_fd, const char *old_path, const char *new_path)
     }
     io_uring_prep_renameat(
         sqe, dir_fd.first, old_path, dir_fd.first, new_path, 0);
-    return ThdTask()->WaitSyncIo();
+    return ThdTask()->WaitIoResult();
 }
 
 int IouringMgr::Close(int fd)
 {
     io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, ThdTask());
     io_uring_prep_close(sqe, fd);
-    int res = ThdTask()->WaitSyncIo();
+    int res = ThdTask()->WaitIoResult();
     if (res < 0)
     {
         LOG(ERROR) << "close file/directory " << fd
@@ -1042,7 +1052,7 @@ int IouringMgr::RegisterFile(int fd)
     }
     io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, ThdTask());
     io_uring_prep_files_update(sqe, &fd, 1, idx);
-    int res = ThdTask()->WaitSyncIo();
+    int res = ThdTask()->WaitIoResult();
     if (res < 0)
     {
         LOG(ERROR) << "failed to register file " << fd << " at " << idx << ": "
@@ -1058,7 +1068,7 @@ int IouringMgr::UnregisterFile(int idx)
     int fd = -1;
     io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, ThdTask());
     io_uring_prep_files_update(sqe, &fd, 1, idx);
-    int res = ThdTask()->WaitSyncIo();
+    int res = ThdTask()->WaitIoResult();
     if (res < 0)
     {
         LOG(ERROR) << "can't unregister file at " << idx << ": "
@@ -1077,7 +1087,7 @@ int IouringMgr::Fallocate(FdIdx fd, uint64_t size)
         sqe->flags |= IOSQE_FIXED_FILE;
     }
     io_uring_prep_fallocate(sqe, fd.first, 0, 0, size);
-    int res = ThdTask()->WaitSyncIo();
+    int res = ThdTask()->WaitIoResult();
     if (res < 0)
     {
         LOG(ERROR) << "fallocate failed " << strerror(-res);
@@ -1098,7 +1108,7 @@ int IouringMgr::UnlinkAt(FdIdx dir_fd, const char *path, bool rmdir)
         flags = AT_REMOVEDIR;
     }
     io_uring_prep_unlinkat(sqe, dir_fd.first, path, flags);
-    int res = ThdTask()->WaitSyncIo();
+    int res = ThdTask()->WaitIoResult();
     return res;
 }
 
@@ -1499,11 +1509,6 @@ void IouringMgr::LruFD::Ref::Clear()
     }
     fd_ = nullptr;
     io_mgr_ = nullptr;
-}
-
-IouringMgr::ReadReq::ReadReq(KvTask *task, LruFD::Ref fd, uint32_t offset)
-    : task_(task), fd_ref_(std::move(fd)), offset_(offset), page_(Page(true))
-{
 }
 
 char *IouringMgr::WriteReq::PagePtr() const
@@ -1945,16 +1950,16 @@ void CloudStoreMgr::FileCleaner::Run()
             io_uring_prep_unlinkat(sqe, root_fd, req.path_.c_str(), 0);
         }
 
-        WaitAsynIo();
+        WaitIo();
 
         for (uint16_t i = 0; i < req_count; i++)
         {
             const UnlinkReq &req = unlink_reqs[i];
             CachedFile *file = req.file_;
-            if (req.io_res_ < 0)
+            if (req.res_ < 0)
             {
                 LOG(ERROR) << "unlink file failed: " << req.path_ << " : "
-                           << strerror(-req.io_res_);
+                           << strerror(-req.res_);
                 file->evicting_ = false;
                 file->waiting_.Wake();
                 continue;

@@ -34,8 +34,7 @@ enum class TaskStatus : uint8_t
     Idle = 0,
     Ongoing,
     Blocked,
-    WaitSyncIo,
-    WaitAllAsynIo
+    BlockedIO
 };
 
 enum struct TaskType
@@ -64,9 +63,9 @@ public:
      */
     void Resume();
 
-    int WaitSyncIo();
-    void WaitAsynIo();
-    void FinishIo(bool is_sync_io);
+    int WaitIoResult();
+    void WaitIo();
+    void FinishIo();
 
     std::pair<Page, KvError> LoadPage(const TableIdent &tbl_id,
                                       FilePageId file_page_id);

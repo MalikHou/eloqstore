@@ -21,38 +21,29 @@ void KvTask::Resume()
     }
 }
 
-int KvTask::WaitSyncIo()
+int KvTask::WaitIoResult()
 {
     assert(inflight_io_ > 0);
-    status_ = TaskStatus::WaitSyncIo;
-    io_res_ = 0;
-    io_flags_ = 0;
-    Yield();
+    WaitIo();
     return io_res_;
 }
 
-void KvTask::WaitAsynIo()
+void KvTask::WaitIo()
 {
     while (inflight_io_ > 0)
     {
-        status_ = TaskStatus::WaitAllAsynIo;
+        status_ = TaskStatus::BlockedIO;
         Yield();
     }
 }
 
-void KvTask::FinishIo(bool is_sync_io)
+void KvTask::FinishIo()
 {
     assert(inflight_io_ > 0);
     inflight_io_--;
     switch (status_)
     {
-    case TaskStatus::WaitSyncIo:
-        if (is_sync_io)
-        {
-            Resume();
-        }
-        break;
-    case TaskStatus::WaitAllAsynIo:
+    case TaskStatus::BlockedIO:
         if (inflight_io_ == 0)
         {
             Resume();
@@ -201,15 +192,13 @@ void WaitingZone::WakeN(size_t n)
 
 void WaitingZone::WakeAll()
 {
-    while (true)
+    for (KvTask *task = head_; task != nullptr; task = task->next_)
     {
-        KvTask *task = PopFront();
-        if (task == nullptr)
-        {
-            break;
-        }
         task->Resume();
     }
+    head_ = tail_ = nullptr;  // Clear the waiting zone.
+    // Note: This will not clear the next_ pointers of the tasks, but they
+    // are not used after being resumed.
 }
 
 bool WaitingZone::Empty() const
