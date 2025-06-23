@@ -12,7 +12,7 @@ KvError CompactTask::CompactDataFile()
 
     auto [meta, err] = shard->IndexManager()->FindRoot(tbl_ident_);
     CHECK_KV_ERR(err);
-    if (meta->root_page_ == nullptr)
+    if (meta->root_id_ == MaxPageId)
     {
         return KvError::NotFound;
     }
@@ -41,16 +41,16 @@ KvError CompactTask::CompactDataFile()
 
     err = shard->IndexManager()->MakeCowRoot(tbl_ident_, cow_meta_);
     CHECK_KV_ERR(err);
-    assert(cow_meta_.root_ != nullptr);
+    assert(cow_meta_.root_id_ != MaxPageId);
+    PageMapper *mapper = cow_meta_.mapper_.get();
 
-    allocator =
-        static_cast<AppendAllocator *>(cow_meta_.mapper_->FilePgAllocator());
-    assert(mapping_cnt == cow_meta_.mapper_->MappingCount());
+    allocator = static_cast<AppendAllocator *>(mapper->FilePgAllocator());
+    assert(mapping_cnt == mapper->MappingCount());
 
     // Get all file page ids that are used by this version.
     std::vector<std::pair<FilePageId, PageId>> fp_ids;
     fp_ids.reserve(mapping_cnt);
-    size_t tbl_size = cow_meta_.mapper_->GetMapping()->mapping_tbl_.size();
+    size_t tbl_size = mapper->GetMapping()->mapping_tbl_.size();
     for (PageId page_id = 0; page_id < tbl_size; page_id++)
     {
         FilePageId fp_id = ToFilePage(page_id);
@@ -138,15 +138,15 @@ KvError CompactTask::CompactDataFile()
         it_low = it_high;
     }
     allocator->UpdateStat(min_file_id, empty_file_cnt);
-    assert(mapping_cnt == cow_meta_.mapper_->MappingCount());
+    assert(mapping_cnt == mapper->MappingCount());
     assert(allocator->SpaceSize() >= mapping_cnt);
     assert(meta->mapper_->DebugStat());
 
-    err = UpdateMeta(cow_meta_.root_);
+    err = UpdateMeta();
     CHECK_KV_ERR(err);
 
-    err = TriggerFileGC();
-    assert(err == KvError::NoError);
+    TriggerFileGC(mapper);
     return KvError::NoError;
 }
+
 }  // namespace kvstore

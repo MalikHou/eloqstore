@@ -54,9 +54,10 @@ void KvTask::FinishIo()
     }
 }
 
-std::pair<Page, KvError> KvTask::LoadPage(const TableIdent &tbl_id,
-                                          FilePageId file_page_id)
+std::pair<Page, KvError> LoadPage(const TableIdent &tbl_id,
+                                  FilePageId file_page_id)
 {
+    assert(file_page_id != MaxFilePageId);
     auto [page, err] = IoMgr()->ReadPage(tbl_id, file_page_id, Page(true));
     if (err != KvError::NoError)
     {
@@ -65,9 +66,9 @@ std::pair<Page, KvError> KvTask::LoadPage(const TableIdent &tbl_id,
     return {std::move(page), KvError::NoError};
 }
 
-std::pair<DataPage, KvError> KvTask::LoadDataPage(const TableIdent &tbl_id,
-                                                  PageId page_id,
-                                                  FilePageId file_page_id)
+std::pair<DataPage, KvError> LoadDataPage(const TableIdent &tbl_id,
+                                          PageId page_id,
+                                          FilePageId file_page_id)
 {
     auto [page, err] = LoadPage(tbl_id, file_page_id);
     if (err != KvError::NoError)
@@ -77,8 +78,9 @@ std::pair<DataPage, KvError> KvTask::LoadDataPage(const TableIdent &tbl_id,
     return {DataPage(page_id, std::move(page)), KvError::NoError};
 }
 
-std::pair<OverflowPage, KvError> KvTask::LoadOverflowPage(
-    const TableIdent &tbl_id, PageId page_id, FilePageId file_page_id)
+std::pair<OverflowPage, KvError> LoadOverflowPage(const TableIdent &tbl_id,
+                                                  PageId page_id,
+                                                  FilePageId file_page_id)
 {
     auto [page, err] = LoadPage(tbl_id, file_page_id);
     if (err != KvError::NoError)
@@ -88,10 +90,9 @@ std::pair<OverflowPage, KvError> KvTask::LoadOverflowPage(
     return {OverflowPage(page_id, std::move(page)), KvError::NoError};
 }
 
-std::pair<std::string, KvError> KvTask::GetOverflowValue(
-    const TableIdent &tbl_id,
-    const MappingSnapshot *mapping,
-    std::string_view encoded_ptrs)
+std::pair<std::string, KvError> GetOverflowValue(const TableIdent &tbl_id,
+                                                 const MappingSnapshot *mapping,
+                                                 std::string_view encoded_ptrs)
 {
     std::array<FilePageId, max_overflow_pointers> ids_buf;
     // Decode and convert overflow pointers (logical) to file page ids.
@@ -129,7 +130,7 @@ std::pair<std::string, KvError> KvTask::GetOverflowValue(
     return {std::move(value), KvError::NoError};
 }
 
-uint8_t KvTask::DecodeOverflowPointers(
+uint8_t DecodeOverflowPointers(
     std::string_view encoded, std::span<PageId, max_overflow_pointers> pointers)
 {
     assert(encoded.size() % sizeof(PageId) == 0);
@@ -144,7 +145,7 @@ uint8_t KvTask::DecodeOverflowPointers(
     return n_ptrs;
 }
 
-uint8_t KvTask::DecodeOverflowPointers(
+uint8_t DecodeOverflowPointers(
     std::string_view encoded,
     std::span<FilePageId, max_overflow_pointers> pointers,
     const MappingSnapshot *mapping)

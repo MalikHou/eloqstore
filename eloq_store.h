@@ -18,7 +18,9 @@ enum class RequestType : uint8_t
     Scan,
     BatchWrite,
     Truncate,
-    Archive
+    Archive,
+    Compact,
+    CleanExpired
 };
 
 class KvRequest
@@ -64,7 +66,8 @@ public:
     std::string_view key_;
     // output
     std::string value_;
-    uint64_t ts_{0};
+    uint64_t ts_;
+    uint64_t expire_ts_;
 };
 
 /**
@@ -85,7 +88,8 @@ public:
     // output
     std::string floor_key_;
     std::string value_;
-    uint64_t ts_{0};
+    uint64_t ts_;
+    uint64_t expire_ts_;
 };
 
 class ScanRequest : public KvRequest
@@ -175,7 +179,24 @@ public:
     {
         return RequestType::Archive;
     }
-    void SetArgs(TableIdent tid);
+};
+
+class CompactRequest : public WriteRequest
+{
+public:
+    RequestType Type() const override
+    {
+        return RequestType::Compact;
+    }
+};
+
+class CleanExpiredRequest : public WriteRequest
+{
+public:
+    RequestType Type() const override
+    {
+        return RequestType::CleanExpired;
+    }
 };
 
 class FileGarbageCollector;

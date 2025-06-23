@@ -17,7 +17,7 @@ void wake_up(kvstore::KvRequest *req)
 int main()
 {
     kvstore::KvOptions opts;
-    opts.db_path = "/tmp/eloq_store";
+    opts.store_path = {"/tmp/eloq_store"};
     opts.num_threads = 1;
     kvstore::TableIdent tbl_id("t1", 1);
 
@@ -26,7 +26,7 @@ int main()
     assert(err == kvstore::KvError::NoError);
 
     {
-        kvstore::WriteRequest req;
+        kvstore::BatchWriteRequest req;
         std::vector<kvstore::WriteDataEntry> entries;
         entries.emplace_back("key1", "val1", 1, kvstore::WriteOp::Upsert);
         entries.emplace_back("key2", "val2", 1, kvstore::WriteOp::Upsert);
@@ -67,18 +67,18 @@ int main()
         }
         assert(req.entries_.size() == 2);
         kvstore::KvEntry &ent0 = req.entries_[0];
-        assert(std::get<0>(ent0) == "key1");
-        assert(std::get<1>(ent0) == "val1");
-        assert(std::get<2>(ent0) == 1);
+        assert(ent0.key_ == "key1");
+        assert(ent0.value_ == "val1");
+        assert(ent0.timestamp_ == 1);
         kvstore::KvEntry &ent1 = req.entries_[1];
-        assert(std::get<0>(ent1) == "key2");
-        assert(std::get<1>(ent1) == "val2");
-        assert(std::get<2>(ent1) == 1);
+        assert(ent1.key_ == "key2");
+        assert(ent1.value_ == "val2");
+        assert(ent1.timestamp_ == 1);
     }
 
     {
         // Execute synchronously
-        kvstore::WriteRequest req;
+        kvstore::BatchWriteRequest req;
         std::vector<kvstore::WriteDataEntry> entries;
         entries.emplace_back("key1", "", 2, kvstore::WriteOp::Delete);
         entries.emplace_back("key3", "val33", 2, kvstore::WriteOp::Upsert);
@@ -95,9 +95,9 @@ int main()
             ;
         assert(req.entries_.size() == 1);
         kvstore::KvEntry &ent0 = req.entries_[0];
-        assert(std::get<0>(ent0) == "key3");
-        assert(std::get<1>(ent0) == "val33");
-        assert(std::get<2>(ent0) == 2);
+        assert(ent0.key_ == "key3");
+        assert(ent0.value_ == "val33");
+        assert(ent0.timestamp_ == 2);
     }
 
     store.Stop();

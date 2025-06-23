@@ -7,33 +7,35 @@
 
 #include "mem_index_page.h"
 #include "page_mapper.h"
+#include "task.h"
 
 namespace kvstore
 {
-class RootMeta;
-
 class ManifestBuilder
 {
 public:
     ManifestBuilder();
     void UpdateMapping(PageId page_id, FilePageId file_page_id);
     void DeleteMapping(PageId page_id);
-    std::string_view Snapshot(uint32_t root_id,
+    std::string_view Snapshot(PageId root_id,
+                              PageId ttl_root,
                               const MappingSnapshot *mapping,
                               FilePageId max_fp_id);
 
-    std::string_view Finalize(uint32_t new_root);
+    std::string_view Finalize(PageId new_root, PageId ttl_root);
     std::string_view BuffView() const;
     void Reset();
     bool Empty() const;
     uint32_t CurrentSize() const;
 
-    // checksum(8B), root_page_id(4B), log_size(4B)
+    // checksum(8B)|root(4B)|ttl_root(4B)|log_size(4B)
     static constexpr uint16_t checksum_bytes = 8;
-    static constexpr uint16_t header_bytes = checksum_bytes + 8;
+    static constexpr uint16_t header_bytes =
+        checksum_bytes + sizeof(PageId) * 2 + sizeof(uint32_t);
 
     static constexpr uint16_t offset_root = checksum_bytes;
-    static constexpr uint16_t offset_len = offset_root + 4;
+    static constexpr uint16_t offset_ttl_root = offset_root + sizeof(PageId);
+    static constexpr uint16_t offset_len = offset_ttl_root + sizeof(PageId);
 
 private:
     std::string buff_;
@@ -41,10 +43,12 @@ private:
 
 struct CowRootMeta
 {
+    PageId root_id_{MaxPageId};
+    PageId ttl_root_id_{MaxPageId};
     std::unique_ptr<PageMapper> mapper_;
     uint64_t manifest_size_;
-    MemIndexPage *root_;
     std::shared_ptr<MappingSnapshot> old_mapping_;
+    uint64_t next_expire_ts_;
 };
 
 struct RootMeta
@@ -52,15 +56,19 @@ struct RootMeta
     RootMeta() = default;
     RootMeta(const RootMeta &rhs) = delete;
     RootMeta(RootMeta &&rhs) = default;
-    bool IsPinned() const;
     void Pin();
     void Unpin();
 
-    MemIndexPage *root_page_{nullptr};
+    PageId root_id_{MaxPageId};
+    PageId ttl_root_id_{MaxPageId};
     std::unique_ptr<PageMapper> mapper_{nullptr};
     std::unordered_set<MappingSnapshot *> mapping_snapshots_;
-    uint32_t ref_cnt_{0};
     uint64_t manifest_size_{0};
+    uint64_t next_expire_ts_{0};
+
+    uint32_t ref_cnt_{0};
+    bool locked_{false};
+    WaitingZone waiting_;
 };
 
 }  // namespace kvstore

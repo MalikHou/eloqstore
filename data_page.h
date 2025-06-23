@@ -14,7 +14,7 @@ namespace kvstore
 enum class ValLenBit : uint8_t
 {
     Overflow = 0,
-    Reserved1,
+    Expire,
     Reserved2,
     Reserved3,
     BitsCount
@@ -69,6 +69,7 @@ public:
     std::string_view Key() const;
     std::string_view Value() const;
     bool IsOverflow() const;
+    uint64_t ExpireTs() const;
     uint64_t Timestamp() const;
 
     bool HasNext() const;
@@ -105,7 +106,8 @@ private:
                                    uint32_t *shared,
                                    uint32_t *non_shared,
                                    uint32_t *value_length,
-                                   bool *overflow);
+                                   bool *overflow,
+                                   bool *expire);
 
     const Comparator *const cmp_;
     std::string_view page_;
@@ -119,6 +121,7 @@ private:
     std::string_view value_;
     bool overflow_;
     uint64_t timestamp_;
+    uint64_t expire_ts_;
 };
 
 /**

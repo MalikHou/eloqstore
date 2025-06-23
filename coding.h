@@ -90,6 +90,18 @@ inline uint32_t ToBigEndian(uint32_t value)
                                                       : value;
 }
 
+inline uint64_t BigEndianToNative(uint64_t value)
+{
+    return std::endian::native == std::endian::little ? __builtin_bswap64(value)
+                                                      : value;
+}
+
+inline uint32_t BigEndianToNative(uint32_t value)
+{
+    return std::endian::native == std::endian::little ? __builtin_bswap32(value)
+                                                      : value;
+}
+
 // Lower-level versions of Get... that read directly from a character buffer
 // without any bounds checking.
 

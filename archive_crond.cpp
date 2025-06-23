@@ -80,7 +80,7 @@ void ArchiveCrond::StartArchiving()
         const size_t batch_size = tbl_ids.size();
         for (size_t i = 0; i < batch_size; i++)
         {
-            requests[i].SetArgs(std::move(tbl_ids[i]));
+            requests[i].SetTableId(std::move(tbl_ids[i]));
             bool ok = store_->ExecAsyn(&requests[i]);
             LOG_IF(FATAL, !ok) << "Failed to send archive request";
         }

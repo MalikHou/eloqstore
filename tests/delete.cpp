@@ -99,3 +99,77 @@ TEST_CASE("truncate table partition", "[truncate]")
     verify.Clean();
     verify.Validate();
 }
+
+TEST_CASE("rand write with expire timestamp", "[TTL]")
+{
+    kvstore::EloqStore *store = InitStore(mem_store_opts);
+    MapVerifier verify(test_tbl_id, store);
+    verify.SetValueSize(10000);
+    verify.SetMaxTTL(4);
+
+    for (size_t i = 0; i < 20; i++)
+    {
+        verify.WriteRnd(0, 5000);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        verify.Validate();
+    }
+}
+
+TEST_CASE("upsert with expire timestamp", "[TTL]")
+{
+    kvstore::EloqStore *store = InitStore(mem_store_opts);
+    MapVerifier verify(test_tbl_id, store, false);
+    verify.SetValueSize(1000);
+
+    verify.SetMaxTTL(10);
+    const uint32_t batch_size = 1000;
+    for (size_t i = 0; i < 20; i++)
+    {
+        verify.Upsert(i * batch_size, (i + 1) * batch_size);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        verify.Validate();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    // Need a write operation to trigger the last clean operation.
+    verify.Delete(0, 1);
+    verify.Validate();
+    // Make sure the last clean task finished.
+    verify.Delete(0, 1);
+
+    // All keys should have been expired and removed.
+    kvstore::ScanRequest req;
+    req.SetArgs(test_tbl_id, {}, {});
+    store->ExecSync(&req);
+    CHECK(req.Error() == kvstore::KvError::NoError);
+    CHECK(req.entries_.empty());
+    CHECK(verify.DataSet().empty());
+}
+
+TEST_CASE("expire timestamp", "[TTL]")
+{
+    kvstore::EloqStore *store = InitStore(mem_store_opts);
+    MapVerifier verify(test_tbl_id, store);
+    verify.SetMaxTTL(200);
+
+    const uint32_t range_size = 10000;
+    for (size_t i = 0; i < 100; i++)
+    {
+        const uint32_t begin = rand() % range_size;
+        switch (i % 5)
+        {
+        case 0:
+            // Hybrid with overflow value.
+            verify.SetValueSize(10000);
+            verify.WriteRnd(begin, begin + range_size);
+            break;
+        case 1:
+            // Hybrid with truncate operation.
+            verify.Truncate(begin);
+            break;
+        default:
+            verify.SetValueSize(1000);
+            verify.WriteRnd(begin, begin + range_size);
+            break;
+        }
+    }
+}

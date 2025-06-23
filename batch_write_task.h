@@ -1,6 +1,9 @@
 #pragma once
 
+#include "data_page_builder.h"
+#include "index_page_builder.h"
 #include "write_task.h"
+#include "write_tree_stack.h"
 
 namespace kvstore
 {
@@ -8,18 +11,26 @@ namespace kvstore
 class BatchWriteTask : public WriteTask
 {
 public:
+    BatchWriteTask();
     TaskType Type() const override
     {
         return TaskType::BatchWrite;
     }
     void Abort() override;
 
-    bool SetBatch(std::vector<WriteDataEntry> &&entries);
+    bool SetBatch(std::span<WriteDataEntry> entries);
     KvError Apply();
 
+    KvError Truncate(std::string_view trunc_pos);
+
+    KvError CleanExpiredKeys();
+
 private:
+    KvError ApplyBatch(PageId &root_id, bool update_ttl);
+    KvError ApplyTTLBatch();
+    KvError ApplyOnePage(size_t &cidx, uint64_t now_ms);
+
     KvError LoadApplyingPage(PageId page_id);
-    KvError ApplyOnePage(size_t &cidx);
     std::pair<MemIndexPage *, KvError> Pop();
 
     KvError FinishIndexPage(MemIndexPage *new_page,
@@ -37,9 +48,38 @@ private:
      * @param search_key
      */
     KvError SeekStack(std::string_view search_key);
+    std::pair<uint32_t, KvError> Seek(std::string_view key);
+    /**
+     * @brief Calculates the left boundary of the data page or the top index
+     * page in the stack.
+     *
+     * @param is_data_page
+     * @return std::string_view
+     */
+    std::string_view LeftBound(bool is_data_page);
 
-    std::vector<WriteDataEntry> batch_;
+    /**
+     * @brief Calculates the right boundary of the data page or the top index
+     * page in the stack.
+     *
+     * @param is_data_page
+     * @return std::string
+     */
+    std::string RightBound(bool is_data_page);
+
+    std::span<WriteDataEntry> data_batch_;
     DataPage applying_page_;
+    /**
+     * @brief Batch of updates that need to be applied on the TTL tree.
+     */
+    std::vector<WriteDataEntry> ttl_batch_;
+    bool do_update_ttl_;
+    inline void UpdateTTL(uint64_t expire_ts, std::string_view key, WriteOp op);
+
+    std::vector<std::unique_ptr<IndexStackEntry>> stack_;
+    IndexPageBuilder idx_page_builder_;
+    DataPageBuilder data_page_builder_;
+    std::string overflow_ptrs_;
 
     /**
      * @brief To maintain the double link list between bottom data pages, we
@@ -81,6 +121,32 @@ private:
      */
     KvError LeafLinkDelete();
     KvError ShiftLeafLink();
+
+    KvError DeleteTree(PageId page_id, bool update_prev);
+    KvError DeleteDataPage(PageId page_id, bool update_prev);
+
+    /**
+     * @brief Split and write overflow value into multiple pages.
+     * @return overflow_ptrs_ store the encoded overflow pointers.
+     */
+    KvError WriteOverflowValue(std::string_view value);
+    /**
+     * @brief Delete overflow value.
+     * @param encoded_ptrs The encoded overflow pointers.
+     */
+    KvError DelOverflowValue(std::string_view encoded_ptrs);
+
+    /**
+     * @brief Truncate the data page at page_id from the trunc_pos.
+     * @return true if the page is empty after truncation.
+     */
+    std::pair<bool, KvError> TruncateDataPage(PageId page_id,
+                                              std::string_view trunc_pos);
+    std::pair<MemIndexPage *, KvError> TruncateIndexPage(
+        PageId page_id, std::string_view trunc_pos);
+
+    static void AdvanceDataPageIter(DataPageIter &iter, bool &is_valid);
+    static void AdvanceIndexPageIter(IndexPageIter &iter, bool &is_valid);
 };
 
 }  // namespace kvstore

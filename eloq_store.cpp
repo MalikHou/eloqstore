@@ -358,9 +358,10 @@ void ScanRequest::SetPagination(size_t entries, size_t size)
 size_t ScanRequest::ResultSize() const
 {
     size_t size = 0;
-    for (const auto &[k, v, _] : entries_)
+    for (const KvEntry &ent : entries_)
     {
-        size += k.size() + v.size() + sizeof(uint64_t);
+        size += ent.key_.size() + ent.value_.size() + sizeof(ent.timestamp_) +
+                sizeof(ent.expire_ts_);
     }
     return size;
 }
@@ -384,11 +385,6 @@ void TruncateRequest::SetArgs(TableIdent tbl_id, std::string_view position)
 {
     SetTableId(std::move(tbl_id));
     position_ = position;
-}
-
-void ArchiveRequest::SetArgs(TableIdent tbl_id)
-{
-    SetTableId(std::move(tbl_id));
 }
 
 const TableIdent &KvRequest::TableId() const

@@ -11,11 +11,12 @@ namespace kvstore
 KvError ReadTask::Read(const TableIdent &tbl_id,
                        std::string_view search_key,
                        std::string &value,
-                       uint64_t &timestamp)
+                       uint64_t &timestamp,
+                       uint64_t &expire_ts)
 {
     auto [meta, err] = shard->IndexManager()->FindRoot(tbl_id);
     CHECK_KV_ERR(err);
-    if (meta->root_page_ == nullptr)
+    if (meta->root_id_ == MaxPageId)
     {
         return KvError::NotFound;
     }
@@ -23,7 +24,7 @@ KvError ReadTask::Read(const TableIdent &tbl_id,
 
     PageId page_id;
     err = shard->IndexManager()->SeekIndex(
-        mapping.get(), tbl_id, meta->root_page_, search_key, page_id);
+        mapping.get(), meta->root_id_, search_key, page_id);
     CHECK_KV_ERR(err);
     FilePageId file_page = mapping->ToFilePage(page_id);
     auto [page, err_load] = LoadDataPage(tbl_id, page_id, file_page);
@@ -47,6 +48,7 @@ KvError ReadTask::Read(const TableIdent &tbl_id,
         value = iter.Value();
     }
     timestamp = iter.Timestamp();
+    expire_ts = iter.ExpireTs();
     return KvError::NoError;
 }
 
@@ -54,11 +56,12 @@ KvError ReadTask::Floor(const TableIdent &tbl_id,
                         std::string_view search_key,
                         std::string &floor_key,
                         std::string &value,
-                        uint64_t &timestamp)
+                        uint64_t &timestamp,
+                        uint64_t &expire_ts)
 {
     auto [meta, err] = shard->IndexManager()->FindRoot(tbl_id);
     CHECK_KV_ERR(err);
-    if (meta->root_page_ == nullptr)
+    if (meta->root_id_ == MaxPageId)
     {
         return KvError::NotFound;
     }
@@ -66,7 +69,7 @@ KvError ReadTask::Floor(const TableIdent &tbl_id,
 
     PageId page_id;
     err = shard->IndexManager()->SeekIndex(
-        mapping.get(), tbl_id, meta->root_page_, search_key, page_id);
+        mapping.get(), meta->root_id_, search_key, page_id);
     CHECK_KV_ERR(err);
     FilePageId file_page = mapping->ToFilePage(page_id);
     auto [page, err_load] = LoadDataPage(tbl_id, page_id, file_page);
@@ -100,6 +103,7 @@ KvError ReadTask::Floor(const TableIdent &tbl_id,
         value = iter.Value();
     }
     timestamp = iter.Timestamp();
+    expire_ts = iter.ExpireTs();
     return KvError::NoError;
 }
 }  // namespace kvstore

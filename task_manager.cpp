@@ -18,14 +18,6 @@ BatchWriteTask *TaskManager::GetBatchWriteTask(const TableIdent &tbl_id)
     return task;
 }
 
-TruncateTask *TaskManager::GetTruncateTask(const TableIdent &tbl_id)
-{
-    num_active_++;
-    TruncateTask *task = truncate_pool_.GetTask();
-    task->Reset(tbl_id);
-    return task;
-}
-
 CompactTask *TaskManager::GetCompactTask(const TableIdent &tbl_id)
 {
     num_active_++;
@@ -67,9 +59,6 @@ void TaskManager::FreeTask(KvTask *task)
         break;
     case TaskType::BatchWrite:
         batch_write_pool_.FreeTask(static_cast<BatchWriteTask *>(task));
-        break;
-    case TaskType::Truncate:
-        truncate_pool_.FreeTask(static_cast<TruncateTask *>(task));
         break;
     case TaskType::Compact:
         compact_pool_.FreeTask(static_cast<CompactTask *>(task));

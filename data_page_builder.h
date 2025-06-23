@@ -25,8 +25,9 @@ public:
     // REQUIRES: key is larger than any previously added key
     bool Add(std::string_view key,
              std::string_view value,
-             uint64_t ts = 0,
-             bool overflow = false);
+             bool overflow,
+             uint64_t ts,
+             uint64_t expire_ts);
 
     // Finish building the block and return a view that refers to the page
     // contents. The returned view will remain valid for the lifetime of this
@@ -39,6 +40,7 @@ public:
     static bool IsOverflowKV(std::string_view key,
                              size_t val_size,
                              uint64_t ts,
+                             uint64_t expire_ts,
                              const KvOptions *options);
 
     // Return true iff no entries have been added since the last Reset()
@@ -59,6 +61,7 @@ private:
         std::string_view key,
         size_t val_size,
         uint64_t ts,
+        uint64_t expire_ts,
         std::string_view last_key,
         uint64_t last_ts,
         bool restart);

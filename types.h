@@ -52,53 +52,7 @@ struct TableIdent
     uint32_t partition_id_;
 };
 
-inline std::string TableIdent::ToString() const
-{
-    return tbl_name_ + separator + std::to_string(partition_id_);
-}
-
-inline TableIdent TableIdent::FromString(const std::string &str)
-{
-    size_t p = str.find_last_of(separator);
-    if (p == std::string::npos)
-    {
-        return {};
-    }
-
-    try
-    {
-        uint32_t id = std::stoul(str.data() + p + 1);
-        return {str.substr(0, p), id};
-    }
-    catch (...)
-    {
-        return {};
-    }
-}
-
-inline uint8_t TableIdent::DiskIndex(uint8_t num_disks) const
-{
-    assert(num_disks > 0);
-    return partition_id_ % num_disks;
-}
-
-inline fs::path TableIdent::StorePath(std::span<const std::string> disks) const
-{
-    fs::path partition_path = disks[DiskIndex(disks.size())];
-    partition_path.append(ToString());
-    return partition_path;
-}
-
-inline bool TableIdent::IsValid() const
-{
-    return !tbl_name_.empty();
-}
-
-inline std::ostream &operator<<(std::ostream &out, const TableIdent &tid)
-{
-    out << tid.tbl_name_ << TableIdent::separator << tid.partition_id_;
-    return out;
-}
+std::ostream &operator<<(std::ostream &out, const TableIdent &tid);
 
 struct FileKey
 {
@@ -110,7 +64,14 @@ struct FileKey
     std::string filename_;
 };
 
-using KvEntry = std::tuple<std::string, std::string, uint64_t>;
+struct KvEntry
+{
+    bool operator==(const KvEntry &other) const = default;
+    std::string key_;
+    std::string value_;
+    uint64_t timestamp_;
+    uint64_t expire_ts_;
+};
 
 enum class WriteOp : uint8_t
 {
@@ -120,10 +81,19 @@ enum class WriteOp : uint8_t
 
 struct WriteDataEntry
 {
+    WriteDataEntry() = default;
+    WriteDataEntry(std::string key,
+                   std::string val,
+                   uint64_t ts,
+                   WriteOp op,
+                   uint64_t expire_ts = 0);
+    bool operator<(const WriteDataEntry &other) const;
+
     std::string key_;
     std::string val_;
     uint64_t timestamp_;
     WriteOp op_;
+    uint64_t expire_ts_{0};  // 0 means never expire.
 };
 
 }  // namespace kvstore

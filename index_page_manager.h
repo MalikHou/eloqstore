@@ -50,8 +50,6 @@ public:
 
     void UpdateRoot(const TableIdent &tbl_ident, CowRootMeta new_meta);
 
-    KvError LoadTablePartition(const TableIdent &tbl_id);
-
     std::pair<MemIndexPage *, KvError> FindPage(MappingSnapshot *mapping,
                                                 PageId page_id);
 
@@ -64,8 +62,7 @@ public:
     // Given the table id, tree root and the input key, returns the logical page
     // id of the data page that might contain the key.
     KvError SeekIndex(MappingSnapshot *mapping,
-                      const TableIdent &tbl_ident,
-                      MemIndexPage *node,
+                      PageId page_id,
                       std::string_view key,
                       uint32_t &result);
 
@@ -120,7 +117,6 @@ private:
      *
      */
     std::unordered_map<TableIdent, RootMeta> tbl_roots_;
-    std::unordered_map<TableIdent, std::vector<KvTask *>> tbl_loading_;
 
     struct ReadReq
     {

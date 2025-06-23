@@ -15,7 +15,6 @@ namespace test_util
 {
 std::string Key(uint64_t key, uint16_t len = 12);
 std::string Value(uint64_t val, uint32_t len = 0);
-void CheckKvEntry(const kvstore::KvEntry &left, const kvstore::KvEntry &right);
 
 void EncodeKey(char *dst, uint32_t key);
 void EncodeKey(std::string *dst, uint32_t key);
@@ -36,7 +35,7 @@ public:
     MapVerifier(kvstore::TableIdent tid,
                 kvstore::EloqStore *store,
                 bool validate = true,
-                uint16_t key_len = 12);
+                uint16_t key_len = 7);
     ~MapVerifier();
     void Upsert(uint64_t key);
     void Upsert(uint64_t begin, uint64_t end);
@@ -66,6 +65,9 @@ public:
     void SetValueSize(uint32_t val_size);
     void SetStore(kvstore::EloqStore *store);
     void SetTimestamp(uint64_t ts);
+    void SetMaxTTL(uint32_t max_ttl);
+
+    const std::map<std::string, kvstore::KvEntry> &DataSet() const;
 
 private:
     const kvstore::TableIdent tid_;
@@ -74,6 +76,7 @@ private:
     bool auto_validate_{true};
     const uint16_t key_len_;
     uint32_t val_size_{12};
+    uint32_t max_ttl_{0};  // Max TTL in milliseconds
 
     kvstore::EloqStore *eloq_store_;
 };

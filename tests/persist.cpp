@@ -172,6 +172,7 @@ TEST_CASE("overflow kv", "[persist][overflow_kv]")
         write_req.AddWrite(Key(sz), Value(sz, sz), 1, kvstore::WriteOp::Upsert);
     }
     verifier.ExecWrite(&write_req);
+    write_req.batch_.clear();
 
     verifier.Read(Key(1 << 20));
 
@@ -262,6 +263,7 @@ TEST_CASE("file garbage collector", "[GC]")
         // Do validate after each write to try to ensure the file GC is
         // finished.
         tester.Validate();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
         size_t cnt = utils::DirEntryCount(dir_path);
         CHECK(cnt <= max_cnt);
     }

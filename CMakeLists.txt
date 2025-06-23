@@ -6,6 +6,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+option(WITH_ASAN "build with ASAN" OFF)
+if(WITH_ASAN)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
+endif()
+
 find_package(Threads REQUIRED)
 find_package(glog REQUIRED)
 
@@ -24,16 +29,13 @@ endif()
 
 find_package(Git QUIET)
 if(GIT_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/.git")
-    option(GIT_SUBMODULE "Check submodules during build" ON)
-    if(GIT_SUBMODULE)
-        # Update submodules as needed
-        message(STATUS "Submodule update")
-        execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
-                        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-                        RESULT_VARIABLE GIT_SUBMOD_RESULT)
-        if(NOT GIT_SUBMOD_RESULT EQUAL "0")
-            message(FATAL_ERROR "git submodule update --init --recursive failed with ${GIT_SUBMOD_RESULT}, please checkout submodules")
-        endif()
+    # Update submodules as needed
+    message(STATUS "Submodule update")
+    execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
+                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                    RESULT_VARIABLE GIT_SUBMOD_RESULT)
+    if(NOT GIT_SUBMOD_RESULT EQUAL "0")
+        message(FATAL_ERROR "git submodule update --init --recursive failed with ${GIT_SUBMOD_RESULT}, please checkout submodules")
     endif()
 endif()
 
@@ -45,11 +47,6 @@ add_subdirectory(concurrentqueue)
 add_subdirectory(abseil)
 
 set(INI_SOURCES ${PROJECT_SOURCE_DIR}/inih/ini.c ${PROJECT_SOURCE_DIR}/inih/cpp/INIReader.cpp)
-
-option(WITH_ASAN "build with ASAN" OFF)
-if(WITH_ASAN)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined -fsanitize=address -fno-omit-frame-pointer")
-endif()
 
 SET(ELOQ_STORE_INCLUDE
     ${URING_INCLUDE_PATH}
@@ -67,7 +64,6 @@ set(ELOQ_STORE_SOURCES
     scan_task.cpp
     write_task.cpp
     batch_write_task.cpp
-    truncate_task.cpp
     compact_task.cpp
     archive_task.cpp
     async_io_manager.cpp
@@ -84,6 +80,7 @@ set(ELOQ_STORE_SOURCES
     file_gc.cpp
     archive_crond.cpp
     object_store.cpp
+    types.cpp
     kv_options.cpp)
 
 add_library(eloqstore STATIC ${ELOQ_STORE_SOURCES} ${INI_SOURCES})
@@ -94,14 +91,17 @@ target_link_libraries(eloqstore PRIVATE ${URING_LIB} Boost::context glog::glog a
 add_library(test_util STATIC test_utils.cpp)
 target_link_libraries(test_util PUBLIC eloqstore)
 
+option(WITH_UNIT_TESTS "build with unit tests" ON)
 if (WITH_UNIT_TESTS)
     add_subdirectory(tests)
 endif()
 
+option(WITH_EXAMPLE "build with example" ON)
 if (WITH_EXAMPLE)
     add_subdirectory(examples)
 endif()
 
+option(WITH_DB_STRESS "build with stress tool" ON)
 if (WITH_DB_STRESS)
     add_subdirectory(db_stress)
 endif()

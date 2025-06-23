@@ -34,4 +34,21 @@ static size_t CountUsedFD()
     return DirEntryCount("/proc/self/fd");
 }
 
+template <typename F>
+struct YCombinator
+{
+    F f;
+    template <typename... Args>
+    decltype(auto) operator()(Args &&...args) const
+    {
+        return f(*this, std::forward<Args>(args)...);
+    }
+};
+
+template <typename F>
+YCombinator<std::decay_t<F>> MakeYCombinator(F &&f)
+{
+    return {std::forward<F>(f)};
+}
+
 }  // namespace utils

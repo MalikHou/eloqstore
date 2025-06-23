@@ -43,6 +43,7 @@ size_t DataPageBuilder::CurrentSizeEstimate() const
 bool DataPageBuilder::IsOverflowKV(std::string_view key,
                                    size_t val_size,
                                    uint64_t ts,
+                                   uint64_t expire_ts,
                                    const KvOptions *options)
 {
     // Minimum reserved space for header and restart array.
@@ -55,7 +56,7 @@ bool DataPageBuilder::IsOverflowKV(std::string_view key,
     }
 
     size_t stored_val_len = val_size << uint8_t(ValLenBit::BitsCount);
-    auto ret = CalculateDelta(key, stored_val_len, ts, {}, 0, false);
+    auto ret = CalculateDelta(key, stored_val_len, ts, expire_ts, {}, 0, false);
     return reserved + std::get<0>(ret) > options->data_page_size;
 }
 
@@ -63,6 +64,7 @@ std::tuple<size_t, size_t, size_t, uint64_t> DataPageBuilder::CalculateDelta(
     std::string_view key,
     size_t stored_val_len,
     uint64_t ts,
+    uint64_t expire_ts,
     std::string_view last_key,
     uint64_t last_ts,
     bool restart)
@@ -95,6 +97,11 @@ std::tuple<size_t, size_t, size_t, uint64_t> DataPageBuilder::CalculateDelta(
     addition_delta += non_shared;
     // Value
     addition_delta += stored_val_len >> uint8_t(ValLenBit::BitsCount);
+
+    if (expire_ts != 0)
+    {
+        addition_delta += Varint64Size(expire_ts);
+    }
 
     // Timestamp delta
     assert(ts <= INT64_MAX);
@@ -134,8 +141,9 @@ std::string_view DataPageBuilder::Finish()
 
 bool DataPageBuilder::Add(std::string_view key,
                           std::string_view value,
+                          bool overflow,
                           uint64_t ts,
-                          bool overflow)
+                          uint64_t expire_ts)
 {
 #ifndef NDEBUG
     size_t buf_prev_size = buffer_.size();
@@ -149,8 +157,18 @@ bool DataPageBuilder::Add(std::string_view key,
 
     size_t stored_val_len = value.size() << uint8_t(ValLenBit::BitsCount);
     stored_val_len |= (overflow << uint8_t(ValLenBit::Overflow));
-    auto [size_delta, shared, non_shared, ts_delta] = CalculateDelta(
-        key, stored_val_len, ts, last_key_, last_timestamp_, NeedRestart());
+    if (expire_ts != 0)
+    {
+        stored_val_len |= (1 << uint8_t(ValLenBit::Expire));
+    }
+    auto [size_delta, shared, non_shared, ts_delta] =
+        CalculateDelta(key,
+                       stored_val_len,
+                       ts,
+                       expire_ts,
+                       last_key_,
+                       last_timestamp_,
+                       NeedRestart());
 
     // Does not add the data item if it would overflow the page.
     if (CurrentSizeEstimate() + size_delta > options_->data_page_size)
@@ -176,6 +194,10 @@ bool DataPageBuilder::Add(std::string_view key,
     // Adds string delta to buffer_ followed by value
     buffer_.append(key.data() + shared, non_shared);
     buffer_.append(value.data(), value.size());
+    if (expire_ts != 0)
+    {
+        PutVarint64(&buffer_, expire_ts);
+    }
     PutVarint64(&buffer_, ts_delta);
 
 #ifndef NDEBUG

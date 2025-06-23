@@ -9,7 +9,6 @@
 #include "compact_task.h"
 #include "read_task.h"
 #include "scan_task.h"
-#include "truncate_task.h"
 #include "types.h"
 
 namespace kvstore
@@ -18,7 +17,6 @@ class TaskManager
 {
 public:
     BatchWriteTask *GetBatchWriteTask(const TableIdent &tbl_id);
-    TruncateTask *GetTruncateTask(const TableIdent &tbl_id);
     CompactTask *GetCompactTask(const TableIdent &tbl_id);
     ArchiveTask *GetArchiveTask(const TableIdent &tbl_id);
     ReadTask *GetReadTask();
@@ -76,7 +74,6 @@ private:
     };
 
     TaskPool<BatchWriteTask> batch_write_pool_{1024};
-    TaskPool<TruncateTask> truncate_pool_{512};
     TaskPool<CompactTask> compact_pool_{1024};
     TaskPool<ArchiveTask> archive_pool_{256};
     TaskPool<ReadTask> read_pool_{2048};

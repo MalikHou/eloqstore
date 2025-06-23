@@ -66,10 +66,46 @@ bool Shard::AddKvRequest(KvRequest *req)
     return requests_.enqueue(req);
 }
 
-void Shard::AddCompactRequest(const TableIdent &tbl_id)
+void Shard::AddPendingCompact(const TableIdent &tbl_id)
 {
-    assert(pending_queues_.find(tbl_id) != pending_queues_.end());
-    pending_queues_[tbl_id].SetCompact(true);
+    // Send CompactRequest from internal.
+    assert(!HasPendingCompact(tbl_id));
+    auto it = pending_queues_.find(tbl_id);
+    assert(it != pending_queues_.end());
+    PendingWriteQueue &pending_q = it->second;
+    CompactRequest &req = pending_q.compact_req_;
+    req.SetTableId(tbl_id);
+    req.done_.store(false, std::memory_order_relaxed);
+    pending_q.PushBack(&req);
+}
+
+bool Shard::HasPendingCompact(const TableIdent &tbl_id)
+{
+    auto it = pending_queues_.find(tbl_id);
+    assert(it != pending_queues_.end());
+    PendingWriteQueue &pending_q = it->second;
+    return !pending_q.compact_req_.done_.load(std::memory_order_relaxed);
+}
+
+void Shard::AddPendingTTL(const TableIdent &tbl_id)
+{
+    // Send CleanExpiredRequest from internal.
+    assert(!HasPendingTTL(tbl_id));
+    auto it = pending_queues_.find(tbl_id);
+    assert(it != pending_queues_.end());
+    PendingWriteQueue &pending_q = it->second;
+    CleanExpiredRequest &req = pending_q.expire_req_;
+    req.SetTableId(tbl_id);
+    req.done_.store(false, std::memory_order_relaxed);
+    pending_q.PushBack(&req);
+}
+
+bool Shard::HasPendingTTL(const TableIdent &tbl_id)
+{
+    auto it = pending_queues_.find(tbl_id);
+    assert(it != pending_queues_.end());
+    PendingWriteQueue &pending_q = it->second;
+    return !pending_q.expire_req_.done_.load(std::memory_order_relaxed);
 }
 
 IndexPageManager *Shard::IndexManager()
@@ -128,7 +164,8 @@ void Shard::ProcessReq(KvRequest *req)
             KvError err = task->Read(req->TableId(),
                                      read_req->key_,
                                      read_req->value_,
-                                     read_req->ts_);
+                                     read_req->ts_,
+                                     read_req->expire_ts_);
             return err;
         };
         StartTask(task, req, lbd);
@@ -144,7 +181,8 @@ void Shard::ProcessReq(KvRequest *req)
                                       floor_req->key_,
                                       floor_req->floor_key_,
                                       floor_req->value_,
-                                      floor_req->ts_);
+                                      floor_req->ts_,
+                                      floor_req->expire_ts_);
             return err;
         };
         StartTask(task, req, lbd);
@@ -178,32 +216,22 @@ void Shard::ProcessReq(KvRequest *req)
             {
                 return KvError::NoError;
             }
-            if (!task->SetBatch(std::move(write_req->batch_)))
+            if (!task->SetBatch(write_req->batch_))
             {
                 return KvError::InvalidArgs;
             }
-            KvError err = task->Apply();
-            if (err != KvError::NoError)
-            {
-                task->Abort();
-            }
-            return err;
+            return task->Apply();
         };
         StartTask(task, req, lbd);
         break;
     }
     case RequestType::Truncate:
     {
-        TruncateTask *task = task_mgr_.GetTruncateTask(req->TableId());
+        BatchWriteTask *task = task_mgr_.GetBatchWriteTask(req->TableId());
         auto lbd = [task, req]() -> KvError
         {
             auto trunc_req = static_cast<TruncateRequest *>(req);
-            KvError err = task->Truncate(trunc_req->position_);
-            if (err != KvError::NoError)
-            {
-                task->Abort();
-            }
-            return err;
+            return task->Truncate(trunc_req->position_);
         };
         StartTask(task, req, lbd);
         break;
@@ -215,22 +243,21 @@ void Shard::ProcessReq(KvRequest *req)
         StartTask(task, req, lbd);
         break;
     }
-    }
-}
-
-void Shard::StartCompact(const TableIdent &tbl_id)
-{
-    CompactTask *task = task_mgr_.GetCompactTask(tbl_id);
-    auto lbd = [task]() -> KvError
+    case RequestType::Compact:
     {
-        KvError err = task->CompactDataFile();
-        if (err != KvError::NoError)
-        {
-            task->Abort();
-        }
-        return err;
-    };
-    StartTask(task, nullptr, lbd);
+        CompactTask *task = task_mgr_.GetCompactTask(req->TableId());
+        auto lbd = [task]() -> KvError { return task->CompactDataFile(); };
+        StartTask(task, req, lbd);
+        break;
+    }
+    case RequestType::CleanExpired:
+    {
+        BatchWriteTask *task = task_mgr_.GetBatchWriteTask(req->TableId());
+        auto lbd = [task]() -> KvError { return task->CleanExpiredKeys(); };
+        StartTask(task, req, lbd);
+        break;
+    }
+    }
 }
 
 void Shard::ResumeScheduled()
@@ -265,33 +292,17 @@ void Shard::OnWriteFinished(const TableIdent &tbl_id)
 {
     auto it = pending_queues_.find(tbl_id);
     assert(it != pending_queues_.end());
-    PendingWriteQueue &pending = it->second;
-    if (pending.Empty())
+    PendingWriteQueue &pending_q = it->second;
+    if (pending_q.Empty())
     {
-        if (!pending.HasCompact())
-        {
-            // No more write requests, remove the lock queue.
-            pending_queues_.erase(it);
-            return;
-        }
-        pending.SetCompact(false);
-        StartCompact(tbl_id);
+        // No more write requests, remove the pending queue.
+        pending_queues_.erase(it);
         return;
     }
 
-    WriteRequest *req = pending.PopFront();
+    WriteRequest *req = pending_q.PopFront();
     // Continue execute the next pending write request.
     ProcessReq(req);
-}
-
-void Shard::PendingWriteQueue::SetCompact(bool val)
-{
-    compact_ = val;
-}
-
-bool Shard::PendingWriteQueue::HasCompact() const
-{
-    return compact_;
 }
 
 void Shard::PendingWriteQueue::PushBack(WriteRequest *req)

@@ -162,6 +162,11 @@ bool DataPageIter::IsOverflow() const
     return overflow_;
 }
 
+uint64_t DataPageIter::ExpireTs() const
+{
+    return expire_ts_;
+}
+
 uint64_t DataPageIter::Timestamp() const
 {
     return timestamp_;
@@ -276,13 +281,14 @@ std::pair<bool, uint16_t> DataPageIter::SearchRegion(std::string_view key) const
         size_t mid = left + step;
         uint16_t region_offset = RestartOffset(mid);
         uint32_t shared, non_shared, val_len;
-        bool overflow;
+        bool overflow, expire;
         const char *key_ptr = DecodeEntry(page_.data() + region_offset,
                                           page_.data() + restart_offset_,
                                           &shared,
                                           &non_shared,
                                           &val_len,
-                                          &overflow);
+                                          &overflow,
+                                          &expire);
         assert(key_ptr != nullptr && shared == 0);
 
         std::string_view pivot{key_ptr, non_shared};
@@ -333,7 +339,14 @@ bool DataPageIter::ParseNextKey()
 
     bool is_restart_pointer = curr_offset_ == RestartOffset(curr_restart_idx_);
     uint32_t shared = 0, non_shared = 0, value_len = 0;
-    pt = DecodeEntry(pt, limit, &shared, &non_shared, &value_len, &overflow_);
+    bool has_expire_ts;
+    pt = DecodeEntry(pt,
+                     limit,
+                     &shared,
+                     &non_shared,
+                     &value_len,
+                     &overflow_,
+                     &has_expire_ts);
 
     if (pt == nullptr || key_.size() < shared)
     {
@@ -347,6 +360,15 @@ bool DataPageIter::ParseNextKey()
         pt += non_shared;
         value_ = {pt, value_len};
         pt += value_len;
+
+        if (has_expire_ts)
+        {
+            pt = GetVarint64Ptr(pt, limit, &expire_ts_);
+        }
+        else
+        {
+            expire_ts_ = 0;
+        }
 
         // Parses the timestamp. The stored value is the real value if this is
         // the restarting point, or the numerical delta to the previous
@@ -379,6 +401,7 @@ void DataPageIter::Invalidate()
     curr_restart_idx_ = restart_num_;
     key_.clear();
     value_ = std::string_view{};
+    expire_ts_ = 0;
     timestamp_ = 0;
 }
 
@@ -387,7 +410,8 @@ const char *DataPageIter::DecodeEntry(const char *p,
                                       uint32_t *shared,
                                       uint32_t *non_shared,
                                       uint32_t *value_length,
-                                      bool *overflow)
+                                      bool *overflow,
+                                      bool *expire)
 {
     if (limit - p < 3)
         return nullptr;
@@ -410,6 +434,7 @@ const char *DataPageIter::DecodeEntry(const char *p,
     }
 
     *overflow = *value_length & (1 << uint8_t(ValLenBit::Overflow));
+    *expire = *value_length & (1 << uint8_t(ValLenBit::Expire));
     *value_length >>= uint8_t(ValLenBit::BitsCount);
 
     if (static_cast<uint32_t>(limit - p) < (*non_shared + *value_length))

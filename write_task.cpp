@@ -1,10 +1,8 @@
 #include "write_task.h"
 
-#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
-#include <string>
 #include <string_view>
 #include <utility>
 
@@ -21,17 +19,6 @@
 
 namespace kvstore
 {
-WriteTask::WriteTask()
-    : idx_page_builder_(Options()), data_page_builder_(Options())
-{
-    overflow_ptrs_.reserve(Options()->overflow_pointers * 4);
-
-    if (Options()->data_append_mode)
-    {
-        batch_pages_.reserve(Options()->max_write_batch_pages);
-    }
-}
-
 const TableIdent &WriteTask::TableId() const
 {
     return tbl_ident_;
@@ -40,7 +27,6 @@ const TableIdent &WriteTask::TableId() const
 void WriteTask::Reset(const TableIdent &tbl_id)
 {
     tbl_ident_ = tbl_id;
-    stack_.clear();
     write_err_ = KvError::NoError;
     wal_builder_.Reset();
 }
@@ -52,17 +38,6 @@ void WriteTask::Abort()
         IoMgr()->AbortWrite(tbl_ident_);
     }
 
-    // Unpins all index pages in the stack.
-    while (!stack_.empty())
-    {
-        IndexStackEntry *stack_entry = stack_.back().get();
-        if (stack_entry->idx_page_)
-        {
-            stack_entry->idx_page_->Unpin();
-        }
-        stack_.pop_back();
-    }
-
     if (cow_meta_.old_mapping_ != nullptr)
     {
         // Cancel all free file page operations.
@@ -72,113 +47,9 @@ void WriteTask::Abort()
     cow_meta_.mapper_ = nullptr;
     if (cow_meta_.manifest_size_ == 0)
     {
-        assert(cow_meta_.root_ == nullptr);
         // MakeCowRoot will create a empty RootMeta if partition not found
         shard->IndexManager()->EvictRootIfEmpty(tbl_ident_);
     }
-}
-
-KvError WriteTask::DeleteTree(PageId page_id)
-{
-    auto [idx_page, err] = shard->IndexManager()->FindPage(
-        cow_meta_.mapper_->GetMapping(), page_id);
-    CHECK_KV_ERR(err);
-    idx_page->Pin();
-    IndexPageIter iter(idx_page, Options());
-
-    if (idx_page->IsPointingToLeaf())
-    {
-        while (iter.Next())
-        {
-            err = DeleteDataPage(iter.GetPageId());
-            if (err != KvError::NoError)
-            {
-                idx_page->Unpin();
-                return err;
-            }
-        }
-        idx_page->Unpin();
-        FreePage(page_id);
-        return KvError::NoError;
-    }
-
-    while (iter.Next())
-    {
-        KvError err = DeleteTree(iter.GetPageId());
-        if (err != KvError::NoError)
-        {
-            idx_page->Unpin();
-            return err;
-        }
-    }
-    idx_page->Unpin();
-    FreePage(page_id);
-    return KvError::NoError;
-}
-
-KvError WriteTask::DeleteDataPage(PageId page_id)
-{
-    auto [page, err] = LoadDataPage(page_id);
-    CHECK_KV_ERR(err);
-    DataPageIter iter(&page, Options());
-    while (iter.Next())
-    {
-        if (iter.IsOverflow())
-        {
-            err = DelOverflowValue(iter.Value());
-            CHECK_KV_ERR(err);
-        }
-    }
-    FreePage(page_id);
-    return KvError::NoError;
-}
-
-std::string_view WriteTask::LeftBound(bool is_data_page)
-{
-    size_t level = is_data_page ? 0 : 1;
-    auto stack_it = stack_.crbegin() + level;
-    while (stack_it != stack_.crend())
-    {
-        IndexPageIter &idx_iter = (*stack_it)->idx_page_iter_;
-        std::string_view idx_key = idx_iter.Key();
-        if (!idx_key.empty())
-        {
-            return idx_key;
-        }
-        ++stack_it;
-    }
-
-    // An empty string for left bound means negative infinity.
-    return std::string_view{};
-}
-
-std::string WriteTask::RightBound(bool is_data_page)
-{
-    size_t level = is_data_page ? 0 : 1;
-    auto stack_it = stack_.crbegin() + level;
-    while (stack_it != stack_.crend())
-    {
-        IndexPageIter &idx_iter = (*stack_it)->idx_page_iter_;
-        std::string next_key = idx_iter.PeekNextKey();
-        if (!next_key.empty())
-        {
-            return next_key;
-        }
-        ++stack_it;
-    }
-
-    // An empty string for right bound means positive infinity.
-    return std::string{};
-}
-
-void WriteTask::AdvanceDataPageIter(DataPageIter &iter, bool &is_valid)
-{
-    is_valid = iter.HasNext() ? iter.Next() : false;
-}
-
-void WriteTask::AdvanceIndexPageIter(IndexPageIter &iter, bool &is_valid)
-{
-    is_valid = iter.HasNext() ? iter.Next() : false;
 }
 
 KvError WriteTask::WritePage(DataPage &&page)
@@ -293,39 +164,6 @@ KvError WriteTask::WaitWrite()
     return err;
 }
 
-std::pair<PageId, KvError> WriteTask::Seek(std::string_view key)
-{
-    if (stack_.back()->idx_page_ == nullptr)
-    {
-        stack_.back()->is_leaf_index_ = true;
-        return {MaxPageId, KvError::NoError};
-    }
-
-    while (true)
-    {
-        IndexStackEntry *idx_entry = stack_.back().get();
-        IndexPageIter &idx_iter = idx_entry->idx_page_iter_;
-        idx_iter.Seek(key);
-        PageId page_id = idx_iter.GetPageId();
-        assert(page_id != MaxPageId);
-        if (idx_entry->idx_page_->IsPointingToLeaf())
-        {
-            break;
-        }
-        assert(!stack_.back()->is_leaf_index_);
-        auto [node, err] = shard->IndexManager()->FindPage(
-            cow_meta_.mapper_->GetMapping(), page_id);
-        if (err != KvError::NoError)
-        {
-            return {MaxPageId, err};
-        }
-        node->Pin();
-        stack_.emplace_back(std::make_unique<IndexStackEntry>(node, Options()));
-    }
-    stack_.back()->is_leaf_index_ = true;
-    return {stack_.back()->idx_page_iter_.GetPageId(), KvError::NoError};
-}
-
 std::pair<PageId, FilePageId> WriteTask::AllocatePage(PageId page_id)
 {
     if (!Options()->data_append_mode && page_id != MaxPageId)
@@ -368,7 +206,7 @@ FilePageId WriteTask::ToFilePage(PageId page_id)
     return cow_meta_.mapper_->GetMapping()->ToFilePage(page_id);
 }
 
-KvError WriteTask::FlushManifest(PageId root_page_id)
+KvError WriteTask::FlushManifest()
 {
     if (wal_builder_.Empty())
     {
@@ -382,7 +220,8 @@ KvError WriteTask::FlushManifest(PageId root_page_id)
     if (manifest_size > 0 &&
         manifest_size + wal_builder_.CurrentSize() <= opts->manifest_limit)
     {
-        std::string_view blob = wal_builder_.Finalize(root_page_id);
+        std::string_view blob =
+            wal_builder_.Finalize(cow_meta_.root_id_, cow_meta_.ttl_root_id_);
         err = IoMgr()->AppendManifest(tbl_ident_, blob, manifest_size);
         CHECK_KV_ERR(err);
         cow_meta_.manifest_size_ += blob.size();
@@ -392,7 +231,8 @@ KvError WriteTask::FlushManifest(PageId root_page_id)
         MappingSnapshot *mapping = cow_meta_.mapper_->GetMapping();
         FilePageId max_fp_id =
             cow_meta_.mapper_->FilePgAllocator()->MaxFilePageId();
-        snapshot = wal_builder_.Snapshot(root_page_id, mapping, max_fp_id);
+        snapshot = wal_builder_.Snapshot(
+            cow_meta_.root_id_, cow_meta_.ttl_root_id_, mapping, max_fp_id);
         err = IoMgr()->SwitchManifest(tbl_ident_, snapshot);
         CHECK_KV_ERR(err);
         cow_meta_.manifest_size_ = snapshot.size();
@@ -400,7 +240,7 @@ KvError WriteTask::FlushManifest(PageId root_page_id)
     return KvError::NoError;
 }
 
-KvError WriteTask::UpdateMeta(MemIndexPage *root)
+KvError WriteTask::UpdateMeta()
 {
     KvError err;
     const KvOptions *opts = Options();
@@ -419,197 +259,95 @@ KvError WriteTask::UpdateMeta(MemIndexPage *root)
         CHECK_KV_ERR(err);
     }
 
-    PageId root_pg_id = MaxPageId;
-    if (root != nullptr)
-    {
-        // Prevent the root page from being evicted before update RootMeta.
-        root->Pin();
-        root_pg_id = root->GetPageId();
-    }
-
     err = IoMgr()->SyncData(tbl_ident_);
-    if (err != KvError::NoError)
-    {
-        if (root != nullptr)
-        {
-            root->Unpin();
-        }
-        return err;
-    }
+    CHECK_KV_ERR(err);
 
     // Update meta data in storage and then in memory.
-    err = FlushManifest(root_pg_id);
-    if (err != KvError::NoError)
-    {
-        if (root != nullptr)
-        {
-            root->Unpin();
-        }
-        return err;
-    }
+    err = FlushManifest();
+    CHECK_KV_ERR(err);
 
-    if (opts->data_append_mode)
-    {
-        CompactIfNeeded(cow_meta_.mapper_.get());
-    }
+    // Hooks after modified partition.
+    CompactIfNeeded(cow_meta_.mapper_.get());
 
-    cow_meta_.root_ = root;
     shard->IndexManager()->UpdateRoot(tbl_ident_, std::move(cow_meta_));
-    if (root != nullptr)
-    {
-        root->Unpin();
-    }
     return KvError::NoError;
 }
 
 void WriteTask::CompactIfNeeded(PageMapper *mapper) const
 {
     const KvOptions *opts = Options();
-    if (opts->file_amplify_factor != 0 && Type() != TaskType::Compact)
+    if (!opts->data_append_mode || opts->file_amplify_factor == 0 ||
+        Type() != TaskType::BatchWrite || shard->HasPendingCompact(tbl_ident_))
     {
-        auto allocator =
-            static_cast<AppendAllocator *>(mapper->FilePgAllocator());
-        uint32_t mapping_cnt = mapper->MappingCount();
-        if (mapping_cnt == 0)
+        return;
+    }
+
+    auto allocator = static_cast<AppendAllocator *>(mapper->FilePgAllocator());
+    uint32_t mapping_cnt = mapper->MappingCount();
+    if (mapping_cnt == 0)
+    {
+        // Update statistic.
+        allocator->UpdateStat(MaxFileId, 0);
+    }
+    else
+    {
+        size_t space_size = allocator->SpaceSize();
+        assert(space_size >= mapping_cnt);
+        if (space_size >= allocator->PagesPerFile() &&
+            double(space_size) / double(mapping_cnt) >
+                double(opts->file_amplify_factor))
         {
-            // Update statistic.
-            allocator->UpdateStat(MaxFileId, 0);
-        }
-        else
-        {
-            size_t space_size = allocator->SpaceSize();
-            assert(space_size >= mapping_cnt);
-            if (space_size >= allocator->PagesPerFile() &&
-                double(space_size) / double(mapping_cnt) >
-                    double(opts->file_amplify_factor))
-            {
-                shard->AddCompactRequest(tbl_ident_);
-            }
+            shard->AddPendingCompact(tbl_ident_);
         }
     }
 }
 
-KvError WriteTask::TriggerFileGC() const
+void WriteTask::TriggerTTL()
+{
+    if (shard->HasPendingTTL(tbl_ident_))
+    {
+        return;
+    }
+
+    auto [meta, err] = shard->IndexManager()->FindRoot(tbl_ident_);
+    if (err != KvError::NoError)
+    {
+        LOG(WARNING) << "failed trigger TTL task: " << ErrorString(err);
+        return;
+    }
+    if (meta->next_expire_ts_ == 0)
+    {
+        return;
+    }
+    const uint64_t now_ts = utils::UnixTs<chrono::milliseconds>();
+    if (meta->next_expire_ts_ <= now_ts)
+    {
+        shard->AddPendingTTL(tbl_ident_);
+    }
+}
+
+void WriteTask::TriggerFileGC(const PageMapper *mapper) const
 {
     if (eloqstore->file_gc_ == nullptr)
     {
         // File garbage collector is not enabled.
-        return KvError::NoError;
     }
 
-    auto [meta, err] = shard->IndexManager()->FindRoot(tbl_ident_);
-    CHECK_KV_ERR(err);
-
-    const PageMapper *mapper = meta->mapper_.get();
     auto mapping = mapper->GetMappingSnapshot();
     uint64_t ts = utils::UnixTs<chrono::microseconds>();
     FileId cur_file_id = mapper->FilePgAllocator()->CurrentFileId();
     eloqstore->file_gc_->AddTask(std::move(mapping), ts, cur_file_id);
-    return KvError::NoError;
-}
-
-KvError WriteTask::WriteOverflowValue(std::string_view value)
-{
-    const KvOptions *opts = Options();
-    const uint16_t page_cap = OverflowPage::Capacity(opts, false);
-    const uint16_t end_page_cap = OverflowPage::Capacity(opts, true);
-    overflow_ptrs_.clear();
-    uint32_t end_page_id = MaxPageId;
-    std::string_view page_val;
-    KvError err;
-    std::array<uint32_t, max_overflow_pointers> buf;
-    std::span<uint32_t> pointers;
-
-    while (!value.empty())
-    {
-        // Calculates how many page ids are needed for the next group.
-        // Round upward and up to KvOptions::overflow_pointers.
-        size_t next_group_size = (value.size() + page_cap - 1) / page_cap;
-        next_group_size =
-            std::min(next_group_size, size_t(opts->overflow_pointers));
-        // Allocate pointers to the next group.
-        for (uint8_t i = 0; i < next_group_size; i++)
-        {
-            buf[i] = cow_meta_.mapper_->GetPage();
-        }
-        pointers = {buf.data(), next_group_size};
-        if (end_page_id == MaxPageId)
-        {
-            // Store head pointers of this link list in overflow_ptrs_.
-            for (uint32_t pg_id : pointers)
-            {
-                PutFixed32(&overflow_ptrs_, pg_id);
-            }
-        }
-        else
-        {
-            // Write end page of the previous group that contains pointers to
-            // the next group.
-            err =
-                WritePage(OverflowPage(end_page_id, opts, page_val, pointers));
-            CHECK_KV_ERR(err);
-        }
-
-        // Write the next overflow pages group.
-        uint8_t i = 0;
-        for (uint32_t pg_id : pointers)
-        {
-            i++;
-            if (i == opts->overflow_pointers && value.size() > page_cap)
-            {
-                // The end page of this group can't hold the remaining value.
-                // So we need at least one more group.
-                end_page_id = pg_id;
-                // The end page of a group has a smaller capacity.
-                uint16_t page_val_size =
-                    std::min(size_t(end_page_cap), value.size());
-                page_val = value.substr(0, page_val_size);
-                value = value.substr(page_val_size);
-                break;
-            }
-            uint16_t page_val_size = std::min(size_t(page_cap), value.size());
-            page_val = value.substr(0, page_val_size);
-            value = value.substr(page_val_size);
-            err = WritePage(OverflowPage(pg_id, opts, page_val));
-            CHECK_KV_ERR(err);
-        }
-        assert(i == pointers.size());
-    }
-    return KvError::NoError;
-}
-
-KvError WriteTask::DelOverflowValue(std::string_view encoded_ptrs)
-{
-    std::array<PageId, max_overflow_pointers> pointers;
-    uint8_t n_ptrs = DecodeOverflowPointers(encoded_ptrs, pointers);
-    for (uint8_t i = 0; i < n_ptrs;)
-    {
-        PageId page_id = pointers[i];
-        if (i == (Options()->overflow_pointers - 1))
-        {
-            auto [page, err] = LoadOverflowPage(page_id);
-            CHECK_KV_ERR(err);
-            encoded_ptrs = page.GetEncodedPointers(Options());
-            n_ptrs = DecodeOverflowPointers(encoded_ptrs, pointers);
-            i = 0;
-        }
-        else
-        {
-            i++;
-        }
-        FreePage(page_id);
-    }
-    return KvError::NoError;
 }
 
 std::pair<DataPage, KvError> WriteTask::LoadDataPage(PageId page_id)
 {
-    return KvTask::LoadDataPage(tbl_ident_, page_id, ToFilePage(page_id));
+    return ::kvstore::LoadDataPage(tbl_ident_, page_id, ToFilePage(page_id));
 }
 
 std::pair<OverflowPage, KvError> WriteTask::LoadOverflowPage(PageId page_id)
 {
-    return KvTask::LoadOverflowPage(tbl_ident_, page_id, ToFilePage(page_id));
+    return ::kvstore::LoadOverflowPage(
+        tbl_ident_, page_id, ToFilePage(page_id));
 }
 
 }  // namespace kvstore

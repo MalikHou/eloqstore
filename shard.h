@@ -2,7 +2,6 @@
 
 #include <boost/context/pooled_fixedsize_stack.hpp>
 
-#include "absl/container/flat_hash_map.h"
 #include "eloq_store.h"
 #include "task_manager.h"
 
@@ -20,7 +19,11 @@ public:
     void Start();
     void Stop();
     bool AddKvRequest(KvRequest *req);
-    void AddCompactRequest(const TableIdent &tbl_id);
+
+    void AddPendingCompact(const TableIdent &tbl_id);
+    bool HasPendingCompact(const TableIdent &tbl_id);
+    void AddPendingTTL(const TableIdent &tbl_id);
+    bool HasPendingTTL(const TableIdent &tbl_id);
 
     const KvOptions *Options() const;
     AsyncIoManager *IoManager();
@@ -41,7 +44,6 @@ private:
 
     void OnReceivedReq(KvRequest *req);
     void ProcessReq(KvRequest *req);
-    void StartCompact(const TableIdent &tbl_id);
     void OnWriteFinished(const TableIdent &tbl_id);
 
     template <typename F>
@@ -57,6 +59,10 @@ private:
                                                  shard->main_ = std::move(sink);
                                                  KvError err = lbd();
                                                  KvTask *task = ThdTask();
+                                                 if (err != KvError::NoError)
+                                                 {
+                                                     task->Abort();
+                                                 }
                                                  if (task->req_ != nullptr)
                                                  {
                                                      task->req_->SetDone(err);
@@ -80,18 +86,18 @@ private:
     class PendingWriteQueue
     {
     public:
-        void SetCompact(bool val);
-        bool HasCompact() const;
-
         void PushBack(WriteRequest *req);
         WriteRequest *PopFront();
         bool Empty() const;
 
+        // Requests from internal
+        CompactRequest compact_req_;
+        CleanExpiredRequest expire_req_;
+
     private:
-        bool compact_{false};
         WriteRequest *head_{nullptr};
         WriteRequest *tail_{nullptr};
     };
-    absl::flat_hash_map<TableIdent, PendingWriteQueue> pending_queues_;
+    std::unordered_map<TableIdent, PendingWriteQueue> pending_queues_;
 };
 }  // namespace kvstore

@@ -42,19 +42,50 @@ enum struct TaskType
     Read = 0,
     Scan,
     BatchWrite,
-    Truncate,
     Compact,
     Archive,
     EvictFile
 };
 
-using boost::context::continuation;
+std::pair<Page, KvError> LoadPage(const TableIdent &tbl_id,
+                                  FilePageId file_page_id);
+std::pair<DataPage, KvError> LoadDataPage(const TableIdent &tbl_id,
+                                          PageId page_id,
+                                          FilePageId file_page_id);
+std::pair<OverflowPage, KvError> LoadOverflowPage(const TableIdent &tbl_id,
+                                                  PageId page_id,
+                                                  FilePageId file_page_id);
 
+/**
+ * @brief Get overflow value.
+ * @param tbl_id The table partition identifier.
+ * @param mapping The mapping snapshot of this table partition.
+ * @param encoded_ptrs The encoded overflow pointers.
+ */
+std::pair<std::string, KvError> GetOverflowValue(const TableIdent &tbl_id,
+                                                 const MappingSnapshot *mapping,
+                                                 std::string_view encoded_ptrs);
+/**
+ * @brief Decode overflow pointers.
+ * @param encoded The encoded overflow pointers.
+ * @param pointers The buffer to store the decoded overflow pointers.
+ * @return The number of decoded overflow pointers.
+ */
+uint8_t DecodeOverflowPointers(
+    std::string_view encoded,
+    std::span<PageId, max_overflow_pointers> pointers);
+uint8_t DecodeOverflowPointers(
+    std::string_view encoded,
+    std::span<FilePageId, max_overflow_pointers> pointers,
+    const MappingSnapshot *mapping);
+
+using boost::context::continuation;
 class KvTask
 {
 public:
     virtual ~KvTask() = default;
     virtual TaskType Type() const = 0;
+    virtual void Abort() {};
     void Yield();
     /**
      * @brief Re-schedules the task to run. Note: the resumed task does not run
@@ -67,52 +98,20 @@ public:
     void WaitIo();
     void FinishIo();
 
-    std::pair<Page, KvError> LoadPage(const TableIdent &tbl_id,
-                                      FilePageId file_page_id);
-    std::pair<DataPage, KvError> LoadDataPage(const TableIdent &tbl_id,
-                                              PageId page_id,
-                                              FilePageId file_page_id);
-    std::pair<OverflowPage, KvError> LoadOverflowPage(const TableIdent &tbl_id,
-                                                      PageId page_id,
-                                                      FilePageId file_page_id);
-
-    /**
-     * @brief Get overflow value.
-     * @param tbl_id The table partition identifier.
-     * @param mapping The mapping snapshot of this table partition.
-     * @param encoded_ptrs The encoded overflow pointers.
-     */
-    std::pair<std::string, KvError> GetOverflowValue(
-        const TableIdent &tbl_id,
-        const MappingSnapshot *mapping,
-        std::string_view encoded_ptrs);
-    /**
-     * @brief Decode overflow pointers.
-     * @param encoded The encoded overflow pointers.
-     * @param pointers The buffer to store the decoded overflow pointers.
-     * @return The number of decoded overflow pointers.
-     */
-    static uint8_t DecodeOverflowPointers(
-        std::string_view encoded,
-        std::span<PageId, max_overflow_pointers> pointers);
-    static uint8_t DecodeOverflowPointers(
-        std::string_view encoded,
-        std::span<FilePageId, max_overflow_pointers> pointers,
-        const MappingSnapshot *mapping);
-
     uint32_t inflight_io_{0};
     int io_res_{0};
     uint32_t io_flags_{0};
 
     TaskStatus status_{TaskStatus::Idle};
     KvRequest *req_{nullptr};
-    boost::context::continuation coro_;
+    continuation coro_;
     KvTask *next_{nullptr};
 };
 
 class WaitingZone
 {
 public:
+    WaitingZone() = default;
     void Wait(KvTask *task);
     void WakeOne();
     void WakeN(size_t n);

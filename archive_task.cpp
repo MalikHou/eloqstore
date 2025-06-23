@@ -11,15 +11,17 @@ KvError ArchiveTask::CreateArchive()
     assert(Options()->num_retained_archives > 0);
     auto [meta, err] = shard->IndexManager()->FindRoot(tbl_ident_);
     CHECK_KV_ERR(err);
-    if (meta->root_page_ == nullptr)
+    PageId root = meta->root_id_;
+    if (root == MaxPageId)
     {
         return KvError::NotFound;
     }
 
-    PageId root = meta->root_page_->GetPageId();
+    PageId ttl_root = meta->ttl_root_id_;
     MappingSnapshot *mapping = meta->mapper_->GetMapping();
     FilePageId max_fp_id = meta->mapper_->FilePgAllocator()->MaxFilePageId();
-    std::string_view snapshot = wal_builder_.Snapshot(root, mapping, max_fp_id);
+    std::string_view snapshot =
+        wal_builder_.Snapshot(root, ttl_root, mapping, max_fp_id);
 
     uint64_t current_ts = utils::UnixTs<chrono::microseconds>();
     err = IoMgr()->CreateArchive(tbl_ident_, snapshot, current_ts);

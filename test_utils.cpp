@@ -34,17 +34,6 @@ std::string Value(uint64_t val, uint32_t len)
     return s;
 }
 
-void CheckKvEntry(const kvstore::KvEntry &left, const kvstore::KvEntry &right)
-{
-    CHECK(std::get<0>(left) == std::get<0>(right));
-    {
-        std::string_view lval(std::get<1>(left));
-        std::string_view rval(std::get<1>(right));
-        CHECK(lval == rval);
-    }
-    CHECK(std::get<2>(left) == std::get<2>(right));
-}
-
 void EncodeKey(char *dst, uint32_t key)
 {
     kvstore::EncodeFixed32(dst, kvstore::ToBigEndian(key));
@@ -80,7 +69,7 @@ uint32_t DecodeValue(const std::string &val)
 std::string FormatEntries(const std::vector<kvstore::KvEntry> &entries)
 {
     std::string kvs_str;
-    for (auto &[k, v, _] : entries)
+    for (auto &[k, v, ts, exp] : entries)
     {
         uint32_t key = DecodeKey(k);
         uint32_t val = DecodeValue(v);
@@ -142,12 +131,15 @@ void MapVerifier::Upsert(uint64_t begin, uint64_t end)
 {
     LOG(INFO) << "Upsert(" << begin << ',' << end << ')';
 
+    const uint64_t now_ts = utils::UnixTs<chrono::milliseconds>();
+    const kvstore::WriteOp upsert = kvstore::WriteOp::Upsert;
     std::vector<kvstore::WriteDataEntry> entries;
     for (size_t idx = begin; idx < end; ++idx)
     {
         std::string key = Key(idx, key_len_);
         std::string val = Value(ts_ + idx, val_size_);
-        entries.emplace_back(key, val, ts_, kvstore::WriteOp::Upsert);
+        uint64_t expire_ts = max_ttl_ == 0 ? 0 : now_ts + max_ttl_;
+        entries.emplace_back(key, val, ts_, upsert, expire_ts);
     }
     kvstore::BatchWriteRequest req;
     req.SetArgs(tid_, std::move(entries));
@@ -175,14 +167,6 @@ void MapVerifier::Truncate(uint64_t position)
 
     kvstore::TruncateRequest req;
     std::string key = Key(position, key_len_);
-    if (answer_.empty())
-    {
-        req.SetArgs(tid_, key);
-        eloq_store_->ExecSync(&req);
-        CHECK(req.Error() == kvstore::KvError::NotFound);
-        return;
-    }
-
     req.SetArgs(tid_, key);
     ExecWrite(&req);
 }
@@ -198,6 +182,7 @@ void MapVerifier::WriteRnd(uint64_t begin,
     LOG(INFO) << "WriteRnd(" << begin << ',' << end << ',' << int(del) << ','
               << int(density) << ')';
 
+    const uint64_t now_ts = utils::UnixTs<chrono::milliseconds>();
     std::vector<kvstore::WriteDataEntry> entries;
     for (size_t idx = begin; idx < end; ++idx)
     {
@@ -217,8 +202,16 @@ void MapVerifier::WriteRnd(uint64_t begin,
         {
             uint32_t len = (rand() % val_size_) + 1;
             std::string val = Value(ts + idx, len);
-            entries.emplace_back(
-                std::move(key), std::move(val), ts, kvstore::WriteOp::Upsert);
+            uint64_t expire_ts = 0;
+            if (max_ttl_ > 0 && (rand() & 1))
+            {
+                expire_ts = now_ts + rand() % max_ttl_;
+            }
+            entries.emplace_back(std::move(key),
+                                 std::move(val),
+                                 ts,
+                                 kvstore::WriteOp::Upsert,
+                                 expire_ts);
         }
     }
     kvstore::BatchWriteRequest req;
@@ -242,20 +235,27 @@ void MapVerifier::Read(uint64_t key)
 
 void MapVerifier::Read(std::string_view key)
 {
-    LOG(INFO) << "Read(" << key << ')';
+    DLOG(INFO) << "Read(" << key << ')';
 
     kvstore::ReadRequest req;
     req.SetArgs(tid_, key);
     eloq_store_->ExecSync(&req);
+    std::string str_key(key);
     if (req.Error() == kvstore::KvError::NoError)
     {
-        kvstore::KvEntry ret(key, req.value_, req.ts_);
-        CheckKvEntry(answer_.at(std::string(key)), ret);
+        kvstore::KvEntry ret(str_key, req.value_, req.ts_, req.expire_ts_);
+        CHECK(answer_.at(str_key) == ret);
     }
     else
     {
         CHECK(req.Error() == kvstore::KvError::NotFound);
-        CHECK(answer_.find(std::string(key)) == answer_.end());
+        auto it = answer_.find(str_key);
+        if (it != answer_.end())
+        {
+            const uint64_t now_ts = utils::UnixTs<chrono::milliseconds>();
+            CHECK(it->second.expire_ts_ < now_ts);
+            answer_.erase(it);
+        }
     }
 }
 
@@ -270,9 +270,17 @@ void MapVerifier::Floor(std::string_view key)
     if (it_lb != answer_.begin())
     {
         it_lb--;
+        if (req.Error() == kvstore::KvError::NotFound)
+        {
+            const uint64_t now_ts = utils::UnixTs<chrono::milliseconds>();
+            CHECK(it_lb->second.expire_ts_ < now_ts);
+            answer_.erase(it_lb);
+            return;
+        }
         CHECK(req.Error() == kvstore::KvError::NoError);
-        kvstore::KvEntry ret(req.floor_key_, req.value_, req.ts_);
-        CheckKvEntry(it_lb->second, ret);
+        kvstore::KvEntry ret(
+            req.floor_key_, req.value_, req.ts_, req.expire_ts_);
+        CHECK(it_lb->second == ret);
     }
     else
     {
@@ -293,12 +301,26 @@ void MapVerifier::Scan(std::string_view begin,
                        size_t page_entries,
                        size_t page_size)
 {
-    LOG(INFO) << "Scan(" << begin << ',' << end << ')';
+    DLOG(INFO) << "Scan(" << begin << ',' << end << ')';
 
     kvstore::ScanRequest req;
     req.SetPagination(page_entries, page_size);
+
     std::string begin_key(begin);
-    std::string end_key(end);
+    const std::string end_key(end);
+
+    auto it = answer_.lower_bound(begin_key);
+    const auto it_end = answer_.lower_bound(end_key);
+
+    auto clean_expired = [&](std::string_view next_key)
+    {
+        const uint64_t now_ts = utils::UnixTs<chrono::milliseconds>();
+        while (it != it_end && it->first < next_key)
+        {
+            CHECK(it->second.expire_ts_ <= now_ts);
+            answer_.erase(it++);
+        }
+    };
 
     req.SetArgs(tid_, begin_key, end_key);
     while (true)
@@ -314,53 +336,28 @@ void MapVerifier::Scan(std::string_view begin,
         // Verify scan result
         CHECK(req.entries_.size() <= req.page_entries_);
         CHECK(req.ResultSize() <= req.page_size_ || req.entries_.size() == 1);
-        auto it = answer_.lower_bound(begin_key);
-        if (!req.begin_inclusive_)
+        for (auto &entry : req.entries_)
         {
-            assert(it->first == begin_key);
-            it++;
-        }
-        for (auto &t : req.entries_)
-        {
-            CheckKvEntry(t, it->second);
+            clean_expired(entry.key_);
+            CHECK(entry == it->second);
             it++;
         }
 
         if (!req.has_remaining_)
         {
-            if (it != answer_.end())
-            {
-                CHECK(it->first >= end_key);
-            }
             break;
         }
         // Continue scan the next page.
         CHECK(!req.entries_.empty());
-        begin_key = std::get<0>(req.entries_.back());
+        begin_key = req.entries_.back().key_;
         req.SetArgs(tid_, begin_key, end_key, false);
     }
+    clean_expired(end_key);
 }
 
 void MapVerifier::Validate()
 {
-    kvstore::ScanRequest req;
-    req.SetArgs(tid_, {}, {});
-    eloq_store_->ExecSync(&req);
-    if (req.Error() == kvstore::KvError::NotFound)
-    {
-        CHECK(answer_.empty());
-        CHECK(req.entries_.empty());
-        return;
-    }
-    CHECK(req.Error() == kvstore::KvError::NoError);
-    CHECK(answer_.size() == req.entries_.size());
-    auto it = answer_.begin();
-    for (auto &t : req.entries_)
-    {
-        CheckKvEntry(t, it->second);
-        it++;
-    }
-    CHECK(it == answer_.end());
+    Scan({}, Key(UINT64_MAX, 20), 1000);
 }
 
 void MapVerifier::ExecWrite(kvstore::KvRequest *req)
@@ -385,7 +382,7 @@ void MapVerifier::ExecWrite(kvstore::KvRequest *req)
             }
             else
             {
-                if (ent.timestamp_ <= std::get<2>(it->second))
+                if (ent.timestamp_ <= it->second.timestamp_)
                 {
                     continue;
                 }
@@ -394,8 +391,8 @@ void MapVerifier::ExecWrite(kvstore::KvRequest *req)
 
             if (ent.op_ == kvstore::WriteOp::Upsert)
             {
-                it->second =
-                    kvstore::KvEntry(ent.key_, ent.val_, ent.timestamp_);
+                it->second = kvstore::KvEntry(
+                    ent.key_, ent.val_, ent.timestamp_, ent.expire_ts_);
             }
             else if (ent.op_ == kvstore::WriteOp::Delete)
             {
@@ -447,6 +444,16 @@ void MapVerifier::SetStore(kvstore::EloqStore *store)
 void MapVerifier::SetTimestamp(uint64_t ts)
 {
     ts_ = ts;
+}
+
+void MapVerifier::SetMaxTTL(uint32_t max_ttl)
+{
+    max_ttl_ = max_ttl;
+}
+
+const std::map<std::string, kvstore::KvEntry> &MapVerifier::DataSet() const
+{
+    return answer_;
 }
 
 bool ConcurrencyTester::Partition::IsWriting() const
@@ -536,7 +543,7 @@ void ConcurrencyTester::VerifyRead(Reader *reader, uint32_t write_pause)
     uint64_t sum_val = 0;
     for (auto &ent : entries)
     {
-        uint32_t val = DecodeValue(std::get<1>(ent));
+        uint32_t val = DecodeValue(ent.value_);
         sum_val += val;
     }
     if (seg_sum_ != sum_val)
@@ -550,7 +557,7 @@ void ConcurrencyTester::VerifyRead(Reader *reader, uint32_t write_pause)
     if (!partition.IsWriting() && partition.ticks_ == reader->start_tick_)
     {
         uint32_t key_ans = key_begin;
-        for (auto &[k, v, _] : entries)
+        for (auto &[k, v, ts, exp] : entries)
         {
             while (partition.kvs_[key_ans] == 0)
             {
@@ -709,7 +716,7 @@ void ConcurrencyTester::Init()
         {
             partition.kvs_.resize(kvs_num, 0);
             CHECK(scan_req.entries_.size() <= partition.kvs_.size());
-            for (auto &[k, v, _] : scan_req.entries_)
+            for (auto &[k, v, ts, exp] : scan_req.entries_)
             {
                 uint32_t key_res = DecodeKey(k);
                 uint32_t val_res = DecodeValue(v);
@@ -893,7 +900,8 @@ void ManifestVerifier::Finish()
         }
         else
         {
-            std::string_view sv = builder_.Finalize(root_id_);
+            std::string_view sv =
+                builder_.Finalize(root_id_, kvstore::MaxPageId);
             file_.append(sv);
             builder_.Reset();
         }
@@ -903,8 +911,8 @@ void ManifestVerifier::Finish()
 void ManifestVerifier::Snapshot()
 {
     kvstore::FilePageId max_fp_id = answer_.FilePgAllocator()->MaxFilePageId();
-    std::string_view sv =
-        builder_.Snapshot(root_id_, answer_.GetMapping(), max_fp_id);
+    std::string_view sv = builder_.Snapshot(
+        root_id_, kvstore::MaxPageId, answer_.GetMapping(), max_fp_id);
     file_ = sv;
     builder_.Reset();
 }

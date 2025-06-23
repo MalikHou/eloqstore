@@ -14,22 +14,23 @@ class Replayer
 {
 public:
     Replayer(const KvOptions *opts);
-    KvError Replay(ManifestFile *log);
+    KvError Replay(ManifestFile *file);
     std::unique_ptr<PageMapper> GetMapper(IndexPageManager *idx_mgr,
                                           const TableIdent *tbl_ident);
 
     PageId root_;
-    uint64_t file_size_;
+    PageId ttl_root_;
     std::vector<uint64_t> mapping_tbl_;
     FilePageId max_fp_id_;
+    uint64_t file_size_;
 
 private:
-    KvError NextRecord(ManifestFile *log);
+    KvError ParseNextRecord(ManifestFile *file);
     void DeserializeSnapshot(std::string_view snapshot);
-    void ReplayLog(std::string_view log);
+    void ReplayLog();
 
     const KvOptions *opts_;
     std::string log_buf_;
-    std::string_view mapping_log_;
+    std::string_view payload_;
 };
 }  // namespace kvstore

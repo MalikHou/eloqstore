@@ -21,22 +21,23 @@ Replayer::Replayer(const KvOptions *opts) : opts_(opts)
     log_buf_.resize(ManifestBuilder::header_bytes);
 }
 
-KvError Replayer::Replay(ManifestFile *log)
+KvError Replayer::Replay(ManifestFile *file)
 {
     root_ = MaxPageId;
+    ttl_root_ = MaxPageId;
     mapping_tbl_.resize(0);
     mapping_tbl_.reserve(opts_->init_page_count);
     file_size_ = 0;
     max_fp_id_ = MaxFilePageId;
 
-    KvError err = NextRecord(log);
+    KvError err = ParseNextRecord(file);
     CHECK_KV_ERR(err);
-    assert(!mapping_log_.empty());
-    DeserializeSnapshot(mapping_log_);
+    assert(!payload_.empty());
+    DeserializeSnapshot(payload_);
 
     while (true)
     {
-        err = NextRecord(log);
+        err = ParseNextRecord(file);
         if (err != KvError::NoError)
         {
             if (err == KvError::EndOfFile)
@@ -45,37 +46,41 @@ KvError Replayer::Replay(ManifestFile *log)
             }
             return err;
         }
-        ReplayLog(mapping_log_);
+        ReplayLog();
     }
     return KvError::NoError;
 }
 
-KvError Replayer::NextRecord(ManifestFile *log)
+KvError Replayer::ParseNextRecord(ManifestFile *file)
 {
-    KvError err = log->Read(log_buf_.data(), ManifestBuilder::header_bytes);
+    // Read header
+    KvError err = file->Read(log_buf_.data(), ManifestBuilder::header_bytes);
     CHECK_KV_ERR(err);
 
-    PageId root = DecodeFixed32(log_buf_.data() + ManifestBuilder::offset_root);
-
+    // Read payload
     const uint32_t len =
         DecodeFixed32(log_buf_.data() + ManifestBuilder::offset_len);
     log_buf_.resize(ManifestBuilder::header_bytes + len);
-    err = log->Read(log_buf_.data() + ManifestBuilder::header_bytes, len);
+    err = file->Read(log_buf_.data() + ManifestBuilder::header_bytes, len);
     CHECK_KV_ERR(err);
-    mapping_log_ = {log_buf_.data() + ManifestBuilder::header_bytes,
-                    log_buf_.size() - ManifestBuilder::header_bytes};
 
-    uint64_t checksum_stored = DecodeFixed64(log_buf_.data());
-    uint64_t checksum =
-        XXH3_64bits(log_buf_.data() + ManifestBuilder::checksum_bytes,
-                    log_buf_.size() - ManifestBuilder::checksum_bytes);
+    std::string_view content = log_buf_;
+
+    // Verify checksum
+    uint64_t checksum_stored = DecodeFixed64(content.data());
+    content = content.substr(ManifestBuilder::checksum_bytes);
+    uint64_t checksum = XXH3_64bits(content.data(), content.size());
     if (checksum != checksum_stored)
     {
         return KvError::Corrupted;
     }
 
-    root_ = root;
-    file_size_ += (ManifestBuilder::header_bytes + len);
+    root_ = DecodeFixed32(content.data());
+    content = content.substr(sizeof(PageId));
+    ttl_root_ = DecodeFixed32(content.data());
+    content = content.substr(sizeof(PageId));
+    payload_ = content.substr(sizeof(uint32_t));  // Skip payload length
+    file_size_ += ManifestBuilder::header_bytes + len;
     return KvError::NoError;
 }
 
@@ -94,19 +99,19 @@ void Replayer::DeserializeSnapshot(std::string_view snapshot)
     }
 }
 
-void Replayer::ReplayLog(std::string_view log)
+void Replayer::ReplayLog()
 {
-    while (!log.empty())
+    while (!payload_.empty())
     {
         PageId page_id;
-        bool ok = GetVarint32(&log, &page_id);
+        bool ok = GetVarint32(&payload_, &page_id);
         assert(ok);
         while (page_id >= mapping_tbl_.size())
         {
             mapping_tbl_.emplace_back(MappingSnapshot::InvalidValue);
         }
         uint64_t value;
-        ok = GetVarint64(&log, &value);
+        ok = GetVarint64(&payload_, &value);
         assert(ok);
         mapping_tbl_[page_id] = value;
         if (MappingSnapshot::IsFilePageId(value))

@@ -30,14 +30,15 @@ void ManifestBuilder::DeleteMapping(PageId page_id)
     PutVarint64(&buff_, MappingSnapshot::InvalidValue);
 }
 
-std::string_view ManifestBuilder::Snapshot(uint32_t root_id,
+std::string_view ManifestBuilder::Snapshot(PageId root_id,
+                                           PageId ttl_root,
                                            const MappingSnapshot *mapping,
                                            FilePageId max_fp_id)
 {
     Reset();
     PutVarint64(&buff_, max_fp_id);
     mapping->Serialize(buff_);
-    return Finalize(root_id);
+    return Finalize(root_id, ttl_root);
 }
 
 void ManifestBuilder::Reset()
@@ -55,12 +56,13 @@ uint32_t ManifestBuilder::CurrentSize() const
     return buff_.size();
 }
 
-std::string_view ManifestBuilder::Finalize(uint32_t new_root)
+std::string_view ManifestBuilder::Finalize(PageId new_root, PageId ttl_root)
 {
+    EncodeFixed32(buff_.data() + offset_root, new_root);
+    EncodeFixed32(buff_.data() + offset_ttl_root, ttl_root);
+
     uint32_t len = buff_.size() - header_bytes;
     EncodeFixed32(buff_.data() + offset_len, len);
-
-    EncodeFixed32(buff_.data() + offset_root, new_root);
 
     uint64_t checksum = XXH3_64bits(buff_.data() + checksum_bytes,
                                     buff_.size() - checksum_bytes);
@@ -71,11 +73,6 @@ std::string_view ManifestBuilder::Finalize(uint32_t new_root)
 std::string_view ManifestBuilder::BuffView() const
 {
     return buff_;
-}
-
-bool RootMeta::IsPinned() const
-{
-    return ref_cnt_ > 0;
 }
 
 void RootMeta::Pin()

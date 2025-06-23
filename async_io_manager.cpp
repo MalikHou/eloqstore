@@ -408,7 +408,6 @@ KvError IouringMgr::SyncData(const TableIdent &tbl_id)
     auto it_tbl = tables_.find(tbl_id);
     if (it_tbl == tables_.end())
     {
-        LOG(WARNING) << "sync table partition not found " << tbl_id;
         return KvError::NoError;
     }
 

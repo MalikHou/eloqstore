@@ -1,9 +1,22 @@
 #include "batch_write_task.h"
 
 #include "shard.h"
+#include "utils.h"
+#include "write_tree_stack.h"
 
 namespace kvstore
 {
+BatchWriteTask::BatchWriteTask()
+    : idx_page_builder_(Options()), data_page_builder_(Options())
+{
+    overflow_ptrs_.reserve(Options()->overflow_pointers * 4);
+
+    if (Options()->data_append_mode)
+    {
+        batch_pages_.reserve(Options()->max_write_batch_pages);
+    }
+}
+
 KvError BatchWriteTask::SeekStack(std::string_view search_key)
 {
     const Comparator *cmp = shard->IndexManager()->GetComparator();
@@ -46,6 +59,39 @@ KvError BatchWriteTask::SeekStack(std::string_view search_key)
         }
     }
     return KvError::NoError;
+}
+
+std::pair<PageId, KvError> BatchWriteTask::Seek(std::string_view key)
+{
+    if (stack_.back()->idx_page_ == nullptr)
+    {
+        stack_.back()->is_leaf_index_ = true;
+        return {MaxPageId, KvError::NoError};
+    }
+
+    while (true)
+    {
+        IndexStackEntry *idx_entry = stack_.back().get();
+        IndexPageIter &idx_iter = idx_entry->idx_page_iter_;
+        idx_iter.Seek(key);
+        PageId page_id = idx_iter.GetPageId();
+        assert(page_id != MaxPageId);
+        if (idx_entry->idx_page_->IsPointingToLeaf())
+        {
+            break;
+        }
+        assert(!stack_.back()->is_leaf_index_);
+        auto [node, err] = shard->IndexManager()->FindPage(
+            cow_meta_.mapper_->GetMapping(), page_id);
+        if (err != KvError::NoError)
+        {
+            return {MaxPageId, err};
+        }
+        node->Pin();
+        stack_.emplace_back(std::make_unique<IndexStackEntry>(node, Options()));
+    }
+    stack_.back()->is_leaf_index_ = true;
+    return {stack_.back()->idx_page_iter_.GetPageId(), KvError::NoError};
 }
 
 inline DataPage *BatchWriteTask::TripleElement(uint8_t idx)
@@ -131,7 +177,7 @@ KvError BatchWriteTask::LeafLinkDelete()
     return KvError::NoError;
 }
 
-bool BatchWriteTask::SetBatch(std::vector<WriteDataEntry> &&entries)
+bool BatchWriteTask::SetBatch(std::span<WriteDataEntry> entries)
 {
 #ifndef NDEBUG
     const Comparator *cmp = Comp();
@@ -158,7 +204,7 @@ bool BatchWriteTask::SetBatch(std::vector<WriteDataEntry> &&entries)
     }
 #endif
 
-    batch_ = std::move(entries);
+    data_batch_ = entries;
     return true;
 }
 
@@ -166,30 +212,81 @@ void BatchWriteTask::Abort()
 {
     WriteTask::Abort();
 
+    // Unpins all index pages in the stack.
+    while (!stack_.empty())
+    {
+        IndexStackEntry *stack_entry = stack_.back().get();
+        if (stack_entry->idx_page_)
+        {
+            stack_entry->idx_page_->Unpin();
+        }
+        stack_.pop_back();
+    }
+
     for (DataPage &page : leaf_triple_)
     {
         page.Clear();
     }
-    batch_.clear();
+    ttl_batch_.clear();
 }
 
 KvError BatchWriteTask::Apply()
 {
     KvError err = shard->IndexManager()->MakeCowRoot(tbl_ident_, cow_meta_);
     CHECK_KV_ERR(err);
+    err = ApplyBatch(cow_meta_.root_id_, true);
+    CHECK_KV_ERR(err);
+    err = ApplyTTLBatch();
+    CHECK_KV_ERR(err);
+    err = UpdateMeta();
+    CHECK_KV_ERR(err);
+    TriggerTTL();
+    return KvError::NoError;
+}
 
-    stack_.emplace_back(
-        std::make_unique<IndexStackEntry>(cow_meta_.root_, Options()));
-    if (cow_meta_.root_ != nullptr)
+KvError BatchWriteTask::ApplyTTLBatch()
+{
+    if (!ttl_batch_.empty())
     {
-        cow_meta_.root_->Pin();
+        std::sort(ttl_batch_.begin(), ttl_batch_.end());
+        SetBatch(ttl_batch_);
+        KvError err = ApplyBatch(cow_meta_.ttl_root_id_, false);
+        ttl_batch_.clear();
+        return err;
+    }
+    else
+    {
+        return KvError::NoError;
+    }
+}
+
+KvError BatchWriteTask::ApplyBatch(PageId &root_id, bool update_ttl)
+{
+    do_update_ttl_ = update_ttl;
+    assert(!update_ttl || ttl_batch_.empty());
+
+    if (root_id != MaxPageId)
+    {
+        auto [root_page, err] = shard->IndexManager()->FindPage(
+            cow_meta_.old_mapping_.get(), root_id);
+        CHECK_KV_ERR(err);
+        stack_.emplace_back(
+            std::make_unique<IndexStackEntry>(root_page, Options()));
+        root_page->Pin();
+    }
+    else
+    {
+        stack_.emplace_back(
+            std::make_unique<IndexStackEntry>(nullptr, Options()));
     }
 
+    KvError err;
     size_t cidx = 0;
-    while (cidx < batch_.size())
+    const uint64_t now_ms = utils::UnixTs<chrono::milliseconds>();
+    while (cidx < data_batch_.size())
     {
-        std::string_view batch_start_key = {batch_[cidx].key_.data(),
-                                            batch_[cidx].key_.size()};
+        std::string_view batch_start_key = {data_batch_[cidx].key_.data(),
+                                            data_batch_[cidx].key_.size()};
         if (stack_.size() > 1)
         {
             err = SeekStack(batch_start_key);
@@ -202,7 +299,7 @@ KvError BatchWriteTask::Apply()
             err = LoadApplyingPage(page_id);
             CHECK_KV_ERR(err);
         }
-        err = ApplyOnePage(cidx);
+        err = ApplyOnePage(cidx, now_ms);
         CHECK_KV_ERR(err);
     }
     // Flush all dirty leaf data pages in leaf_triple_ .
@@ -211,7 +308,6 @@ KvError BatchWriteTask::Apply()
     CHECK_KV_ERR(err);
     err = ShiftLeafLink();
     CHECK_KV_ERR(err);
-    batch_.clear();
 
     assert(!stack_.empty());
     MemIndexPage *new_root = nullptr;
@@ -221,8 +317,8 @@ KvError BatchWriteTask::Apply()
         CHECK_KV_ERR(err);
         new_root = new_page;
     }
-    err = UpdateMeta(new_root);
-    return err;
+    root_id = new_root == nullptr ? MaxPageId : new_root->GetPageId();
+    return KvError::NoError;
 }
 
 KvError BatchWriteTask::LoadApplyingPage(PageId page_id)
@@ -263,10 +359,11 @@ KvError BatchWriteTask::LoadApplyingPage(PageId page_id)
     return KvError::NoError;
 }
 
-KvError BatchWriteTask::ApplyOnePage(size_t &cidx)
+KvError BatchWriteTask::ApplyOnePage(size_t &cidx, uint64_t now_ms)
 {
     assert(!stack_.empty());
 
+    KvError err;
     DataPage *base_page = nullptr;
     std::string_view page_left_bound{};
     std::string page_right_key;
@@ -289,17 +386,17 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx)
 
     data_page_builder_.Reset();
 
-    assert(cidx < batch_.size());
-    std::string_view change_key = {batch_[cidx].key_.data(),
-                                   batch_[cidx].key_.size()};
+    assert(cidx < data_batch_.size());
+    std::string_view change_key = {data_batch_[cidx].key_.data(),
+                                   data_batch_[cidx].key_.size()};
     assert(cmp->Compare(page_left_bound, change_key) <= 0);
     assert(page_right_bound.empty() ||
            cmp->Compare(page_left_bound, page_right_bound) < 0);
 
-    auto change_it = batch_.begin() + cidx;
+    auto change_it = data_batch_.begin() + cidx;
     auto change_end_it = std::lower_bound(
         change_it,
-        batch_.end(),
+        data_batch_.end(),
         page_right_bound,
         [&](const WriteDataEntry &change_item, std::string_view key)
         {
@@ -325,43 +422,59 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx)
         assert(page_key <= base_page_iter.Key());
     }
 
-    std::function<KvError(std::string_view, std::string_view, bool, uint64_t)>
-        add_to_page = [&](std::string_view key,
-                          std::string_view val,
-                          bool is_ptr,
-                          uint64_t ts) -> KvError
-    {
-        bool success = data_page_builder_.Add(key, val, ts, is_ptr);
-        if (!success)
+    auto add_to_page = utils::MakeYCombinator(
+        [&](auto &&self,
+            std::string_view key,
+            std::string_view val,
+            bool is_ptr,
+            uint64_t ts,
+            uint64_t expire_ts) -> KvError
         {
-            if (!is_ptr &&
-                DataPageBuilder::IsOverflowKV(key, val.size(), ts, Options()))
+            if (expire_ts != 0 && expire_ts <= now_ms)
             {
-                // The key-value pair is too large to fit in a single data page.
-                // Split it into multiple overflow pages.
-                KvError err = WriteOverflowValue(val);
-                CHECK_KV_ERR(err);
-                return add_to_page(key, overflow_ptrs_, true, ts);
+                // Skip expired key-value.
+                if (is_ptr)
+                {
+                    err = DelOverflowValue(val);
+                    CHECK_KV_ERR(err);
+                }
+                UpdateTTL(expire_ts, key, WriteOp::Delete);
+                return KvError::NoError;
             }
 
-            // Finishes the current page.
-            std::string_view page_view = data_page_builder_.Finish();
-            KvError err =
-                FinishDataPage(page_view, std::move(curr_page_key), page_id);
-            CHECK_KV_ERR(err);
-            // Starts a new page.
-            curr_page_key = cmp->FindShortestSeparator(
-                {prev_key.data(), prev_key.size()}, key);
-            assert(!prev_key.empty() && prev_key < curr_page_key);
-            data_page_builder_.Reset();
-            success = data_page_builder_.Add(key, val, ts, is_ptr);
-            assert(success);
-            page_id = MaxPageId;
-        }
-        assert(curr_page_key <= key);
-        prev_key = key;
-        return KvError::NoError;
-    };
+            bool success =
+                data_page_builder_.Add(key, val, is_ptr, ts, expire_ts);
+            if (!success)
+            {
+                if (!is_ptr && DataPageBuilder::IsOverflowKV(
+                                   key, val.size(), ts, expire_ts, Options()))
+                {
+                    // The key-value pair is too large to fit in a single
+                    // data page. Split it into multiple overflow pages.
+                    KvError err = WriteOverflowValue(val);
+                    CHECK_KV_ERR(err);
+                    return self(key, overflow_ptrs_, true, ts, expire_ts);
+                }
+
+                // Finishes the current page.
+                std::string_view page_view = data_page_builder_.Finish();
+                KvError err = FinishDataPage(
+                    page_view, std::move(curr_page_key), page_id);
+                CHECK_KV_ERR(err);
+                // Starts a new page.
+                curr_page_key = cmp->FindShortestSeparator(
+                    {prev_key.data(), prev_key.size()}, key);
+                assert(!prev_key.empty() && prev_key < curr_page_key);
+                data_page_builder_.Reset();
+                success =
+                    data_page_builder_.Add(key, val, is_ptr, ts, expire_ts);
+                assert(success);
+                page_id = MaxPageId;
+            }
+            assert(curr_page_key <= key);
+            prev_key = key;
+            return KvError::NoError;
+        });
 
     while (is_base_iter_valid && change_it != change_end_it)
     {
@@ -385,44 +498,67 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx)
         std::string_view new_key;
         std::string_view new_val;
         uint64_t new_ts;
+        uint64_t expire_ts;
         AdvanceType adv_type;
 
         int cmp_ret = cmp->Compare(base_key, change_key);
         if (cmp_ret < 0)
         {
+            // no change
             new_key = base_key;
             new_val = base_val;
             new_ts = base_ts;
             is_overflow_ptr = base_page_iter.IsOverflow();
+            expire_ts = base_page_iter.ExpireTs();
             adv_type = AdvanceType::PageIter;
         }
         else if (cmp_ret == 0)
         {
             adv_type = AdvanceType::Both;
-            if (change_ts > base_ts)
+            if (change_ts >= base_ts)
             {
                 if (base_page_iter.IsOverflow())
                 {
-                    KvError err = DelOverflowValue(base_val);
+                    err = DelOverflowValue(base_val);
                     CHECK_KV_ERR(err);
                 }
+                const uint32_t base_expire = base_page_iter.ExpireTs();
+                expire_ts = change_it->expire_ts_;
                 if (change_it->op_ == WriteOp::Delete)
                 {
+                    /* DELETE */
                     new_key = std::string_view{};
+                    UpdateTTL(base_expire, base_key, WriteOp::Delete);
+                    assert(expire_ts == 0 || expire_ts == base_expire);
+                }
+                else if (expire_ts != 0 && expire_ts <= now_ms)
+                {
+                    /* DELETE (expired update) */
+                    new_key = std::string_view{};
+                    UpdateTTL(base_expire, base_key, WriteOp::Delete);
                 }
                 else
                 {
+                    /* UPDATE */
                     new_key = change_key;
                     new_val = change_val;
                     new_ts = change_ts;
+                    // update expire timestamp only if it is changed.
+                    if (base_expire != expire_ts)
+                    {
+                        UpdateTTL(base_expire, base_key, WriteOp::Delete);
+                        UpdateTTL(expire_ts, new_key, WriteOp::Upsert);
+                    }
                 }
             }
             else
             {
+                // no change, this update/delete is ignored.
                 new_key = base_key;
                 new_val = base_val;
                 new_ts = base_ts;
                 is_overflow_ptr = base_page_iter.IsOverflow();
+                expire_ts = base_page_iter.ExpireTs();
             }
         }
         else
@@ -430,20 +566,24 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx)
             adv_type = AdvanceType::Changes;
             if (change_it->op_ == WriteOp::Delete)
             {
+                // deleting key not exists.
                 new_key = std::string_view{};
             }
             else
             {
+                /* INSERT */
                 new_key = change_key;
                 new_val = change_val;
                 new_ts = change_ts;
+                expire_ts = change_it->expire_ts_;
+                UpdateTTL(expire_ts, new_key, WriteOp::Upsert);
             }
         }
 
         if (!new_key.empty())
         {
-            KvError err =
-                add_to_page(new_key, new_val, is_overflow_ptr, new_ts);
+            err = add_to_page(
+                new_key, new_val, is_overflow_ptr, new_ts, expire_ts);
             CHECK_KV_ERR(err);
         }
 
@@ -464,26 +604,35 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx)
 
     while (is_base_iter_valid)
     {
-        std::string_view new_key = base_page_iter.Key();
-        std::string_view new_val = base_page_iter.Value();
+        // no change
+        std::string_view key = base_page_iter.Key();
+        std::string_view val = base_page_iter.Value();
         bool overflow = base_page_iter.IsOverflow();
-        uint64_t new_ts = base_page_iter.Timestamp();
-        KvError err = add_to_page(new_key, new_val, overflow, new_ts);
+        uint64_t ts = base_page_iter.Timestamp();
+        uint64_t expire_ts = base_page_iter.ExpireTs();
+        err = add_to_page(key, val, overflow, ts, expire_ts);
         CHECK_KV_ERR(err);
         AdvanceDataPageIter(base_page_iter, is_base_iter_valid);
     }
 
     while (change_it != change_end_it)
     {
-        if (change_it->op_ != WriteOp::Delete)
+        if (change_it->op_ == WriteOp::Upsert)
         {
-            std::string_view new_key{change_it->key_.data(),
-                                     change_it->key_.size()};
-            std::string_view new_val{change_it->val_.data(),
-                                     change_it->val_.size()};
-            uint64_t new_ts = change_it->timestamp_;
-            KvError err = add_to_page(new_key, new_val, false, new_ts);
+            /* INSERT */
+            std::string_view key{change_it->key_.data(),
+                                 change_it->key_.size()};
+            std::string_view val{change_it->val_.data(),
+                                 change_it->val_.size()};
+            uint64_t ts = change_it->timestamp_;
+            uint64_t expire_ts = change_it->expire_ts_;
+            UpdateTTL(expire_ts, key, WriteOp::Upsert);
+            err = add_to_page(key, val, false, ts, expire_ts);
             CHECK_KV_ERR(err);
+        }
+        else
+        {
+            // deleting key not exists.
         }
         ++change_it;
     }
@@ -492,7 +641,7 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx)
     {
         if (base_page)
         {
-            KvError err = LeafLinkDelete();
+            err = LeafLinkDelete();
             CHECK_KV_ERR(err);
             FreePage(applying_page_.GetPageId());
             assert(stack_.back()->changes_.empty() ||
@@ -504,14 +653,13 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx)
     else
     {
         std::string_view page_view = data_page_builder_.Finish();
-        KvError err =
-            FinishDataPage(page_view, std::move(curr_page_key), page_id);
+        err = FinishDataPage(page_view, std::move(curr_page_key), page_id);
         CHECK_KV_ERR(err);
     }
     assert(!TripleElement(1));
     leaf_triple_[1] = std::move(leaf_triple_[2]);
 
-    cidx = cidx + std::distance(batch_.begin() + cidx, change_end_it);
+    cidx = cidx + std::distance(data_batch_.begin() + cidx, change_end_it);
     return KvError::NoError;
 }
 
@@ -833,6 +981,547 @@ KvError BatchWriteTask::FinishDataPage(std::string_view page_view,
         CHECK_KV_ERR(err);
     }
     return KvError::NoError;
+}
+
+std::string_view BatchWriteTask::LeftBound(bool is_data_page)
+{
+    size_t level = is_data_page ? 0 : 1;
+    auto stack_it = stack_.crbegin() + level;
+    while (stack_it != stack_.crend())
+    {
+        IndexPageIter &idx_iter = (*stack_it)->idx_page_iter_;
+        std::string_view idx_key = idx_iter.Key();
+        if (!idx_key.empty())
+        {
+            return idx_key;
+        }
+        ++stack_it;
+    }
+
+    // An empty string for left bound means negative infinity.
+    return std::string_view{};
+}
+
+std::string BatchWriteTask::RightBound(bool is_data_page)
+{
+    size_t level = is_data_page ? 0 : 1;
+    auto stack_it = stack_.crbegin() + level;
+    while (stack_it != stack_.crend())
+    {
+        IndexPageIter &idx_iter = (*stack_it)->idx_page_iter_;
+        std::string next_key = idx_iter.PeekNextKey();
+        if (!next_key.empty())
+        {
+            return next_key;
+        }
+        ++stack_it;
+    }
+
+    // An empty string for right bound means positive infinity.
+    return std::string{};
+}
+
+KvError BatchWriteTask::DeleteTree(PageId page_id, bool update_prev)
+{
+    auto [idx_page, err] = shard->IndexManager()->FindPage(
+        cow_meta_.mapper_->GetMapping(), page_id);
+    CHECK_KV_ERR(err);
+    idx_page->Pin();
+    IndexPageIter iter(idx_page, Options());
+
+    if (idx_page->IsPointingToLeaf())
+    {
+        while (iter.Next())
+        {
+            err = DeleteDataPage(iter.GetPageId(), update_prev);
+            update_prev = false;
+            if (err != KvError::NoError)
+            {
+                idx_page->Unpin();
+                return err;
+            }
+        }
+        idx_page->Unpin();
+        FreePage(page_id);
+        return KvError::NoError;
+    }
+
+    while (iter.Next())
+    {
+        KvError err = DeleteTree(iter.GetPageId(), update_prev);
+        update_prev = false;
+        if (err != KvError::NoError)
+        {
+            idx_page->Unpin();
+            return err;
+        }
+    }
+    idx_page->Unpin();
+    FreePage(page_id);
+    return KvError::NoError;
+}
+
+KvError BatchWriteTask::DeleteDataPage(PageId page_id, bool update_prev)
+{
+    auto [page, err] = LoadDataPage(page_id);
+    CHECK_KV_ERR(err);
+    DataPageIter iter(&page, Options());
+    while (iter.Next())
+    {
+        if (iter.IsOverflow())
+        {
+            err = DelOverflowValue(iter.Value());
+            CHECK_KV_ERR(err);
+        }
+        uint64_t expire_ts = iter.ExpireTs();
+        UpdateTTL(expire_ts, iter.Key(), WriteOp::Delete);
+    }
+    FreePage(page_id);
+
+    if (!update_prev || page.PrevPageId() == MaxPageId)
+    {
+        return KvError::NoError;
+    }
+    // This is the first truncated data page, and the previous data page will
+    // become the new tail data page.
+    auto [prev_page, err_prev] = LoadDataPage(page.PrevPageId());
+    if (err_prev != KvError::NoError)
+    {
+        return err_prev;
+    }
+    prev_page.SetNextPageId(MaxPageId);
+    return WritePage(std::move(prev_page));
+}
+
+KvError BatchWriteTask::WriteOverflowValue(std::string_view value)
+{
+    const KvOptions *opts = Options();
+    const uint16_t page_cap = OverflowPage::Capacity(opts, false);
+    const uint16_t end_page_cap = OverflowPage::Capacity(opts, true);
+    overflow_ptrs_.clear();
+    uint32_t end_page_id = MaxPageId;
+    std::string_view page_val;
+    KvError err;
+    std::array<uint32_t, max_overflow_pointers> buf;
+    std::span<uint32_t> pointers;
+
+    while (!value.empty())
+    {
+        // Calculates how many page ids are needed for the next group.
+        // Round upward and up to KvOptions::overflow_pointers.
+        size_t next_group_size = (value.size() + page_cap - 1) / page_cap;
+        next_group_size =
+            std::min(next_group_size, size_t(opts->overflow_pointers));
+        // Allocate pointers to the next group.
+        for (uint8_t i = 0; i < next_group_size; i++)
+        {
+            buf[i] = cow_meta_.mapper_->GetPage();
+        }
+        pointers = {buf.data(), next_group_size};
+        if (end_page_id == MaxPageId)
+        {
+            // Store head pointers of this link list in overflow_ptrs_.
+            for (uint32_t pg_id : pointers)
+            {
+                PutFixed32(&overflow_ptrs_, pg_id);
+            }
+        }
+        else
+        {
+            // Write end page of the previous group that contains pointers to
+            // the next group.
+            err =
+                WritePage(OverflowPage(end_page_id, opts, page_val, pointers));
+            CHECK_KV_ERR(err);
+        }
+
+        // Write the next overflow pages group.
+        uint8_t i = 0;
+        for (uint32_t pg_id : pointers)
+        {
+            i++;
+            if (i == opts->overflow_pointers && value.size() > page_cap)
+            {
+                // The end page of this group can't hold the remaining value.
+                // So we need at least one more group.
+                end_page_id = pg_id;
+                // The end page of a group has a smaller capacity.
+                uint16_t page_val_size =
+                    std::min(size_t(end_page_cap), value.size());
+                page_val = value.substr(0, page_val_size);
+                value = value.substr(page_val_size);
+                break;
+            }
+            uint16_t page_val_size = std::min(size_t(page_cap), value.size());
+            page_val = value.substr(0, page_val_size);
+            value = value.substr(page_val_size);
+            err = WritePage(OverflowPage(pg_id, opts, page_val));
+            CHECK_KV_ERR(err);
+        }
+        assert(i == pointers.size());
+    }
+    return KvError::NoError;
+}
+
+KvError BatchWriteTask::DelOverflowValue(std::string_view encoded_ptrs)
+{
+    std::array<PageId, max_overflow_pointers> pointers;
+    uint8_t n_ptrs = DecodeOverflowPointers(encoded_ptrs, pointers);
+    for (uint8_t i = 0; i < n_ptrs;)
+    {
+        PageId page_id = pointers[i];
+        if (i == (Options()->overflow_pointers - 1))
+        {
+            auto [page, err] = LoadOverflowPage(page_id);
+            CHECK_KV_ERR(err);
+            encoded_ptrs = page.GetEncodedPointers(Options());
+            n_ptrs = DecodeOverflowPointers(encoded_ptrs, pointers);
+            i = 0;
+        }
+        else
+        {
+            i++;
+        }
+        FreePage(page_id);
+    }
+    return KvError::NoError;
+}
+
+void BatchWriteTask::AdvanceDataPageIter(DataPageIter &iter, bool &is_valid)
+{
+    is_valid = iter.HasNext() ? iter.Next() : false;
+}
+
+void BatchWriteTask::AdvanceIndexPageIter(IndexPageIter &iter, bool &is_valid)
+{
+    is_valid = iter.HasNext() ? iter.Next() : false;
+}
+
+std::pair<MemIndexPage *, KvError> BatchWriteTask::TruncateIndexPage(
+    PageId page_id, std::string_view trunc_pos)
+{
+    auto [idx_page, err] = shard->IndexManager()->FindPage(
+        cow_meta_.mapper_->GetMapping(), page_id);
+    if (err != KvError::NoError)
+    {
+        return {nullptr, err};
+    }
+
+    const bool is_leaf_idx = idx_page->IsPointingToLeaf();
+    IndexPageBuilder builder(Options());
+
+    auto truncate_sub_node = [&](std::string_view sub_node_key,
+                                 PageId sub_node_id) -> KvError
+    {
+        // truncate sub-node
+        std::pair<bool, KvError> ret;
+        if (is_leaf_idx)
+        {
+            ret = TruncateDataPage(sub_node_id, trunc_pos);
+        }
+        else
+        {
+            ret = TruncateIndexPage(sub_node_id, trunc_pos);
+        }
+        CHECK_KV_ERR(ret.second);
+        if (ret.first)
+        {
+            // This sub-node is partially truncated
+            builder.Add(sub_node_key, sub_node_id, is_leaf_idx);
+        }
+        return KvError::NoError;
+    };
+
+    auto delete_sub_node = [this, is_leaf_idx](std::string_view sub_node_key,
+                                               PageId sub_node_id,
+                                               bool is_trunc_begin) -> KvError
+    {
+        // delete whole sub-node
+        if (is_leaf_idx)
+        {
+            return DeleteDataPage(sub_node_id, is_trunc_begin);
+        }
+        else
+        {
+            return DeleteTree(sub_node_id, is_trunc_begin);
+        }
+    };
+
+    IndexPageIter iter(idx_page, Options());
+    CHECK(iter.Next());
+    std::string sub_node_key = {};
+    PageId sub_node_id = iter.GetPageId();
+
+    // Depth first search recursively
+    bool cut_point_found = false;
+    idx_page->Pin();
+    while (iter.Next())
+    {
+        std::string_view next_node_key = iter.Key();
+        PageId next_node_id = iter.GetPageId();
+
+        if (cut_point_found)
+        {
+            // Delete all sub-nodes bigger than cutting point.
+            err = delete_sub_node(sub_node_key, sub_node_id, false);
+            if (err != KvError::NoError)
+            {
+                idx_page->Unpin();
+                return {nullptr, err};
+            }
+        }
+        else if (Comp()->Compare(trunc_pos, next_node_key) >= 0)
+        {
+            // Preserve this sub-node smaller than cutting point.
+            builder.Add(sub_node_key, sub_node_id, is_leaf_idx);
+        }
+        else
+        {
+            // Mark cutting point has been found to reduce string comparison.
+            cut_point_found = true;
+            if (Comp()->Compare(trunc_pos, sub_node_key) > 0)
+            {
+                // Truncate the biggest sub-node smaller than trunc_pos.
+                err = truncate_sub_node(sub_node_key, sub_node_id);
+            }
+            else
+            {
+                // Delete sub-node equal to trunc_pos.
+                assert(Comp()->Compare(trunc_pos, sub_node_key) == 0);
+                err = delete_sub_node(sub_node_key, sub_node_id, true);
+            }
+            if (err != KvError::NoError)
+            {
+                idx_page->Unpin();
+                return {nullptr, err};
+            }
+        }
+
+        sub_node_key = next_node_key;
+        sub_node_id = next_node_id;
+    }
+    if (cut_point_found)
+    {
+        err = delete_sub_node(sub_node_key, sub_node_id, false);
+    }
+    else if (Comp()->Compare(trunc_pos, sub_node_key) > 0)
+    {
+        err = truncate_sub_node(sub_node_key, sub_node_id);
+    }
+    else
+    {
+        err = delete_sub_node(sub_node_key, sub_node_id, true);
+    }
+    idx_page->Unpin();
+    if (err != KvError::NoError)
+    {
+        return {nullptr, err};
+    }
+
+    if (builder.IsEmpty())
+    {
+        // This index page is wholly deleted
+        return {nullptr, KvError::NoError};
+    }
+    // This index page is partially truncated
+    MemIndexPage *new_page = shard->IndexManager()->AllocIndexPage();
+    if (new_page == nullptr)
+    {
+        return {nullptr, KvError::OutOfMem};
+    }
+    std::string_view page_view = builder.Finish();
+    memcpy(new_page->PagePtr(), page_view.data(), page_view.size());
+    new_page->SetPageId(page_id);
+    err = WritePage(new_page);
+    if (err != KvError::NoError)
+    {
+        shard->IndexManager()->FreeIndexPage(new_page);
+        return {nullptr, err};
+    }
+    return {new_page, KvError::NoError};
+}
+
+KvError BatchWriteTask::Truncate(std::string_view trunc_pos)
+{
+    KvError err = shard->IndexManager()->MakeCowRoot(tbl_ident_, cow_meta_);
+    CHECK_KV_ERR(err);
+    if (cow_meta_.root_id_ == MaxPageId)
+    {
+        return KvError::NoError;
+    }
+
+    if (trunc_pos.empty())
+    {
+        do_update_ttl_ = false;
+        err = DeleteTree(cow_meta_.root_id_, false);
+        CHECK_KV_ERR(err);
+        cow_meta_.root_id_ = MaxPageId;
+        if (cow_meta_.ttl_root_id_ != MaxPageId)
+        {
+            err = DeleteTree(cow_meta_.ttl_root_id_, false);
+            CHECK_KV_ERR(err);
+            cow_meta_.ttl_root_id_ = MaxPageId;
+        }
+        return UpdateMeta();
+    }
+
+    do_update_ttl_ = true;
+    auto [new_root, error] = TruncateIndexPage(cow_meta_.root_id_, trunc_pos);
+    CHECK_KV_ERR(error);
+    cow_meta_.root_id_ =
+        new_root == nullptr ? MaxPageId : new_root->GetPageId();
+    err = ApplyTTLBatch();
+    CHECK_KV_ERR(err);
+    return UpdateMeta();
+}
+
+std::pair<bool, KvError> BatchWriteTask::TruncateDataPage(
+    PageId page_id, std::string_view trunc_pos)
+{
+    auto [page, err] = LoadDataPage(page_id);
+    if (err != KvError::NoError)
+    {
+        return {true, err};
+    }
+
+    const Comparator *cmp = shard->IndexManager()->GetComparator();
+    DataPageIter iter{&page, Options()};
+    data_page_builder_.Reset();
+    while (iter.Next() && cmp->Compare(iter.Key(), trunc_pos) < 0)
+    {
+        data_page_builder_.Add(iter.Key(),
+                               iter.Value(),
+                               iter.IsOverflow(),
+                               iter.Timestamp(),
+                               iter.ExpireTs());
+    }
+    while (iter.Next())
+    {
+        if (iter.IsOverflow())
+        {
+            err = DelOverflowValue(iter.Value());
+            if (err != KvError::NoError)
+            {
+                return {true, err};
+            }
+        }
+        uint64_t expire_ts = iter.ExpireTs();
+        UpdateTTL(expire_ts, iter.Key(), WriteOp::Delete);
+    }
+
+    if (data_page_builder_.IsEmpty())
+    {
+        FreePage(page.GetPageId());
+
+        uint32_t prev_page_id = page.PrevPageId();
+        if (prev_page_id == MaxPageId)
+        {
+            return {false, KvError::NoError};
+        }
+        // The previous data page will become the new tail data page.
+        // We don't need to update the previous page id of the next data page.
+        auto [prev_page, err] = LoadDataPage(prev_page_id);
+        if (err != KvError::NoError)
+        {
+            return {false, err};
+        }
+        prev_page.SetNextPageId(MaxPageId);
+        err = WritePage(std::move(prev_page));
+        return {false, err};
+    }
+    else
+    {
+        // This currently updated data page will become the new tail data page.
+        DataPage new_page(page_id);
+        std::string_view page_view = data_page_builder_.Finish();
+        memcpy(new_page.PagePtr(), page_view.data(), page_view.size());
+        new_page.SetNextPageId(MaxPageId);
+        new_page.SetPrevPageId(page.PrevPageId());
+        err = WritePage(std::move(new_page));
+        return {true, err};
+    }
+}
+
+KvError BatchWriteTask::CleanExpiredKeys()
+{
+    // Scan from leftmost to get all expired keys.
+    ScanIterator iter(tbl_ident_);
+    KvError err = iter.Seek({}, true);
+    if (err != KvError::NoError)
+    {
+        if (err == KvError::EndOfFile)
+        {
+            // TTL tree is empty.
+            return KvError::NoError;
+        }
+        else
+        {
+            LOG(ERROR) << "failed to clean expired keys: " << ErrorString(err);
+            return err;
+        }
+    }
+
+    std::vector<WriteDataEntry> data_batch, ttl_batch;
+    data_batch.reserve(128);
+    ttl_batch.reserve(128);
+    const uint64_t now_ts = utils::UnixTs<chrono::milliseconds>();
+    uint64_t next_expire_ts = 0;
+    do
+    {
+        std::string_view ttl_key = iter.Key();
+        uint64_t expire_ts = BigEndianToNative(DecodeFixed64(ttl_key.data()));
+        if (expire_ts > now_ts)
+        {
+            next_expire_ts = expire_ts;
+            break;
+        }
+        ttl_batch.emplace_back(std::string(ttl_key), "", 0, WriteOp::Delete);
+        std::string key(ttl_key.substr(8));
+        data_batch.emplace_back(
+            std::move(key), "", now_ts, WriteOp::Delete, expire_ts);
+    } while (iter.Next() == KvError::NoError);
+
+    if (ttl_batch.empty())
+    {
+        return KvError::NoError;
+    }
+
+    err = shard->IndexManager()->MakeCowRoot(tbl_ident_, cow_meta_);
+    CHECK_KV_ERR(err);
+    assert(cow_meta_.next_expire_ts_ != 0 &&
+           cow_meta_.next_expire_ts_ <= now_ts);
+
+    std::sort(data_batch.begin(), data_batch.end());
+    SetBatch(data_batch);
+    err = ApplyBatch(cow_meta_.root_id_, false);
+    CHECK_KV_ERR(err);
+
+    assert(std::is_sorted(ttl_batch.begin(), ttl_batch.end()));
+    SetBatch(ttl_batch);
+    err = ApplyBatch(cow_meta_.ttl_root_id_, false);
+    CHECK_KV_ERR(err);
+    cow_meta_.next_expire_ts_ = next_expire_ts;
+    return UpdateMeta();
+}
+
+void BatchWriteTask::UpdateTTL(uint64_t expire_ts,
+                               std::string_view key,
+                               WriteOp op)
+{
+    if (do_update_ttl_ && expire_ts != 0)
+    {
+        std::string ttl_key;
+        ttl_key.resize(sizeof(expire_ts) + key.size());
+        EncodeFixed64(ttl_key.data(), ToBigEndian(expire_ts));
+        std::memcpy(ttl_key.data() + sizeof(expire_ts), key.data(), key.size());
+        ttl_batch_.emplace_back(std::move(ttl_key), "", 0, op, 0);
+        if (op == WriteOp::Upsert)
+        {
+            uint64_t next_ts = cow_meta_.next_expire_ts_;
+            cow_meta_.next_expire_ts_ =
+                next_ts == 0 ? expire_ts : std::min(next_ts, expire_ts);
+        }
+    }
 }
 
 }  // namespace kvstore
