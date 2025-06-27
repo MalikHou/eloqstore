@@ -23,7 +23,7 @@ public:
     ScanTask *GetScanTask();
     void FreeTask(KvTask *task);
 
-    uint32_t NumActive() const;
+    size_t NumActive() const;
 
 private:
     template <typename T>

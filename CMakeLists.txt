@@ -11,6 +11,12 @@ if(WITH_ASAN)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
 endif()
 
+option(ELOQ_MODULE_ENABLED "Enable EloqModule" OFF)
+message("ELOQ_MODULE_ENABLED: " ${ELOQ_MODULE_ENABLED})
+if (ELOQ_MODULE_ENABLED)
+    add_compile_definitions(ELOQ_MODULE_ENABLED)
+endif()
+
 find_package(Threads REQUIRED)
 find_package(glog REQUIRED)
 
@@ -81,7 +87,9 @@ set(ELOQ_STORE_SOURCES
     archive_crond.cpp
     object_store.cpp
     types.cpp
-    kv_options.cpp)
+    kv_options.cpp
+    eloqstore_module.cpp
+    async_io_listener.cpp)
 
 add_library(eloqstore STATIC ${ELOQ_STORE_SOURCES} ${INI_SOURCES})
 

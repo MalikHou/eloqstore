@@ -1,9 +1,13 @@
 #include "shard.h"
 
+#include "async_io_listener.h"
+#include "eloqstore_module.h"
+
 namespace kvstore
 {
-Shard::Shard(const EloqStore *store, uint32_t fd_limit)
+Shard::Shard(const EloqStore *store, size_t shard_id, uint32_t fd_limit)
     : store_(store),
+      shard_id_(shard_id),
       page_pool_(&store->options_),
       io_mgr_(AsyncIoManager::Instance(store, fd_limit)),
       index_mgr_(io_mgr_.get()),
@@ -13,21 +17,24 @@ Shard::Shard(const EloqStore *store, uint32_t fd_limit)
 
 KvError Shard::Init()
 {
-    return io_mgr_->Init(this);
+    KvError res = io_mgr_->Init(this);
+#ifdef ELOQ_MODULE_ENABLED
+    if (res == KvError::NoError)
+    {
+        async_io_listener_ = std::make_unique<AsyncIOListener>(this);
+    }
+#endif
+    return res;
 }
 
 void Shard::WorkLoop()
 {
     while (true)
     {
-        KvRequest *reqs[128];
-        size_t nreqs = requests_.try_dequeue_bulk(reqs, std::size(reqs));
-        for (size_t i = 0; i < nreqs; i++)
-        {
-            OnReceivedReq(reqs[i]);
-        }
+        size_t req_cnt = 0;
+        WorkOneRound(req_cnt);
 
-        if (nreqs == 0 && task_mgr_.NumActive() == 0)
+        if (req_cnt == 0)
         {
             if (store_->IsStopped())
             {
@@ -36,17 +43,14 @@ void Shard::WorkLoop()
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
-
-        io_mgr_->Submit();
-        io_mgr_->PollComplete();
-
-        ResumeScheduled();
-        PollFinished();
     }
 }
 
 void Shard::Start()
 {
+#ifdef ELOQ_MODULE_ENABLED
+    io_mgr_->Start();
+#else
     thd_ = std::thread(
         [this]
         {
@@ -54,16 +58,30 @@ void Shard::Start()
             io_mgr_->Start();
             WorkLoop();
         });
+#endif
 }
 
 void Shard::Stop()
 {
+#ifdef ELOQ_MODULE_ENABLED
+    async_io_listener_.reset(nullptr);
+#else
     thd_.join();
+#endif
 }
 
 bool Shard::AddKvRequest(KvRequest *req)
 {
-    return requests_.enqueue(req);
+    bool ret = requests_.enqueue(req);
+#ifdef ELOQ_MODULE_ENABLED
+    if (ret)
+    {
+        req_queue_size_.fetch_add(1, std::memory_order_relaxed);
+        // New request, notify the external processor directly.
+        eloq::EloqModule::NotifyWorker(shard_id_);
+    }
+#endif
+    return ret;
 }
 
 void Shard::AddPendingCompact(const TableIdent &tbl_id)
@@ -295,6 +313,44 @@ void Shard::OnWriteFinished(const TableIdent &tbl_id)
     // Continue execute the next pending write request.
     ProcessReq(req);
 }
+
+void Shard::WorkOneRound(size_t &req_cnt)
+{
+    KvRequest *reqs[128];
+    size_t nreqs = requests_.try_dequeue_bulk(reqs, std::size(reqs));
+    for (size_t i = 0; i < nreqs; i++)
+    {
+        OnReceivedReq(reqs[i]);
+    }
+
+    if (nreqs == 0 && task_mgr_.NumActive() == 0)
+    {
+        // No request.
+        req_cnt = 0;
+        return;
+    }
+
+#ifdef ELOQ_MODULE_ENABLED
+    req_queue_size_.fetch_sub(nreqs, std::memory_order_acq_rel);
+#endif
+
+    req_cnt = nreqs;
+
+    io_mgr_->Submit();
+    io_mgr_->PollComplete();
+
+    ResumeScheduled();
+    PollFinished();
+
+    io_mgr_->CheckAndSetIOStatus(false);
+}
+
+#ifdef ELOQ_MODULE_ENABLED
+void Shard::NotifyListener()
+{
+    async_io_listener_->StartListening();
+}
+#endif
 
 void Shard::PendingWriteQueue::PushBack(WriteRequest *req)
 {

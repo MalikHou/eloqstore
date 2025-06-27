@@ -1,7 +1,9 @@
 #pragma once
 
 #include <boost/context/pooled_fixedsize_stack.hpp>
+#include <condition_variable>
 
+#include "async_io_listener.h"
 #include "eloq_store.h"
 #include "task_manager.h"
 
@@ -11,10 +13,14 @@
 
 namespace kvstore
 {
+#ifdef ELOQ_MODULE_ENABLED
+class EloqStoreModule;
+#endif
+
 class Shard
 {
 public:
-    Shard(const EloqStore *store, uint32_t fd_limit);
+    Shard(const EloqStore *store, size_t shard_id, uint32_t fd_limit);
     KvError Init();
     void Start();
     void Stop();
@@ -46,6 +52,20 @@ private:
     void ProcessReq(KvRequest *req);
     void OnWriteFinished(const TableIdent &tbl_id);
 
+    void WorkOneRound(size_t &req_cnt);
+#ifdef ELOQ_MODULE_ENABLED
+    bool IsIdle() const
+    {
+        return req_queue_size_.load(std::memory_order_relaxed) == 0 &&
+               !io_mgr_->HasValidIO();
+    }
+    void BindExtThd()
+    {
+        shard = this;
+    }
+    void NotifyListener();
+#endif
+
     template <typename F>
     void StartTask(KvTask *task, KvRequest *req, F lbd)
     {
@@ -73,6 +93,7 @@ private:
         running_ = nullptr;
     }
 
+    size_t shard_id_{0};
     moodycamel::ConcurrentQueue<KvRequest *> requests_;
     std::thread thd_;
     PagesPool page_pool_;
@@ -97,5 +118,14 @@ private:
         WriteRequest *tail_{nullptr};
     };
     std::unordered_map<TableIdent, PendingWriteQueue> pending_queues_;
+
+#ifdef ELOQ_MODULE_ENABLED
+    std::atomic<size_t> req_queue_size_{0};
+    std::atomic<bool> ext_proc_running_{true};
+    std::unique_ptr<AsyncIOListener> async_io_listener_{nullptr};
+#endif
+
+    friend class EloqStoreModule;
+    friend class AsyncIOListener;
 };
 }  // namespace kvstore

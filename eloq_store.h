@@ -215,6 +215,7 @@ public:
 class FileGarbageCollector;
 class ArchiveCrond;
 class ObjectStore;
+class EloqStoreModule;
 
 class EloqStore
 {
@@ -250,6 +251,10 @@ private:
     std::unique_ptr<FileGarbageCollector> file_gc_{nullptr};
     std::unique_ptr<ArchiveCrond> archive_crond_{nullptr};
     std::unique_ptr<ObjectStore> obj_store_{nullptr};
+#ifdef ELOQ_MODULE_ENABLED
+    std::unique_ptr<EloqStoreModule> module_{nullptr};
+#endif
+
     friend class Shard;
     friend class AsyncIoManager;
     friend class IouringMgr;

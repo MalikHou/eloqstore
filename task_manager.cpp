@@ -72,7 +72,7 @@ void TaskManager::FreeTask(KvTask *task)
     }
 }
 
-uint32_t TaskManager::NumActive() const
+size_t TaskManager::NumActive() const
 {
     return num_active_;
 }

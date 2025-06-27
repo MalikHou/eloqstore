@@ -14,6 +14,7 @@
 
 #include "archive_crond.h"
 #include "common.h"
+#include "eloqstore_module.h"
 #include "file_gc.h"
 #include "object_store.h"
 #include "shard.h"
@@ -96,7 +97,7 @@ KvError EloqStore::Start()
     {
         if (shards_[i] == nullptr)
         {
-            shards_[i] = std::make_unique<Shard>(this, shard_fd_limit);
+            shards_[i] = std::make_unique<Shard>(this, i, shard_fd_limit);
         }
         KvError err = shards_[i]->Init();
         CHECK_KV_ERR(err);
@@ -135,6 +136,11 @@ KvError EloqStore::Start()
     {
         shard->Start();
     }
+
+#ifdef ELOQ_MODULE_ENABLED
+    module_ = std::make_unique<EloqStoreModule>(&shards_);
+    eloq::register_module(module_.get());
+#endif
 
     LOG(INFO) << "EloqStore is started.";
     return KvError::NoError;
@@ -255,6 +261,10 @@ bool EloqStore::SendRequest(KvRequest *req)
 
 void EloqStore::Stop()
 {
+#ifdef ELOQ_MODULE_ENABLED
+    eloq::unregister_module(module_.get());
+#endif
+
     if (archive_crond_ != nullptr)
     {
         archive_crond_->Stop();

@@ -4,6 +4,7 @@
 #include <liburing.h>
 #include <sys/types.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -52,14 +53,14 @@ class EloqStore;
 class AsyncIoManager
 {
 public:
-    AsyncIoManager(const KvOptions *opts) : options_(opts) {};
+    AsyncIoManager(const KvOptions *opts) : options_(opts){};
     virtual ~AsyncIoManager() = default;
     static std::unique_ptr<AsyncIoManager> Instance(const EloqStore *store,
                                                     uint32_t fd_limit);
 
     /** These methods are provided for worker thread. */
     virtual KvError Init(Shard *shard) = 0;
-    virtual void Start() {};
+    virtual void Start(){};
     virtual void Submit() = 0;
     virtual void PollComplete() = 0;
 
@@ -91,6 +92,10 @@ public:
     virtual std::pair<ManifestFilePtr, KvError> GetManifest(
         const TableIdent &tbl_id) = 0;
     virtual void CleanTable(const TableIdent &tbl_id) = 0;
+
+    virtual int WaitCompletedIO() = 0;
+    virtual void CheckAndSetIOStatus(bool has_completed_io) = 0;
+    virtual bool HasValidIO() = 0;
 
     const KvOptions *options_;
 };
@@ -133,6 +138,10 @@ public:
     std::pair<ManifestFilePtr, KvError> GetManifest(
         const TableIdent &tbl_id) override;
     void CleanTable(const TableIdent &tbl_id) override;
+
+    int WaitCompletedIO() override;
+    void CheckAndSetIOStatus(bool has_completed_io) override;
+    bool HasValidIO() override;
 
     static constexpr uint64_t oflags_dir = O_DIRECTORY | O_RDONLY;
 
@@ -196,7 +205,7 @@ protected:
 
     struct BaseReq
     {
-        BaseReq(KvTask *task = nullptr) : task_(task) {};
+        BaseReq(KvTask *task = nullptr) : task_(task){};
         KvTask *task_;
         int res_{0};
         uint32_t flags_{0};
@@ -344,6 +353,8 @@ protected:
     io_uring ring_;
     WaitingZone waiting_sqe_;
     uint32_t prepared_sqe_{0};
+    // True if there are SQE or there are CQE.
+    std::atomic<bool> has_valid_io_{false};
 };
 
 class CloudStoreMgr : public IouringMgr
@@ -422,7 +433,7 @@ private:
     class FileCleaner : public KvTask
     {
     public:
-        FileCleaner(CloudStoreMgr *io_mgr) : io_mgr_(io_mgr) {};
+        FileCleaner(CloudStoreMgr *io_mgr) : io_mgr_(io_mgr){};
         TaskType Type() const override;
         void Run();
 
@@ -442,8 +453,8 @@ class MemStoreMgr : public AsyncIoManager
 public:
     MemStoreMgr(const KvOptions *opts);
     KvError Init(Shard *shard) override;
-    void Submit() override {};
-    void PollComplete() override {};
+    void Submit() override{};
+    void PollComplete() override{};
 
     std::pair<Page, KvError> ReadPage(const TableIdent &tbl_id,
                                       FilePageId file_page_id,
@@ -473,10 +484,23 @@ public:
         const TableIdent &tbl_id) override;
     void CleanTable(const TableIdent &tbl_id) override;
 
+    int WaitCompletedIO() override
+    {
+        return 0;
+    }
+    void CheckAndSetIOStatus(bool has_completed_io) override
+    {
+        (void) has_completed_io;
+    }
+    bool HasValidIO() override
+    {
+        return true;
+    }
+
     class Manifest : public ManifestFile
     {
     public:
-        Manifest(std::string_view content) : content_(content) {};
+        Manifest(std::string_view content) : content_(content){};
         KvError Read(char *dst, size_t n) override;
         void Skip(size_t n);
 
