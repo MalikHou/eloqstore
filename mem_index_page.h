@@ -133,6 +133,7 @@ public:
 
     IndexPageIter() = delete;
     IndexPageIter(const MemIndexPage *index_page, const KvOptions *opts);
+    IndexPageIter(std::string_view page_view, const KvOptions *opts);
 
     bool HasNext() const
     {
@@ -162,20 +163,20 @@ public:
 
     void Advance(std::string_view &key, uint32_t &page_id);
 
-private:
-    uint16_t RestartOffset(uint16_t restart_idx) const
-    {
-        assert(restart_idx < restart_num_);
-        return DecodeFixed16(page_.data() + restart_offset_ +
-                             restart_idx * sizeof(uint16_t));
-    }
-
     void SeekToRestart(uint16_t restart_idx)
     {
         curr_restart_idx_ = restart_idx;
         curr_offset_ = RestartOffset(restart_idx);
         key_.clear();
         page_id_ = MaxPageId;
+    }
+
+private:
+    uint16_t RestartOffset(uint16_t restart_idx) const
+    {
+        assert(restart_idx < restart_num_);
+        return DecodeFixed16(page_.data() + restart_offset_ +
+                             restart_idx * sizeof(uint16_t));
     }
 
     bool ParseNextKey();

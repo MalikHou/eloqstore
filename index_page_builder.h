@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "kv_options.h"
@@ -36,6 +37,7 @@ public:
     {
         return std::move(buffer_);
     }
+    void Swap(IndexPageBuilder &other);
 
     static size_t HeaderSize();
 

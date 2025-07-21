@@ -443,12 +443,12 @@ const char *DataPageIter::DecodeEntry(const char *p,
     return p;
 }
 
-DataRegionIter::DataRegionIter(std::string_view page)
+PageRegionIter::PageRegionIter(std::string_view page)
 {
     Reset(page);
 }
 
-void DataRegionIter::Reset(std::string_view page)
+void PageRegionIter::Reset(std::string_view page)
 {
     assert(DecodeFixed16(page.data() + DataPage::page_size_offset) ==
            page.size());
@@ -460,25 +460,25 @@ void DataRegionIter::Reset(std::string_view page)
     cur_region_idx_ = 0;
 }
 
-std::string_view DataRegionIter::Region() const
+std::string_view PageRegionIter::Region() const
 {
     uint16_t offset = RegionOffset(cur_region_idx_);
     uint16_t size = RegionOffset(cur_region_idx_ + 1) - offset;
     return {page_.data() + offset, size};
 }
 
-bool DataRegionIter::Valid() const
+bool PageRegionIter::Valid() const
 {
     return cur_region_idx_ < num_regions_;
 }
 
-void DataRegionIter::Next()
+void PageRegionIter::Next()
 {
     assert(Valid());
     cur_region_idx_++;
 }
 
-uint16_t DataRegionIter::RegionOffset(uint16_t region_idx) const
+uint16_t PageRegionIter::RegionOffset(uint16_t region_idx) const
 {
     if (region_idx < num_regions_)
     {

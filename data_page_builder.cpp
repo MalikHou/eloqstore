@@ -8,6 +8,7 @@
 
 #include "coding.h"
 #include "data_page.h"
+#include "index_page_builder.h"
 
 namespace eloqstore
 {
@@ -216,20 +217,31 @@ bool DataPageBuilder::Add(std::string_view key,
     return true;
 }
 
-FastDataPageBuilder::FastDataPageBuilder(const KvOptions *options)
-    : options_(options)
+FastPageBuilder::FastPageBuilder(const KvOptions *options) : options_(options)
 {
 }
 
-void FastDataPageBuilder::Reset(char *ptr)
+void FastPageBuilder::Reset(char *ptr, PageType type)
 {
     ptr_ = ptr;
-    end_offset_ = DataPageBuilder::HeaderSize();
-    SetPageType(ptr_, PageType::Data);
+    SetPageType(ptr_, type);
+    switch (type)
+    {
+    case PageType::NonLeafIndex:
+    case PageType::LeafIndex:
+        end_offset_ = IndexPageBuilder::HeaderSize();
+        break;
+    case PageType::Data:
+        end_offset_ = DataPageBuilder::HeaderSize();
+        break;
+    default:
+        assert(false);
+        break;
+    }
     region_offsets_.clear();
 }
 
-bool FastDataPageBuilder::AddRegion(std::string_view region)
+bool FastPageBuilder::AddRegion(std::string_view region)
 {
     if (CurrentSize() + region.size() + sizeof(uint16_t) >
         options_->data_page_size)
@@ -245,14 +257,14 @@ bool FastDataPageBuilder::AddRegion(std::string_view region)
     return true;
 }
 
-size_t FastDataPageBuilder::CurrentSize() const
+size_t FastPageBuilder::CurrentSize() const
 {
     return (end_offset_ +                                // Raw data buffer
             region_offsets_.size() * sizeof(uint16_t) +  // Restart array
             sizeof(uint16_t));                           // Restart array length
 }
 
-void FastDataPageBuilder::Finish()
+void FastPageBuilder::Finish()
 {
     // Append restart array
     for (uint16_t offset : region_offsets_)

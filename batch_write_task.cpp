@@ -696,21 +696,18 @@ std::pair<MemIndexPage *, KvError> BatchWriteTask::Pop()
     // Merges index entries in the page with the change vector.
     auto cit = changes.begin();
 
+    KvError err;
     // We keep the previous built page in the pipeline before flushing it to
     // storage. This is to redistribute between last two pages in case the last
     // page is sparse.
-    MemIndexPage *prev_page = nullptr;
-    MemIndexPage *curr_page = nullptr;
-    std::string prev_page_key{};
+    DirtyIndexPage prev_page;
     std::string_view page_key =
         stack_.size() == 1 ? std::string_view{}
                            : stack_[stack_.size() - 2]->idx_page_iter_.Key();
     std::string curr_page_key{page_key};
-
-    PageId page_id = MaxPageId;
     if (stack_page != nullptr)
     {
-        page_id = stack_page->GetPageId();
+        prev_page.page_id_ = stack_page->GetPageId();
     }
 
     auto add_to_page = [&](std::string_view new_key,
@@ -720,37 +717,8 @@ std::pair<MemIndexPage *, KvError> BatchWriteTask::Pop()
             idx_page_builder_.Add(new_key, new_page_id, is_leaf_index);
         if (!success)
         {
-            curr_page = shard->IndexManager()->AllocIndexPage();
-            if (curr_page == nullptr)
-            {
-                return KvError::OutOfMem;
-            }
-            // The page is full.
-            std::string_view page_view = idx_page_builder_.Finish();
-            memcpy(curr_page->PagePtr(), page_view.data(), page_view.size());
-
-            if (prev_page != nullptr)
-            {
-                // The update results in an index page split, because there is
-                // at least one new index page to come. Flushes the previously
-                // built index page and elevates it to the parent in the stack.
-                KvError err = FinishIndexPage(
-                    prev_page, std::move(prev_page_key), page_id, true);
-                if (err != KvError::NoError)
-                {
-                    shard->IndexManager()->FreeIndexPage(prev_page);
-                    prev_page = nullptr;
-                    return err;
-                }
-
-                // The first split index page shares the same page Id with the
-                // original one. The following index pages will have new page
-                // Id's.
-                page_id = MaxPageId;
-            }
-
-            prev_page = curr_page;
-            prev_page_key = std::move(curr_page_key);
+            err = FinishIndexPage(prev_page, std::move(curr_page_key));
+            CHECK_KV_ERR(err);
             curr_page_key = new_key;
             idx_page_builder_.Reset();
             // The first index entry is the leftmost pointer w/o the key.
@@ -860,28 +828,7 @@ std::pair<MemIndexPage *, KvError> BatchWriteTask::Pop()
         ++cit;
     }
 
-    bool elevate;
-    if (prev_page != nullptr)
-    {
-        KvError err =
-            FinishIndexPage(prev_page, std::move(prev_page_key), page_id, true);
-        if (err != KvError::NoError)
-        {
-            return {nullptr, err};
-        }
-        page_id = MaxPageId;
-        // The index page is split into two or more pages, all of which are
-        // elevated.
-        elevate = true;
-    }
-    else
-    {
-        // The update does not yield a page split. The new page has the same
-        // page Id as the original one. It is mapped to a new file page and is
-        // not elevated to its parent page.
-        elevate = false;
-    }
-
+    MemIndexPage *new_root = nullptr;
     if (idx_page_builder_.IsEmpty())
     {
         FreePage(stack_.back()->idx_page_->GetPageId());
@@ -890,25 +837,30 @@ std::pair<MemIndexPage *, KvError> BatchWriteTask::Pop()
             IndexStackEntry *parent = stack_[stack_.size() - 2].get();
             std::string_view page_key = parent->idx_page_iter_.Key();
             parent->changes_.emplace_back(
-                std::string(page_key), page_id, WriteOp::Delete);
+                std::string(page_key), prev_page.page_id_, WriteOp::Delete);
         }
     }
     else
     {
-        curr_page = shard->IndexManager()->AllocIndexPage();
-        if (curr_page == nullptr)
-        {
-            return {nullptr, KvError::OutOfMem};
-        }
-        std::string_view page_view = idx_page_builder_.Finish();
-        memcpy(curr_page->PagePtr(), page_view.data(), page_view.size());
-        KvError err = FinishIndexPage(
-            curr_page, std::move(curr_page_key), page_id, elevate);
+        bool splited = prev_page.page_ != nullptr;
+        err = FinishIndexPage(prev_page, std::move(curr_page_key));
         if (err != KvError::NoError)
         {
-            shard->IndexManager()->FreeIndexPage(curr_page);
             return {nullptr, err};
         }
+        err = FlushIndexPage(prev_page.page_,
+                             std::move(prev_page.key_),
+                             prev_page.page_id_,
+                             splited);
+        if (err != KvError::NoError)
+        {
+            return {nullptr, err};
+        }
+        if (!splited)
+        {
+            new_root = prev_page.page_;
+        }
+        prev_page.page_ = nullptr;
     }
 
     if (stack_page != nullptr)
@@ -916,21 +868,69 @@ std::pair<MemIndexPage *, KvError> BatchWriteTask::Pop()
         stack_page->Unpin();
     }
     stack_.pop_back();
-    return {curr_page, KvError::NoError};
+    return {new_root, KvError::NoError};
 }
 
-KvError BatchWriteTask::FinishIndexPage(MemIndexPage *idx_page,
-                                        std::string idx_page_key,
-                                        PageId page_id,
-                                        bool elevate)
+KvError BatchWriteTask::FinishIndexPage(DirtyIndexPage &prev,
+                                        std::string cur_page_key)
+{
+    assert(!idx_page_builder_.IsEmpty());
+    const uint16_t cur_page_len = idx_page_builder_.CurrentSizeEstimate();
+    std::string_view page_view = idx_page_builder_.Finish();
+    if (prev.page_ != nullptr)
+    {
+        // Redistributing only if the current page length is smaller than
+        // one quarter of data_page_size and the previous page length is
+        // bigger than three quarter of data_page_size.
+        const uint16_t one_quarter = Options()->data_page_size >> 2;
+        const uint16_t three_quarter = Options()->data_page_size - one_quarter;
+        if (cur_page_len < one_quarter && prev.page_ != nullptr &&
+            prev.page_->RestartNum() > 1 &&
+            prev.page_->ContentLength() > three_quarter)
+        {
+            page_view = Redistribute(prev.page_, page_view, cur_page_key);
+        }
+
+        KvError err = FlushIndexPage(
+            prev.page_, std::move(prev.key_), prev.page_id_, true);
+        CHECK_KV_ERR(err);
+        prev.page_ = nullptr;
+        prev.page_id_ = MaxPageId;
+    }
+    MemIndexPage *cur_page = shard->IndexManager()->AllocIndexPage();
+    if (cur_page == nullptr)
+    {
+        return KvError::OutOfMem;
+    }
+    memcpy(cur_page->PagePtr(), page_view.data(), page_view.size());
+    prev.page_ = cur_page;
+    prev.key_ = std::move(cur_page_key);
+    return KvError::NoError;
+}
+
+BatchWriteTask::DirtyIndexPage::~DirtyIndexPage()
+{
+    if (page_ != nullptr)
+    {
+        assert(page_->IsDetached());
+        shard->IndexManager()->FreeIndexPage(page_);
+        page_ = nullptr;
+    }
+}
+
+KvError BatchWriteTask::FlushIndexPage(MemIndexPage *idx_page,
+                                       std::string idx_page_key,
+                                       PageId page_id,
+                                       bool split)
 {
     // Flushes the built index page.
     idx_page->SetPageId(page_id);
     KvError err = WritePage(idx_page);
     CHECK_KV_ERR(err);
 
-    // The index page is linked to the parent.
-    if (elevate)
+    // The parent node needs to be updated only when the index page splits and
+    // the current page is either a newly generated page or the root page.
+    if (split && (page_id == MaxPageId || stack_.size() == 1))
     {
         assert(stack_.size() >= 1);
         if (stack_.size() == 1)
@@ -1011,7 +1011,7 @@ Page BatchWriteTask::Redistribute(DataPage &prev_page,
     const uint16_t average_len = (prev_page_len + cur_page_len) >> 1;
     assert(prev_page_len >= average_len);
 
-    DataRegionIter iter({prev_page.PagePtr(), prev_page_len});
+    PageRegionIter iter({prev_page.PagePtr(), prev_page_len});
     uint16_t preserve_region_cnt = 0;
     // Number of bytes occupied by header and tailer (number of regions).
     uint16_t preserve_len = DataPageBuilder::HeaderSize() + sizeof(uint16_t);
@@ -1035,8 +1035,9 @@ Page BatchWriteTask::Redistribute(DataPage &prev_page,
     }
 
     // Merge last several regions of previous page with current page.
-    FastDataPageBuilder builder(Options());
-    for (builder.Reset(new_page.Ptr()); iter.Valid(); iter.Next())
+    FastPageBuilder builder(Options());
+    builder.Reset(new_page.Ptr(), PageType::Data);
+    for (; iter.Valid(); iter.Next())
     {
         std::string_view region = iter.Region();
         builder.AddRegion(region);
@@ -1051,7 +1052,7 @@ Page BatchWriteTask::Redistribute(DataPage &prev_page,
 
     // Update previous page in-place.
     iter.Reset({prev_page.PagePtr(), prev_page_len});
-    builder.Reset(prev_page.PagePtr());
+    builder.Reset(prev_page.PagePtr(), PageType::Data);
     for (uint16_t i = 0; i < preserve_region_cnt; i++)
     {
         // Copy preserved regions.
@@ -1067,6 +1068,83 @@ Page BatchWriteTask::Redistribute(DataPage &prev_page,
     const uint16_t new_page_len =
         DecodeFixed16(new_page.Ptr() + DataPage::page_size_offset);
     assert(prev_page_len + cur_page_len == preserve_len + new_page_len);
+#endif
+    return new_page;
+}
+
+std::string_view BatchWriteTask::Redistribute(MemIndexPage *prev_page,
+                                              std::string_view cur_page,
+                                              std::string &cur_page_key)
+{
+    const uint16_t prev_page_len = prev_page->ContentLength();
+    const uint16_t cur_page_len =
+        DecodeFixed16(cur_page.data() + DataPage::page_size_offset);
+    cur_page = cur_page.substr(0, cur_page_len);
+    assert(prev_page_len > cur_page_len);
+    const uint16_t average_len = (prev_page_len + cur_page_len) >> 1;
+    assert(prev_page_len >= average_len);
+
+    PageRegionIter region_iter({prev_page->PagePtr(), prev_page_len});
+    uint16_t preserve_region_cnt = 0;
+    // Number of bytes occupied by header and tailer (number of regions).
+    uint16_t preserve_len = IndexPageBuilder::HeaderSize() + sizeof(uint16_t);
+    while (preserve_len < average_len)
+    {
+        // Skip preserved regions for previous page.
+        assert(region_iter.Valid());
+        std::string_view region = region_iter.Region();
+        // Space for region data and region offset
+        preserve_len += region.size() + sizeof(uint16_t);
+        preserve_region_cnt++;
+        region_iter.Next();
+    }
+    assert(preserve_len <= prev_page_len);
+    if (preserve_len == prev_page_len)
+    {
+        // Corner case: can not move any region from the previous page.
+        return cur_page;
+    }
+
+    // Merge last several regions of previous page with current page.
+    bool is_leaf_idx = prev_page->IsPointingToLeaf();
+    IndexPageBuilder idx_builder(Options());
+    IndexPageIter iter_prev(prev_page, Options());
+    iter_prev.SeekToRestart(preserve_region_cnt);
+    iter_prev.Next();
+    std::string new_page_key(iter_prev.Key());
+    idx_builder.Add({}, iter_prev.GetPageId(), is_leaf_idx);
+    while (iter_prev.Next())
+    {
+        idx_builder.Add(iter_prev.Key(), iter_prev.GetPageId(), is_leaf_idx);
+    }
+    IndexPageIter iter_cur(cur_page, Options());
+    iter_cur.Next();
+    assert(iter_cur.Key().empty());
+    idx_builder.Add(cur_page_key, iter_cur.GetPageId(), is_leaf_idx);
+    while (iter_cur.Next())
+    {
+        idx_builder.Add(iter_cur.Key(), iter_cur.GetPageId(), is_leaf_idx);
+    }
+    std::string_view new_page = idx_builder.Finish();
+    idx_page_builder_.Swap(idx_builder);
+    cur_page_key = std::move(new_page_key);
+
+    // Update previous page in-place.
+    FastPageBuilder builder(Options());
+    builder.Reset(prev_page->PagePtr(), TypeOfPage(prev_page->PagePtr()));
+    region_iter.Reset({prev_page->PagePtr(), prev_page_len});
+    for (uint16_t i = 0; i < preserve_region_cnt; i++)
+    {
+        // Copy preserved regions.
+        std::string_view region = region_iter.Region();
+        builder.AddRegion(region);
+        region_iter.Next();
+    }
+    builder.Finish();
+
+#ifndef NDEBUG
+    assert(prev_page->RestartNum() == preserve_region_cnt);
+    assert(prev_page->ContentLength() == preserve_len);
 #endif
     return new_page;
 }

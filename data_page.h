@@ -132,10 +132,10 @@ private:
     uint64_t expire_ts_;
 };
 
-class DataRegionIter
+class PageRegionIter
 {
 public:
-    explicit DataRegionIter(std::string_view page);
+    explicit PageRegionIter(std::string_view page);
     void Reset(std::string_view page);
     std::string_view Region() const;
     bool Valid() const;

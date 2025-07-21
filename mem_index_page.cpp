@@ -136,6 +136,18 @@ IndexPageIter::IndexPageIter(const MemIndexPage *index_page,
 {
 }
 
+IndexPageIter::IndexPageIter(std::string_view page_view, const KvOptions *opts)
+    : comparator_(opts->comparator_),
+      page_(page_view),
+      restart_num_(DecodeFixed16(page_view.data() + page_view.size() -
+                                 sizeof(uint16_t))),
+      restart_offset_(page_view.size() - (1 + restart_num_) * sizeof(uint16_t)),
+      curr_offset_(MemIndexPage::leftmost_ptr_offset)
+{
+    assert(DecodeFixed16(page_view.data() + MemIndexPage::page_size_offset) ==
+           page_view.size());
+}
+
 bool IndexPageIter::ParseNextKey()
 {
     const char *pt = page_.data() + curr_offset_;

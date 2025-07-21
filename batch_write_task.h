@@ -33,10 +33,19 @@ private:
     KvError LoadApplyingPage(PageId page_id);
     std::pair<MemIndexPage *, KvError> Pop();
 
-    KvError FinishIndexPage(MemIndexPage *new_page,
-                            std::string idx_page_key,
-                            PageId page_id,
-                            bool elevate);
+    struct DirtyIndexPage
+    {
+        ~DirtyIndexPage();
+        std::string key_;
+        MemIndexPage *page_{nullptr};
+        PageId page_id_{MaxPageId};
+    };
+    KvError FinishIndexPage(DirtyIndexPage &prev_page,
+                            std::string cur_page_key);
+    KvError FlushIndexPage(MemIndexPage *new_page,
+                           std::string idx_page_key,
+                           PageId page_id,
+                           bool split);
     KvError FinishDataPage(std::string page_key, PageId page_id);
 
     /**
@@ -48,6 +57,9 @@ private:
      * @return The current page after redistributing.
      */
     Page Redistribute(DataPage &prev_page, std::string_view cur_page);
+    std::string_view Redistribute(MemIndexPage *prev_page,
+                                  std::string_view cur_page,
+                                  std::string &cur_page_key);
 
     /**
      * @brief Pops up the index stack such that the top index entry contains the

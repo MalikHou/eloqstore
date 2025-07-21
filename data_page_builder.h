@@ -77,11 +77,11 @@ private:
     int64_t last_timestamp_{0};
 };
 
-class FastDataPageBuilder
+class FastPageBuilder
 {
 public:
-    explicit FastDataPageBuilder(const KvOptions *options);
-    void Reset(char *ptr);
+    explicit FastPageBuilder(const KvOptions *options);
+    void Reset(char *ptr, PageType type);
     bool AddRegion(std::string_view region);
     size_t CurrentSize() const;
     void Finish();

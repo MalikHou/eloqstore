@@ -17,10 +17,14 @@ namespace test_util
 {
 std::string Key(uint64_t key, uint16_t len)
 {
+    const uint16_t digits = std::min(len, static_cast<uint16_t>(20));
     std::stringstream ss;
-    ss << std::setw(len) << std::setfill('0') << key;
+    ss << std::setw(digits) << std::setfill('0') << key;
     std::string kstr = ss.str();
-    assert(kstr.size() == len);
+    if (kstr.size() < len)
+    {
+        kstr.resize(len, '#');
+    }
     return kstr;
 }
 

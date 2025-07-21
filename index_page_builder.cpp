@@ -182,6 +182,17 @@ bool IndexPageBuilder::Add(std::string_view key,
     return true;
 }
 
+void IndexPageBuilder::Swap(IndexPageBuilder &other)
+{
+    std::swap(buffer_, other.buffer_);
+    std::swap(restarts_, other.restarts_);
+    std::swap(counter_, other.counter_);
+    std::swap(cnt_, other.cnt_);
+    std::swap(finished_, other.finished_);
+    std::swap(last_key_, other.last_key_);
+    std::swap(last_page_id_, other.last_page_id_);
+}
+
 size_t IndexPageBuilder::HeaderSize()
 {
     // 1 byte for the page type and the following 8 bytes for the leftmost
