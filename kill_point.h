@@ -1,8 +1,8 @@
+#pragma once
 
 #include <glog/logging.h>
 
 #include <cassert>
-#include <random>
 
 #ifndef NDEBUG
 #define TEST_KILL_POINT_WEIGHT(kill_point, odds_weight) \
@@ -20,10 +20,6 @@ class KillPoint
 {
 public:
     static KillPoint &GetInstance();
-    KillPoint() : gen(std::random_device{}()){};
-    KillPoint(const KillPoint &) = delete;
-    KillPoint &operator=(const KillPoint &) = delete;
-
     void TestKillRandom(std::string kill_point,
                         const char *file,
                         uint32_t line,
@@ -31,9 +27,5 @@ public:
                         uint32_t odds_weight = 1);
 
     uint32_t kill_odds_{0};
-
-private:
-    std::mt19937 gen;
-    std::uniform_int_distribution<> dis{0, 1000000000};
 };
 }  // namespace eloqstore

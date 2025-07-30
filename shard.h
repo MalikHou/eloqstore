@@ -1,6 +1,7 @@
 #pragma once
 
 #include <boost/context/pooled_fixedsize_stack.hpp>
+#include <boost/context/protected_fixedsize_stack.hpp>
 
 #include "circular_queue.h"
 #include "eloq_store.h"
@@ -74,7 +75,7 @@ private:
         task->status_ = TaskStatus::Ongoing;
         running_ = task;
         task->coro_ = boost::context::callcc(std::allocator_arg,
-                                             stack_pool_,
+                                             stack_allocator_,
                                              [lbd](continuation &&sink)
                                              {
                                                  shard->main_ = std::move(sink);
@@ -100,7 +101,11 @@ private:
     std::unique_ptr<AsyncIoManager> io_mgr_;
     IndexPageManager index_mgr_;
     TaskManager task_mgr_;
-    boost::context::pooled_fixedsize_stack stack_pool_;
+#ifndef NDEBUG
+    boost::context::protected_fixedsize_stack stack_allocator_;
+#else
+    boost::context::pooled_fixedsize_stack stack_allocator_;
+#endif
 
     class PendingWriteQueue
     {

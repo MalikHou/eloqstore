@@ -373,7 +373,7 @@ KvError IouringMgr::WritePage(const TableIdent &tbl_id,
     auto [fd_ref, err] = OpenOrCreateFD(tbl_id, file_id);
     CHECK_KV_ERR(err);
     fd_ref.Get()->dirty_ = true;
-    TEST_KILL_POINT("WritePage")
+    TEST_KILL_POINT_WEIGHT("WritePage", 1000)
 
     auto [fd, registered] = fd_ref.FdPair();
     WriteReq *req = write_req_pool_->Alloc(std::move(fd_ref), std::move(page));
@@ -428,7 +428,7 @@ KvError IouringMgr::WritePages(const TableIdent &tbl_id,
         return KvError::NoError;
     };
 
-    TEST_KILL_POINT("WritePages")
+    TEST_KILL_POINT_WEIGHT("WritePages", 100)
     size_t num_pages = pages.size();
     if (num_pages <= 256)
     {
@@ -652,7 +652,7 @@ std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::OpenOrCreateFD(
                     error = err;
                     if (dfd_ref != nullptr)
                     {
-                        TEST_KILL_POINT("OpenOrCreateFD:CreateFile")
+                        TEST_KILL_POINT_WEIGHT("OpenOrCreateFD:CreateFile", 100)
                         fd = CreateFile(std::move(dfd_ref), file_id);
                     }
                 }
@@ -1208,7 +1208,7 @@ int IouringMgr::WriteSnapshot(LruFD::Ref dir_fd,
         LOG(ERROR) << "write temporary file failed " << strerror(-res);
         return res;
     }
-    TEST_KILL_POINT_WEIGHT("AtomicWriteFile:Sync", 100)
+    TEST_KILL_POINT("AtomicWriteFile:Sync")
     res = Fdatasync({tmp_fd, false});
     if (res < 0)
     {
@@ -1218,7 +1218,7 @@ int IouringMgr::WriteSnapshot(LruFD::Ref dir_fd,
     }
 
     // Switch file on disk.
-    TEST_KILL_POINT_WEIGHT("AtomicWriteFile:Rename", 100)
+    TEST_KILL_POINT("AtomicWriteFile:Rename")
     res = Rename(dir_fd.FdPair(), tmpfile.c_str(), name.data());
     if (res < 0)
     {
@@ -1226,7 +1226,7 @@ int IouringMgr::WriteSnapshot(LruFD::Ref dir_fd,
         LOG(ERROR) << "rename temporary file failed " << strerror(-res);
         return res;
     }
-    TEST_KILL_POINT_WEIGHT("AtomicWriteFile:SyncDir", 100)
+    TEST_KILL_POINT("AtomicWriteFile:SyncDir")
     res = Fdatasync(dir_fd.FdPair());
     if (res < 0)
     {

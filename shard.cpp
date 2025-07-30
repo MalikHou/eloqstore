@@ -10,7 +10,7 @@ Shard::Shard(const EloqStore *store, size_t shard_id, uint32_t fd_limit)
       page_pool_(&store->options_),
       io_mgr_(AsyncIoManager::Instance(store, fd_limit)),
       index_mgr_(io_mgr_.get()),
-      stack_pool_(store->options_.coroutine_stack_size)
+      stack_allocator_(store->options_.coroutine_stack_size)
 {
 }
 
