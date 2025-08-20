@@ -51,21 +51,28 @@ void Shard::WorkLoop()
 
     while (true)
     {
+        while (true)
+        {
+            io_mgr_->Submit();
+            io_mgr_->PollComplete();
+            bool busy = ExecuteReadyTasks();
+            if (!busy)
+            {
+                // CPU is not busy, we can process more requests.
+                break;
+            }
+        }
+
         int nreqs = dequeue_requests();
         if (nreqs < 0)
         {
+            // Exit.
             break;
         }
         for (size_t i = 0; i < nreqs; i++)
         {
             OnReceivedReq(reqs[i]);
         }
-
-        io_mgr_->Submit();
-        io_mgr_->PollComplete();
-
-        ResumeScheduled();
-        PollFinished();
     }
 
     io_mgr_->Stop();
@@ -285,51 +292,49 @@ void Shard::ProcessReq(KvRequest *req)
     }
 }
 
-void Shard::ResumeScheduled()
+bool Shard::ExecuteReadyTasks()
 {
-    while (scheduled_.Size() > 0)
+    bool busy = ready_tasks_.Size() > 0;
+    while (ready_tasks_.Size() > 0)
     {
-        KvTask *task = scheduled_.Peek();
-        scheduled_.Dequeue();
+        KvTask *task = ready_tasks_.Peek();
+        ready_tasks_.Dequeue();
         assert(task->status_ == TaskStatus::Ongoing);
         running_ = task;
         task->coro_ = task->coro_.resume();
+        if (task->status_ == TaskStatus::Finished)
+        {
+            OnTaskFinished(task);
+        }
     }
     running_ = nullptr;
+    return busy;
 }
 
-void Shard::PollFinished()
+void Shard::OnTaskFinished(KvTask *task)
 {
-    while (finished_.Size() > 0)
+    if (auto *wtask = dynamic_cast<WriteTask *>(task); wtask != nullptr)
     {
-        KvTask *task = finished_.Peek();
-        finished_.Dequeue();
-
-        if (auto *wtask = dynamic_cast<WriteTask *>(task); wtask != nullptr)
+        auto it = pending_queues_.find(wtask->TableId());
+        assert(it != pending_queues_.end());
+        task_mgr_.FreeTask(task);
+        PendingWriteQueue &pending_q = it->second;
+        if (pending_q.Empty())
         {
-            OnWriteFinished(wtask->TableId());
+            // No more write requests, remove the pending queue.
+            pending_queues_.erase(it);
         }
-
-        // Note: You can recycle the stack of this coroutine here if needed.
+        else
+        {
+            WriteRequest *req = pending_q.PopFront();
+            // Continue execute the next pending write request.
+            ProcessReq(req);
+        }
+    }
+    else
+    {
         task_mgr_.FreeTask(task);
     }
-}
-
-void Shard::OnWriteFinished(const TableIdent &tbl_id)
-{
-    auto it = pending_queues_.find(tbl_id);
-    assert(it != pending_queues_.end());
-    PendingWriteQueue &pending_q = it->second;
-    if (pending_q.Empty())
-    {
-        // No more write requests, remove the pending queue.
-        pending_queues_.erase(it);
-        return;
-    }
-
-    WriteRequest *req = pending_q.PopFront();
-    // Continue execute the next pending write request.
-    ProcessReq(req);
 }
 
 #ifdef ELOQ_MODULE_ENABLED
@@ -353,8 +358,7 @@ void Shard::WorkOneRound()
     io_mgr_->Submit();
     io_mgr_->PollComplete();
 
-    ResumeScheduled();
-    PollFinished();
+    ExecuteReadyTasks();
 }
 #endif
 
