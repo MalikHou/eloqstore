@@ -51,8 +51,9 @@ struct KvOptions
     uint32_t io_queue_size = 4096;
     /**
      * @brief Max amount of inflight write IO per shard.
+     * Only take effect in non-append write mode.
      */
-    uint32_t max_inflight_write = 64 << 10;
+    uint32_t max_inflight_write = 32 << 10;
     /**
      * @brief The maximum number of pages per batch for the write task.
      */
@@ -141,8 +142,15 @@ struct KvOptions
     size_t DataFileSize() const;
     /**
      * @brief Amount of pages per data file (1 << pages_per_file_shift).
+     * It is recommended to set a smaller file size like 4MB in append write
+     * mode, and ideally, each batch write operation should exactly fill a new
+     * file, as this will make uploading to S3 the most efficient.
+     * For non-append mode, it is advisable to set a larger file size like
+     * 1GB to avoid the need for fdatasync to be executed for each small file
+     * with minor modifications, ideally every partition consists of exactly one
+     * data file.
      */
-    uint8_t pages_per_file_shift = 11;  // 2048
+    uint8_t pages_per_file_shift = 18;
 
     /**
      * @brief Amount of pointers stored in overflow page.
