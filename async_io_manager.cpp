@@ -568,42 +568,12 @@ IouringMgr::LruFD::Ref IouringMgr::GetOpenedFD(const TableIdent &tbl_id,
     {
         return nullptr;
     }
+    // This file may be in the process of being closed.
     LruFD::Ref fd_ref(&it_fd->second, this);
-    while (fd_ref.Get()->fd_ < 0)
-    {
-        switch (fd_ref.Get()->fd_)
-        {
-        case LruFD::FdEmpty:
-            return nullptr;
-        case LruFD::FdLocked:
-            fd_ref.Get()->waiting_.Wait(ThdTask());
-            break;
-        default:
-            assert(false);
-        }
-    }
-    return fd_ref;
-}
-
-IouringMgr::LruFD::Ref IouringMgr::GetFDSlot(const TableIdent &tbl_id,
-                                             FileId file_id)
-{
-    auto it_tbl = tables_.find(tbl_id);
-    if (it_tbl == tables_.end())
-    {
-        auto [it, _] = tables_.try_emplace(tbl_id);
-        it->second.tbl_id_ = &it->first;
-        it_tbl = it;
-    }
-    PartitionFiles *tbl = &it_tbl->second;
-
-    auto it_fd = tbl->fds_.find(file_id);
-    if (it_fd == tbl->fds_.end())
-    {
-        auto [it, _] = tbl->fds_.try_emplace(file_id, tbl, file_id);
-        it_fd = it;
-    }
-    return {&it_fd->second, this};
+    fd_ref.Get()->mu_.Lock();
+    bool empty = fd_ref.Get()->fd_ == LruFD::FdEmpty;
+    fd_ref.Get()->mu_.Unlock();
+    return empty ? nullptr : fd_ref;
 }
 
 std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::OpenFD(
@@ -615,90 +585,89 @@ std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::OpenFD(
 std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::OpenOrCreateFD(
     const TableIdent &tbl_id, FileId file_id, bool direct, bool create)
 {
-    LruFD::Ref lru_fd = GetFDSlot(tbl_id, file_id);
-    assert(lru_fd != nullptr);
-
-    while (lru_fd.Get()->fd_ < 0)
+    auto it_tbl = tables_.find(tbl_id);
+    if (it_tbl == tables_.end())
     {
-        switch (lru_fd.Get()->fd_)
+        auto [it, _] = tables_.try_emplace(tbl_id);
+        it->second.tbl_id_ = &it->first;
+        it_tbl = it;
+    }
+    PartitionFiles *tbl = &it_tbl->second;
+    auto it_fd = tbl->fds_.find(file_id);
+    if (it_fd == tbl->fds_.end())
+    {
+        auto [it, _] = tbl->fds_.try_emplace(file_id, tbl, file_id);
+        it_fd = it;
+    }
+    LruFD::Ref lru_fd(&it_fd->second, this);
+
+    // Avoid multiple coroutines from concurrently opening the same file
+    // duplicately.
+    lru_fd.Get()->mu_.Lock();
+    if (lru_fd.Get()->fd_ != LruFD::FdEmpty)
+    {
+        // This file have already been opened by previous coroutine.
+        lru_fd.Get()->mu_.Unlock();
+        return {std::move(lru_fd), KvError::NoError};
+    }
+
+    int fd;
+    KvError error = KvError::NoError;
+    if (file_id == LruFD::kDirectory)
+    {
+        FdIdx root_fd = GetRootFD(tbl_id);
+        std::string dirname = tbl_id.ToString();
+        fd = OpenAt(root_fd, dirname.c_str(), oflags_dir);
+        if (fd == -ENOENT && create)
         {
-        case LruFD::FdEmpty:
-        {
-            // Note: Never yield between compare FdEmpty and set FdLocked
-            lru_fd.Get()->fd_ = LruFD::FdLocked;
-
-            int fd;
-            KvError error = KvError::NoError;
-            if (file_id == LruFD::kDirectory)
-            {
-                FdIdx root_fd = GetRootFD(tbl_id);
-                std::string dirname = tbl_id.ToString();
-                fd = OpenAt(root_fd, dirname.c_str(), oflags_dir);
-                if (fd == -ENOENT && create)
-                {
-                    fd = MakeDir(root_fd, dirname.c_str());
-                }
-            }
-            else
-            {
-                fd = OpenFile(tbl_id, file_id, direct);
-                if (fd == -ENOENT && create)
-                {
-                    // This must be data file because manifest should always be
-                    // created by call WriteSnapshot.
-                    assert(file_id <= LruFD::kMaxDataFile);
-                    auto [dfd_ref, err] =
-                        OpenOrCreateFD(tbl_id, LruFD::kDirectory);
-                    error = err;
-                    if (dfd_ref != nullptr)
-                    {
-                        TEST_KILL_POINT_WEIGHT("OpenOrCreateFD:CreateFile", 100)
-                        fd = CreateFile(std::move(dfd_ref), file_id);
-                    }
-                }
-            }
-
-            if (fd < 0)
-            {
-                // Open or create failed.
-                if (error == KvError::NoError)
-                {
-                    error = ToKvError(fd);
-                }
-                if (file_id == LruFD::kManifest && error == KvError::NotFound)
-                {
-                    // Manifest not found, this is normal so don't log it.
-                }
-                else
-                {
-                    LOG(ERROR) << "open failed " << tbl_id << " file id "
-                               << file_id << " : " << ErrorString(error);
-                }
-                lru_fd.Get()->fd_ = LruFD::FdEmpty;
-                lru_fd.Get()->waiting_.WakeAll();
-                return {nullptr, error};
-            }
-
-            if (file_id != LruFD::kDirectory)
-            {
-                lru_fd.Get()->reg_idx_ = RegisterFile(fd);
-            }
-
-            lru_fd.Get()->fd_ = fd;
-            // notify all waiting tasks success
-            lru_fd.Get()->waiting_.WakeAll();
-            break;
+            fd = MakeDir(root_fd, dirname.c_str());
         }
-        case LruFD::FdLocked:
+    }
+    else
+    {
+        fd = OpenFile(tbl_id, file_id, direct);
+        if (fd == -ENOENT && create)
         {
-            lru_fd.Get()->waiting_.Wait(ThdTask());
-            break;
-        }
-        default:
-            LOG(FATAL) << "Unexpected fd status " << lru_fd.Get()->fd_;
+            // This must be data file because manifest should always be
+            // created by call WriteSnapshot.
+            assert(file_id <= LruFD::kMaxDataFile);
+            auto [dfd_ref, err] = OpenOrCreateFD(tbl_id, LruFD::kDirectory);
+            error = err;
+            if (dfd_ref != nullptr)
+            {
+                TEST_KILL_POINT_WEIGHT("OpenOrCreateFD:CreateFile", 100)
+                fd = CreateFile(std::move(dfd_ref), file_id);
+            }
         }
     }
 
+    if (fd < 0)
+    {
+        // Open or create failed.
+        if (error == KvError::NoError)
+        {
+            error = ToKvError(fd);
+        }
+        if (file_id == LruFD::kManifest && error == KvError::NotFound)
+        {
+            // Manifest not found, this is normal so don't log it.
+        }
+        else
+        {
+            LOG(ERROR) << "open failed " << tbl_id << " file id " << file_id
+                       << " : " << ErrorString(error);
+        }
+        lru_fd.Get()->mu_.Unlock();
+        return {nullptr, error};
+    }
+
+    if (file_id != LruFD::kDirectory)
+    {
+        lru_fd.Get()->reg_idx_ = RegisterFile(fd);
+    }
+
+    lru_fd.Get()->fd_ = fd;
+    lru_fd.Get()->mu_.Unlock();
     return {std::move(lru_fd), KvError::NoError};
 }
 
@@ -1024,7 +993,6 @@ int IouringMgr::Close(int fd)
 KvError IouringMgr::CloseFile(LruFD::Ref fd_ref)
 {
     LruFD *lru_fd = fd_ref.Get();
-    assert(lru_fd->waiting_.Empty());
     const int fd = lru_fd->fd_;
     if (fd < 0)
     {
@@ -1033,14 +1001,13 @@ KvError IouringMgr::CloseFile(LruFD::Ref fd_ref)
     FdIdx fd_idx = lru_fd->FdPair();
 
     // Make sure no tasks can use this fd during closing.
-    lru_fd->fd_ = LruFD::FdLocked;
+    lru_fd->mu_.Lock();
 
     if (lru_fd->dirty_)
     {
         if (KvError err = SyncFile(fd_ref); err != KvError::NoError)
         {
-            lru_fd->fd_ = fd;
-            lru_fd->waiting_.WakeAll();
+            lru_fd->mu_.Unlock();
             return err;
         }
     }
@@ -1053,12 +1020,11 @@ KvError IouringMgr::CloseFile(LruFD::Ref fd_ref)
 
     if (int res = Close(fd); res < 0)
     {
-        lru_fd->fd_ = fd;
-        lru_fd->waiting_.WakeAll();
+        lru_fd->mu_.Unlock();
         return ToKvError(res);
     }
     lru_fd->fd_ = LruFD::FdEmpty;
-    lru_fd->waiting_.WakeAll();
+    lru_fd->mu_.Unlock();
     return KvError::NoError;
 }
 
@@ -1925,7 +1891,7 @@ void CloudStoreMgr::EnqueClosedFile(FileKey key)
     lru_file_head_.EnqueNext(&it->second);
 }
 
-bool CloudStoreMgr ::HasEvictableFile() const
+bool CloudStoreMgr::HasEvictableFile() const
 {
     return lru_file_tail_.prev_ != &lru_file_head_;
 }
