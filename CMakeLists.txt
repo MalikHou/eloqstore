@@ -6,6 +6,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Coverage option
+option(WITH_COVERAGE "Enable code coverage" OFF)
+if(WITH_COVERAGE)
+    message(STATUS "Building with coverage flags")
+    add_compile_options(-O0 -g --coverage)
+    add_link_options(--coverage)
+endif()
+
 option(WITH_ASAN "build with ASAN" OFF)
 if (WITH_ASAN)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
