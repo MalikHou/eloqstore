@@ -9,29 +9,6 @@
 using namespace test_util;
 namespace chrono = std::chrono;
 
-const eloqstore::KvOptions cloud_options = {
-    .manifest_limit = 1 << 20,
-    .fd_limit = 30 + eloqstore::num_reserved_fd,
-    .local_space_limit = 200 << 20,  // 100MB
-    .store_path = {"/tmp/test-data"},
-    .cloud_store_path = "docker-minio:eloqstore/unit-test",
-    .pages_per_file_shift = 8,  // 1MB per datafile
-    .data_append_mode = true,
-};
-
-const eloqstore::KvOptions cloud_archive_opts = {
-    .manifest_limit = 1 << 20,
-    .fd_limit = 30 + eloqstore::num_reserved_fd,
-    .num_retained_archives = 1,
-    .archive_interval_secs = 0,  // send archive request immediately
-    .file_amplify_factor = 2,
-    .local_space_limit = 200 << 20,  // 200MB
-    .store_path = {"/tmp/test-data"},
-    .cloud_store_path = "docker-minio:eloqstore/unit-test",
-    .pages_per_file_shift = 8,
-    .data_append_mode = true,
-};
-
 TEST_CASE("simple cloud store", "[cloud]")
 {
     eloqstore::EloqStore *store = InitStore(cloud_options);
