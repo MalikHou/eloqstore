@@ -2,6 +2,11 @@
 
 ## 🔨 Compile
 
+### Install jsoncpp
+```shell
+sudo apt install libjsoncpp-dev
+```
+
 ### Debug Mode
 ```shell
 mkdir build
