@@ -93,10 +93,8 @@ make install
    eloq_store_data_path_list={your_eloqstore_data_path1, your_eloqstore_data_path2,...}
    # Max number of open files used by eloqstore(default: 1024)
    eloq_store_open_files_limit=1024
-   # Number of background file GC threads.(default: 1)
-   eloq_store_gc_threads=1
    # Max amount of cached index pages
-   eloq_store_index_buffer_pool_size=131072
+   eloq_store_index_buffer_pool_size=536870912
    ```
 
 2. **Start EloqKV:**
@@ -126,8 +124,8 @@ make install
    # Max number of open files used by eloqstore(default: 1024)
    eloq_store_open_files_limit=1024
    eloq_store_cloud_store_path=eloqstore_cloud:dss-eloqstore-dev
-   # Max amount of cached index pages
-   eloq_store_index_buffer_pool_size=131072
+   # Max amount of cached index pages (supports KB/MB/GB units, e.g., 32MB)
+   eloq_store_index_buffer_pool_size=536870912
    ```
 
 2. **Install MinIO and start:**

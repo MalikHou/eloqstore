@@ -1,11 +1,87 @@
 #include "kv_options.h"
 
+#include <glog/logging.h>
+
+#include <bit>
 #include <boost/algorithm/string.hpp>
+#include <catch2/catch_test_macros.hpp>
+#include <cctype>
+#include <charconv>
+#include <limits>
+#include <string>
+#include <string_view>
+#include <system_error>
 
 #include "inih/cpp/INIReader.h"
 
 namespace eloqstore
 {
+// Helper function to parse size with units (KB, MB, GB, TB)
+static uint64_t ParseSizeWithUnit(std::string_view s)
+{
+    auto is_space = [](unsigned char c) { return std::isspace(c); };
+
+    while (!s.empty() && is_space(static_cast<unsigned char>(s.front())))
+    {
+        s.remove_prefix(1);
+    }
+    while (!s.empty() && is_space(static_cast<unsigned char>(s.back())))
+    {
+        s.remove_suffix(1);
+    }
+    if (s.empty())
+    {
+        return 0;
+    }
+
+    uint64_t mul = 1;
+
+    if (s.size() >= 2)
+    {
+        const char c1 =
+            std::toupper(static_cast<unsigned char>(s[s.size() - 2]));
+        const char c2 =
+            std::toupper(static_cast<unsigned char>(s[s.size() - 1]));
+        if (c1 == 'K' && c2 == 'B')
+        {
+            mul = 1ULL << 10;
+            s.remove_suffix(2);
+        }
+        else if (c1 == 'M' && c2 == 'B')
+        {
+            mul = 1ULL << 20;
+            s.remove_suffix(2);
+        }
+        else if (c1 == 'G' && c2 == 'B')
+        {
+            mul = 1ULL << 30;
+            s.remove_suffix(2);
+        }
+        else if (c1 == 'T' && c2 == 'B')
+        {
+            mul = 1ULL << 40;
+            s.remove_suffix(2);
+        }
+    }
+
+    while (!s.empty() && is_space(static_cast<unsigned char>(s.back())))
+    {
+        s.remove_suffix(1);
+    }
+    if (s.empty())
+    {
+        return 0;
+    }
+
+    uint64_t v = 0;
+    auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (ec != std::errc() || ptr != s.data() + s.size())
+    {
+        return 0;
+    }
+
+    return v * mul;
+}
 int KvOptions::LoadFromIni(const char *path)
 {
     INIReader reader(path);
@@ -45,13 +121,13 @@ int KvOptions::LoadFromIni(const char *path)
     }
     if (reader.HasValue(sec_run, "index_buffer_pool_size"))
     {
-        index_buffer_pool_size =
-            reader.GetUnsigned(sec_run, "index_buffer_pool_size", UINT32_MAX);
+        std::string index_buffer_pool_size_str =
+            reader.Get(sec_run, "index_buffer_pool_size", "");
+        index_buffer_pool_size = ParseSizeWithUnit(index_buffer_pool_size_str);
     }
     if (reader.HasValue(sec_run, "manifest_limit"))
     {
-        manifest_limit =
-            reader.GetUnsigned(sec_run, "manifest_limit", 16 << 20);
+        manifest_limit = reader.GetUnsigned(sec_run, "manifest_limit", 8 * MB);
     }
     if (reader.HasValue(sec_run, "fd_limit"))
     {
@@ -78,7 +154,7 @@ int KvOptions::LoadFromIni(const char *path)
     if (reader.HasValue(sec_run, "coroutine_stack_size"))
     {
         coroutine_stack_size =
-            reader.GetUnsigned(sec_run, "coroutine_stack_size", 16 * 1024);
+            reader.GetUnsigned(sec_run, "coroutine_stack_size", 16 * KB);
     }
 
     if (reader.HasValue(sec_run, "num_retained_archives"))
@@ -100,10 +176,6 @@ int KvOptions::LoadFromIni(const char *path)
     {
         file_amplify_factor =
             reader.GetUnsigned(sec_run, "file_amplify_factor", 2);
-    }
-    if (reader.HasValue(sec_run, "num_gc_threads"))
-    {
-        num_gc_threads = reader.GetUnsigned(sec_run, "num_gc_threads", 1);
     }
     if (reader.HasValue(sec_run, "local_space_limit"))
     {
@@ -137,13 +209,44 @@ int KvOptions::LoadFromIni(const char *path)
     }
     if (reader.HasValue(sec_permanent, "data_page_size"))
     {
-        data_page_size =
-            reader.GetUnsigned(sec_permanent, "data_page_size", 1 << 12);
+        std::string value_str =
+            reader.Get(sec_permanent, "data_page_size", "4KB");
+        uint64_t parsed_size = ParseSizeWithUnit(value_str);
+        data_page_size = (parsed_size > 0) ? parsed_size : (1 << 12);
     }
-    if (reader.HasValue(sec_permanent, "pages_per_file_shift"))
+    if (reader.HasValue(sec_permanent, "data_file_size"))
     {
-        pages_per_file_shift =
-            reader.GetUnsigned(sec_permanent, "pages_per_file_shift", 11);
+        std::string value_str =
+            reader.Get(sec_permanent, "data_file_size", "8MB");
+        uint64_t parsed_size = ParseSizeWithUnit(value_str);
+        uint32_t data_file_size = (parsed_size > 0) ? parsed_size : (8 * MB);
+        // Calculate pages_per_file_shift from data_file_size
+        // data_file_size = data_page_size * (1 << pages_per_file_shift)
+        // So pages_per_file_shift = floor(log2(data_file_size /
+        // data_page_size))
+        uint32_t pages_per_file = data_file_size / data_page_size;
+        if (pages_per_file == 0)
+        {
+            LOG(WARNING) << "data_file_size " << data_file_size
+                         << " is smaller than data_page_size " << data_page_size
+                         << ", falling back to one page.";
+            pages_per_file_shift = 0;
+        }
+        else
+        {
+            pages_per_file_shift = std::numeric_limits<uint32_t>::digits -
+                                   std::countl_zero(pages_per_file) - 1;
+            if ((pages_per_file & (pages_per_file - 1)) != 0)
+            {
+                uint32_t adjusted_pages = 1U << pages_per_file_shift;
+                uint64_t adjusted_size =
+                    static_cast<uint64_t>(adjusted_pages) * data_page_size;
+                LOG(WARNING) << "data_file_size " << data_file_size
+                             << " is not a power-of-two multiple of page size "
+                             << data_page_size << ", rounded down to "
+                             << adjusted_size << " bytes.";
+            }
+        }
     }
     if (reader.HasValue(sec_permanent, "overflow_pointers"))
     {
@@ -176,7 +279,6 @@ bool KvOptions::operator==(const KvOptions &other) const
            archive_interval_secs == other.archive_interval_secs &&
            max_archive_tasks == other.max_archive_tasks &&
            file_amplify_factor == other.file_amplify_factor &&
-           num_gc_threads == other.num_gc_threads &&
            local_space_limit == other.local_space_limit &&
            reserve_space_ratio == other.reserve_space_ratio &&
            store_path == other.store_path &&
