@@ -10,6 +10,9 @@
 #include <vector>
 
 #include "async_io_manager.h"
+#ifdef ELOQ_MODULE_ENALBED
+#include "bthread/eloq_module.h"
+#endif
 #include "common.h"
 #include "eloq_store.h"
 #include "error.h"
@@ -26,7 +29,8 @@ PrewarmTask::PrewarmTask(CloudStoreMgr *io_mgr) : io_mgr_(io_mgr)
 
 bool PrewarmTask::HasPending() const
 {
-    return !stop_ && next_index_ < pending_.size();
+    return !stop_.load(std::memory_order_acquire) &&
+           next_index_ < pending_.size();
 }
 
 bool PrewarmTask::PopNext(PrewarmFile &file)
@@ -306,7 +310,10 @@ void PrewarmService::PrewarmCloudCache()
         auto &files = shard_files[i];
         DLOG(INFO) << "files size :" << files.size();
         cloud_mgr->prewarm_task_.pending_ = std::move(files);
-        cloud_mgr->prewarm_task_.stop_ = false;
+        cloud_mgr->prewarm_task_.stop_.store(false, std::memory_order_release);
+#ifdef ELOQ_MODULE_ENABLED
+        eloq::EloqModule::NotifyWorker(i);
+#endif
     }
 }
 
