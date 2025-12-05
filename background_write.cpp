@@ -89,7 +89,6 @@ KvError BackgroundWrite::CompactDataFile()
 
     err = shard->IndexManager()->MakeCowRoot(tbl_ident_, cow_meta_);
     CHECK_KV_ERR(err);
-
     PageMapper *mapper = cow_meta_.mapper_.get();
 
     allocator = static_cast<AppendAllocator *>(mapper->FilePgAllocator());

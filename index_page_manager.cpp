@@ -5,7 +5,9 @@
 #include <cassert>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "async_io_manager.h"
 #include "error.h"
@@ -468,7 +470,43 @@ void IndexPageManager::FinishIo(MappingSnapshot *mapping,
 KvError IndexPageManager::SeekIndex(MappingSnapshot *mapping,
                                     PageId page_id,
                                     std::string_view key,
-                                    uint32_t &result)
+                                    std::span<PageId> results,
+                                    size_t &result_size_dst)
+{
+    auto [node, err] = FindPage(mapping, page_id);
+    CHECK_KV_ERR(err);
+    IndexPageIter idx_it{node, Options()};
+    idx_it.Seek(key);
+    PageId child_id = idx_it.GetPageId();
+    if (!node->IsPointingToLeaf())
+    {
+        return SeekIndex(mapping, child_id, key, results, result_size_dst);
+    }
+
+    size_t result_size = 0;
+    const size_t result_limit = results.size();
+    if (child_id != MaxPageId && result_size < result_limit)
+    {
+        results[result_size++] = child_id;
+    }
+
+    while (result_size < result_limit && idx_it.HasNext() && idx_it.Next())
+    {
+        child_id = idx_it.GetPageId();
+        if (child_id == MaxPageId)
+        {
+            break;
+        }
+        results[result_size++] = child_id;
+    }
+    result_size_dst = result_size;
+    return KvError::NoError;
+}
+
+KvError IndexPageManager::SeekIndex(MappingSnapshot *mapping,
+                                    PageId page_id,
+                                    std::string_view key,
+                                    PageId &result)
 {
     auto [node, err] = FindPage(mapping, page_id);
     CHECK_KV_ERR(err);

@@ -699,8 +699,8 @@ std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::OpenOrCreateFD(
     }
     LruFD::Ref lru_fd(&it_fd->second, this);
 
-    // Avoid multiple coroutines from concurrently opening the same file
-    // duplicately.
+    // Avoid multiple coroutines from concurrently opening or closing the same
+    // file duplicately.
     lru_fd.Get()->mu_.Lock();
     if (lru_fd.Get()->fd_ != LruFD::FdEmpty)
     {

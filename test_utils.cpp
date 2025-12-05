@@ -348,8 +348,8 @@ void MapVerifier::Scan(std::string_view begin,
         const uint64_t now_ts = utils::UnixTs<chrono::milliseconds>();
         while (it != it_end && it->first < next_key)
         {
-            CHECK(it->second.expire_ts_ != 0);
-            CHECK(it->second.expire_ts_ <= now_ts);
+            CHECK(it->second.expire_ts_ != 0) << "key:" << it->first;
+            CHECK(it->second.expire_ts_ <= now_ts) << "key:" << it->first;
             answer_.erase(it++);
         }
     };

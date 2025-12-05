@@ -1,7 +1,7 @@
 #pragma once
 
-#include <cstdint>
 #include <memory>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -63,7 +63,13 @@ public:
     KvError SeekIndex(MappingSnapshot *mapping,
                       PageId page_id,
                       std::string_view key,
-                      uint32_t &result);
+                      PageId &result);
+
+    KvError SeekIndex(MappingSnapshot *mapping,
+                      PageId page_id,
+                      std::string_view key,
+                      std::span<PageId> results,
+                      size_t &result_size);
 
     const KvOptions *Options() const;
     AsyncIoManager *IoMgr() const;

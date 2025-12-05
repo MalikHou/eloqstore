@@ -25,7 +25,7 @@ DataPage::DataPage(DataPage &&rhs)
 {
 }
 
-DataPage &DataPage::operator=(DataPage &&other)
+DataPage &DataPage::operator=(DataPage &&other) noexcept
 {
     if (this != &other)
     {

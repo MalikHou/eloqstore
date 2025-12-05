@@ -124,6 +124,7 @@ make install
    eloq_store_data_path_list={your_eloqstore_data_path1, your_eloqstore_data_path2,...}
    # Max number of open files used by eloqstore(default: 1024), cannot be larger than maxclients
    eloq_store_open_files_limit=1024
+   # The first part is the header of the rclone configuration file, and the second part is the bucket name.
    eloq_store_cloud_store_path=eloqstore_cloud:dss-eloqstore-dev
    # Max amount of cached index pages (supports KB/MB/GB units, e.g., 32MB)
    eloq_store_index_buffer_pool_size=32MB
@@ -131,6 +132,7 @@ make install
    eloq_store_local_space_limit=10GB
    # Cloud mode must use append mode.
    eloq_store_data_append_mode=true
+   eloq_store_cloud_store_daemon_ports=5572,5573,5574,5575,5576,5577,5578,5579,5580,5581
    ```
 
 2. **Install MinIO and start:**

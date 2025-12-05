@@ -1,45 +1,65 @@
 #include "scan_task.h"
 
+#include <glog/logging.h>
+
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "error.h"
+#include "kv_options.h"
 #include "page_mapper.h"
 #include "shard.h"
 
 namespace eloqstore
 {
-ScanIterator::ScanIterator(const TableIdent &tbl_id)
-    : tbl_id_(tbl_id), iter_(nullptr, Options())
+ScanIterator::ScanIterator(const TableIdent &tbl_id,
+                           std::vector<DataPage> &prefetched_pages,
+                           std::vector<Page> &read_pages,
+                           size_t prefetch_pages)
+    : tbl_id_(tbl_id),
+      prefetch_page_num_(prefetch_pages),
+      mapping_(),
+      iter_(nullptr, Options()),
+      prefetched_pages_(&prefetched_pages),
+      read_pages_(&read_pages)
 {
+    prefetched_pages_->reserve(prefetch_page_num_);
+    read_pages_->reserve(prefetch_page_num_);
+}
+
+ScanIterator::~ScanIterator()
+{
+    ClearIndexStack();
 }
 
 KvError ScanIterator::Seek(std::string_view key, bool ttl)
 {
+    ResetPrefetchState();
+    ClearIndexStack();
     auto [meta, err] = shard->IndexManager()->FindRoot(tbl_id_);
     CHECK_KV_ERR(err);
-    PageId root_id = ttl ? meta->ttl_root_id_ : meta->root_id_;
-    if (root_id == MaxPageId)
+    root_id_ = ttl ? meta->ttl_root_id_ : meta->root_id_;
+    if (root_id_ == MaxPageId)
     {
         return KvError::EndOfFile;
     }
     compression_ = meta->compression_.get();
     mapping_ = meta->mapper_->GetMappingSnapshot();
 
-    PageId page_id;
-    err =
-        shard->IndexManager()->SeekIndex(mapping_.get(), root_id, key, page_id);
+    err = BuildIndexStack(key);
     CHECK_KV_ERR(err);
-    assert(page_id != MaxPageId);
-    FilePageId file_page = mapping_->ToFilePage(page_id);
-    auto [page, err_load] = LoadDataPage(tbl_id_, page_id, file_page);
-    CHECK_KV_ERR(err_load);
 
-    data_page_ = std::move(page);
-    iter_.Reset(&data_page_, Options()->data_page_size);
+    err = PrefetchFromStack();
+    CHECK_KV_ERR(err);
+
+    err = ConsumePrefetchedPage();
+    CHECK_KV_ERR(err);
 
     if (!iter_.Seek(key))
     {
@@ -49,23 +69,198 @@ KvError ScanIterator::Seek(std::string_view key, bool ttl)
     return KvError::NoError;
 }
 
+void ScanIterator::ResetPrefetchState()
+{
+    prefetched_offset_ = 0;
+    prefetched_count_ = 0;
+    prefetched_pages_->clear();
+    read_pages_->clear();
+}
+
+void ScanIterator::ClearIndexStack()
+{
+    while (!index_stack_.empty())
+    {
+        IndexFrame &frame = index_stack_.back();
+        if (frame.page != nullptr)
+        {
+            frame.page->Unpin();
+        }
+        index_stack_.pop_back();
+    }
+}
+
+KvError ScanIterator::BuildIndexStack(std::string_view key)
+{
+    PageId page_id = root_id_;
+    while (true)
+    {
+        auto [node, err] =
+            shard->IndexManager()->FindPage(mapping_.get(), page_id);
+        if (err != KvError::NoError)
+        {
+            ClearIndexStack();
+            return err;
+        }
+        node->Pin();
+        IndexPageIter idx_it{node, Options()};
+        idx_it.Seek(key);
+        index_stack_.push_back(IndexFrame{node, idx_it});
+        if (idx_it.GetPageId() == MaxPageId)
+        {
+            ClearIndexStack();
+            return KvError::EndOfFile;
+        }
+        PageId child_id = idx_it.GetPageId();
+        if (node->IsPointingToLeaf())
+        {
+            return KvError::NoError;
+        }
+        page_id = child_id;
+    }
+}
+
+KvError ScanIterator::AdvanceToNextLeaf()
+{
+    while (!index_stack_.empty())
+    {
+        auto &frame = index_stack_.back();
+        if (frame.iter.HasNext() && frame.iter.Next())
+        {
+            PageId child_id = frame.iter.GetPageId();
+            if (frame.page->IsPointingToLeaf())
+            {
+                return KvError::NoError;
+            }
+
+            PageId descend_id = child_id;
+            while (true)
+            {
+                auto [node, err] =
+                    shard->IndexManager()->FindPage(mapping_.get(), descend_id);
+                if (err != KvError::NoError)
+                {
+                    ClearIndexStack();
+                    return err;
+                }
+                node->Pin();
+                IndexPageIter it{node, Options()};
+                bool ok = it.Next();
+                CHECK(ok);
+                index_stack_.push_back(IndexFrame{node, it});
+                PageId next_child = it.GetPageId();
+                if (node->IsPointingToLeaf())
+                {
+                    return KvError::NoError;
+                }
+                descend_id = next_child;
+            }
+        }
+        frame.page->Unpin();
+        index_stack_.pop_back();
+    }
+    return KvError::EndOfFile;
+}
+
+KvError ScanIterator::PrefetchFromStack()
+{
+    ResetPrefetchState();
+    if (index_stack_.empty())
+    {
+        return KvError::EndOfFile;
+    }
+
+    size_t leaf_cnt = 0;
+    prefetched_file_page_ids_.fill(MaxFilePageId);
+    prefetched_leaf_ids_.fill(MaxPageId);
+
+    PageId leaf_id = index_stack_.back().iter.GetPageId();
+    while (leaf_cnt < prefetch_page_num_ && leaf_id != MaxPageId)
+    {
+        prefetched_leaf_ids_[leaf_cnt] = leaf_id;
+        FilePageId file_id = mapping_->ToFilePage(leaf_id);
+        assert(file_id != MaxFilePageId);
+        prefetched_file_page_ids_[leaf_cnt] = file_id;
+        ++leaf_cnt;
+
+        bool reached_limit = leaf_cnt >= prefetch_page_num_;
+        if (reached_limit)
+        {
+            KvError err = AdvanceToNextLeaf();
+            if (err != KvError::NoError && err != KvError::EndOfFile)
+            {
+                return err;
+            }
+            break;
+        }
+
+        KvError err = AdvanceToNextLeaf();
+        if (err == KvError::EndOfFile)
+        {
+            break;
+        }
+        CHECK_KV_ERR(err);
+        if (!index_stack_.empty())
+        {
+            leaf_id = index_stack_.back().iter.GetPageId();
+        }
+        else
+        {
+            leaf_id = MaxPageId;
+        }
+    }
+
+    KvError err = IoMgr()->ReadPages(
+        tbl_id_,
+        std::span<FilePageId>(prefetched_file_page_ids_.data(), leaf_cnt),
+        *read_pages_);
+    CHECK_KV_ERR(err);
+    assert(read_pages_->size() == leaf_cnt);
+
+    for (size_t i = 0; i < read_pages_->size(); ++i)
+    {
+        prefetched_pages_->emplace_back(prefetched_leaf_ids_[i],
+                                        std::move((*read_pages_)[i]));
+    }
+    prefetched_count_ = prefetched_pages_->size();
+    prefetched_offset_ = 0;
+    return prefetched_count_ == 0 ? KvError::EndOfFile : KvError::NoError;
+}
+
+KvError ScanIterator::ConsumePrefetchedPage()
+{
+    if (prefetched_offset_ >= prefetched_count_)
+    {
+        return KvError::EndOfFile;
+    }
+    data_page_ = std::move((*prefetched_pages_)[prefetched_offset_++]);
+    iter_.Reset(&data_page_, Options()->data_page_size);
+    assert(iter_.HasNext());
+    return KvError::NoError;
+}
+
+KvError ScanIterator::LoadNextDataPage()
+{
+    if (prefetched_offset_ >= prefetched_count_)
+    {
+        KvError err = PrefetchFromStack();
+        if (err != KvError::NoError)
+        {
+            return err;
+        }
+    }
+    return ConsumePrefetchedPage();
+}
+
 KvError ScanIterator::Next()
 {
     if (!iter_.HasNext())
     {
-        PageId page_id = data_page_.NextPageId();
-        if (page_id == MaxPageId)
+        KvError err = LoadNextDataPage();
+        if (err != KvError::NoError)
         {
-            return KvError::EndOfFile;
+            return err;
         }
-        FilePageId file_page = mapping_->ToFilePage(page_id);
-        assert(file_page != MaxFilePageId);
-        auto [page, err] = LoadDataPage(tbl_id_, page_id, file_page);
-        CHECK_KV_ERR(err);
-
-        data_page_ = std::move(page);
-        iter_.Reset(&data_page_, Options()->data_page_size);
-        assert(iter_.HasNext());
     }
     iter_.Next();
     return KvError::NoError;
@@ -93,11 +288,6 @@ uint64_t ScanIterator::Timestamp() const
     return iter_.Timestamp();
 }
 
-bool ScanIterator::HasNext() const
-{
-    return iter_.HasNext() || data_page_.NextPageId() != MaxPageId;
-}
-
 MappingSnapshot *ScanIterator::Mapping() const
 {
     return mapping_.get();
@@ -112,7 +302,8 @@ KvError ScanTask::Scan()
     req->has_remaining_ = false;
     size_t result_size = 0;
 
-    ScanIterator iter(tbl_id);
+    ScanIterator iter(
+        tbl_id, prefetched_pages_, read_pages_, req->PrefetchPageNum());
     KvError err = iter.Seek(req->BeginKey());
     if (err != KvError::NoError)
     {

@@ -1700,7 +1700,9 @@ std::pair<bool, KvError> BatchWriteTask::TruncateDataPage(
 KvError BatchWriteTask::CleanExpiredKeys()
 {
     // Scan from leftmost to get all expired keys.
-    ScanIterator iter(tbl_ident_);
+    std::vector<DataPage> prefetched_pages;
+    std::vector<Page> read_pages;
+    ScanIterator iter(tbl_ident_, prefetched_pages, read_pages);
     KvError err = iter.Seek({}, true);
     if (err != KvError::NoError)
     {

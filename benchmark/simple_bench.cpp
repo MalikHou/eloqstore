@@ -6,6 +6,7 @@
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <utility>
 #include <vector>
 
 #include "../coding.h"
@@ -27,6 +28,10 @@ DEFINE_uint32(write_interval, 0, "interval seconds between writes");
 DEFINE_uint32(read_per_part, 1, "concurrent read/scan requests per partition");
 DEFINE_uint32(test_secs, 60, "read/scan test time");
 DEFINE_uint32(read_thds, 1, "number of client threads send read/scan requests");
+DEFINE_bool(strict_seq_write,
+            false,
+            "strict sequential writes: step=1 and upsert-only to fill keys");
+DEFINE_uint64(scan_bytes, 0, "bytes to scan per request; 0 scans to the end");
 
 using namespace std::chrono;
 
@@ -117,10 +122,11 @@ Writer::Writer(uint32_t id) : id_(id)
         std::string key;
         key.resize(sizeof(uint64_t));
         EncodeKey(key.data(), writing_key_);
-        writing_key_ += (rand_gen() % key_interval) + 1;
+        writing_key_ +=
+            FLAGS_strict_seq_write ? 1 : ((rand_gen() % key_interval) + 1);
         std::string value;
         value.resize(FLAGS_kv_size - sizeof(uint64_t));
-        if (rand_gen() % del_ratio == 0)
+        if (!FLAGS_strict_seq_write && (rand_gen() % del_ratio == 0))
         {
             entries.emplace_back(std::move(key),
                                  std::move(value),
@@ -147,10 +153,11 @@ void Writer::NextBatch()
     uint64_t ts = utils::UnixTs<milliseconds>();
     for (auto &entry : request_.batch_)
     {
-        writing_key_ += (rand_gen() % key_interval) + 1;
+        writing_key_ +=
+            FLAGS_strict_seq_write ? 1 : ((rand_gen() % key_interval) + 1);
         EncodeKey(entry.key_.data(), writing_key_);
         entry.timestamp_ = ts;
-        if (rand_gen() % del_ratio == 0)
+        if (!FLAGS_strict_seq_write && (rand_gen() % del_ratio == 0))
         {
             entry.op_ = eloqstore::WriteOp::Delete;
         }
@@ -215,8 +222,10 @@ void WriteLoop(eloqstore::EloqStore *store)
             const uint64_t num_kvs =
                 uint64_t(FLAGS_batch_size) * FLAGS_partitions;
             const uint64_t kvs_per_sec = num_kvs * 1000 / cost_ms;
+            const double upsert_ratio_current =
+                FLAGS_strict_seq_write ? 1.0 : upsert_ratio;
             const uint64_t mb_per_sec =
-                (static_cast<uint64_t>(kvs_per_sec * upsert_ratio) *
+                (static_cast<uint64_t>(kvs_per_sec * upsert_ratio_current) *
                  FLAGS_kv_size) >>
                 20;
             LOG(INFO) << "write speed " << kvs_per_sec << " kvs/s | cost "
@@ -242,8 +251,10 @@ void WriteLoop(eloqstore::EloqStore *store)
         const uint64_t num_kvs =
             static_cast<uint64_t>(FLAGS_batch_size) * FLAGS_write_batchs;
         const uint64_t kvs_per_sec = num_kvs * 1000 / total_cost_ms;
+        const double upsert_ratio_current =
+            FLAGS_strict_seq_write ? 1.0 : upsert_ratio;
         const uint64_t mb_per_sec =
-            (static_cast<uint64_t>(kvs_per_sec * upsert_ratio) *
+            (static_cast<uint64_t>(kvs_per_sec * upsert_ratio_current) *
              FLAGS_kv_size) >>
             20;
         LatencyMetrics metrics = CalculateLatencyMetrics(latencies_total);
@@ -371,16 +382,18 @@ public:
         eloqstore::TableIdent tbl_id(table, id % FLAGS_partitions);
         request_.SetPagination(page_size, 0);
         EncodeKey(begin_key_, 0);
-        std::string_view key(begin_key_, sizeof(uint64_t));
-        request_.SetArgs(std::move(tbl_id), key, {});
+        EncodeKey(end_key_, 0);
+        request_.SetTableId(std::move(tbl_id));
     };
     static const size_t page_size = 256;
     const size_t id_;
     uint64_t start_ts_{0};
     uint64_t latency_{0};
     char begin_key_[sizeof(uint64_t)];
+    char end_key_[sizeof(uint64_t)];
     eloqstore::ScanRequest request_;
     size_t kvs_cnt_{0};
+    size_t last_entries_{0};
 };
 
 void ScanLoop(eloqstore::EloqStore *store, uint32_t thd_id)
@@ -398,7 +411,9 @@ void ScanLoop(eloqstore::EloqStore *store, uint32_t thd_id)
         auto scan_req = static_cast<eloqstore::ScanRequest *>(req);
         Scanner *reader = (Scanner *) (req->UserData());
         reader->latency_ = utils::UnixTs<microseconds>() - reader->start_ts_;
-        reader->kvs_cnt_ += scan_req->Entries().size();
+        const size_t cnt = scan_req->Entries().size();
+        reader->last_entries_ = cnt;
+        reader->kvs_cnt_ += cnt;
         assert(scan_req->Error() == eloqstore::KvError::NoError ||
                scan_req->Error() == eloqstore::KvError::NotFound);
         finished.enqueue(reader);
@@ -406,7 +421,32 @@ void ScanLoop(eloqstore::EloqStore *store, uint32_t thd_id)
 
     auto send_req = [&store, callback](Scanner *scanner)
     {
-        EncodeKey(scanner->begin_key_, rand_gen() % FLAGS_max_key);
+        const uint64_t val_size = FLAGS_kv_size - sizeof(uint64_t);
+        if (FLAGS_scan_bytes == 0)
+        {
+            uint64_t start = rand_gen() % FLAGS_max_key;
+            EncodeKey(scanner->begin_key_, start);
+            scanner->request_.SetArgs(
+                scanner->request_.TableId(),
+                std::string_view(scanner->begin_key_, sizeof(uint64_t)),
+                std::string_view{} /* end empty scans to tail */);
+        }
+        else
+        {
+            uint64_t scan_kvs =
+                std::max<uint64_t>(1, FLAGS_scan_bytes / val_size);
+            uint64_t max_start =
+                (FLAGS_max_key > scan_kvs) ? (FLAGS_max_key - scan_kvs) : 0;
+            uint64_t start = (max_start > 0) ? (rand_gen() % max_start) : 0;
+            uint64_t end = start + scan_kvs;
+            EncodeKey(scanner->begin_key_, start);
+            EncodeKey(scanner->end_key_, end);
+            scanner->request_.SetArgs(
+                scanner->request_.TableId(),
+                std::string_view(scanner->begin_key_, sizeof(uint64_t)),
+                std::string_view(scanner->end_key_, sizeof(uint64_t)));
+        }
+
         scanner->start_ts_ = utils::UnixTs<microseconds>();
         store->ExecAsyn(&scanner->request_, uint64_t(scanner), callback);
     };
@@ -415,6 +455,7 @@ void ScanLoop(eloqstore::EloqStore *store, uint32_t thd_id)
     latencies.reserve(kScanLatencyWindow);
     const auto start = high_resolution_clock::now();
     auto last_time = high_resolution_clock::now();
+    uint64_t window_kvs = 0;
     for (auto &scanner : scanners)
     {
         send_req(scanner.get());
@@ -424,6 +465,7 @@ void ScanLoop(eloqstore::EloqStore *store, uint32_t thd_id)
         Scanner *scanner;
         finished.wait_dequeue(scanner);
         latencies.push_back(scanner->latency_);
+        window_kvs += scanner->last_entries_;
 
         send_req(scanner);
 
@@ -433,13 +475,14 @@ void ScanLoop(eloqstore::EloqStore *store, uint32_t thd_id)
             double cost_ms =
                 duration_cast<milliseconds>(now - last_time).count();
             uint64_t qps = latencies.size() * 1000 / cost_ms;
+            uint64_t kvps = window_kvs * 1000 / cost_ms;
             LatencyMetrics metrics = CalculateLatencyMetrics(latencies);
-            uint64_t mb_per_sec =
-                (qps * Scanner::page_size * FLAGS_kv_size) >> 20;
+            uint64_t mb_per_sec = (kvps * FLAGS_kv_size) >> 20;
             LOG(INFO) << "[" << thd_id << "]scan speed " << mb_per_sec
-                      << " MB/s " << qps << " QPS | average latency "
-                      << metrics.average << " microseconds | p50 "
-                      << metrics.p50 << " microseconds | p90 " << metrics.p90
+                      << " MB/s | " << kvps << " KVs/s | " << qps
+                      << " QPS | average latency " << metrics.average
+                      << " microseconds | p50 " << metrics.p50
+                      << " microseconds | p90 " << metrics.p90
                       << " microseconds | p99 " << metrics.p99
                       << " microseconds | p99.9 " << metrics.p999
                       << " microseconds | max latency " << metrics.max
@@ -452,6 +495,7 @@ void ScanLoop(eloqstore::EloqStore *store, uint32_t thd_id)
 
             last_time = high_resolution_clock::now();
             latencies.clear();
+            window_kvs = 0;
         }
     }
     size_t total_kvs = 0;
@@ -464,7 +508,7 @@ void ScanLoop(eloqstore::EloqStore *store, uint32_t thd_id)
     auto now = high_resolution_clock::now();
     double cost_ms = duration_cast<milliseconds>(now - start).count();
     uint64_t kvps = total_kvs * 1000 / cost_ms;
-    uint64_t mb_per_sec = (kvps * Scanner::page_size * FLAGS_kv_size) >> 20;
+    uint64_t mb_per_sec = (kvps * FLAGS_kv_size) >> 20;
     LOG(INFO) << "[" << thd_id << "]scan throughput " << mb_per_sec << " MB/s "
               << kvps << " kvs/s";
 }

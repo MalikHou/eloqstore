@@ -148,6 +148,11 @@ public:
      * @param size Limit the page size (byte).
      */
     void SetPagination(size_t entries, size_t size);
+    /**
+     * @brief Set number of pages to prefetch during scan.
+     */
+    void SetPrefetchPageNum(size_t pages);
+    size_t PrefetchPageNum() const;
 
     std::string_view BeginKey() const;
     std::string_view EndKey() const;
@@ -181,6 +186,7 @@ private:
     std::vector<KvEntry> entries_;
     size_t num_entries_{0};
     bool has_remaining_;
+    size_t prefetch_page_num_{kDefaultScanPrefetchPageCount};
     friend class ScanTask;
 };
 

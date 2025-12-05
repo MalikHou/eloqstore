@@ -619,6 +619,15 @@ void ScanRequest::SetPagination(size_t entries, size_t size)
     }
 }
 
+void ScanRequest::SetPrefetchPageNum(size_t pages)
+{
+    prefetch_page_num_ = pages == 0 ? kDefaultScanPrefetchPageCount : pages;
+    if (prefetch_page_num_ > max_read_pages_batch)
+    {
+        prefetch_page_num_ = max_read_pages_batch;
+    }
+}
+
 std::string_view ScanRequest::BeginKey() const
 {
     return begin_key_.index() == 0 ? std::get<std::string_view>(begin_key_)
@@ -651,6 +660,11 @@ std::pair<size_t, size_t> ScanRequest::ResultSize() const
 bool ScanRequest::HasRemaining() const
 {
     return has_remaining_;
+}
+
+size_t ScanRequest::PrefetchPageNum() const
+{
+    return prefetch_page_num_;
 }
 
 void BatchWriteRequest::SetArgs(TableIdent tbl_id,

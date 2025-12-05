@@ -41,7 +41,8 @@ public:
         : page_id_(page_id), page_(std::move(page)) {};
     DataPage(const DataPage &) = delete;
     DataPage(DataPage &&rhs);
-    DataPage &operator=(DataPage &&);
+    DataPage &operator=(DataPage &&) noexcept;
+    DataPage &operator=(const DataPage &) = delete;
 
     static uint16_t const page_size_offset = page_type_offset + sizeof(uint8_t);
     static uint16_t const prev_page_offset =

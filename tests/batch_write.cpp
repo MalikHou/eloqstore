@@ -99,6 +99,7 @@ TEST_CASE("batch write with big key", "[batch_write]")
 {
     eloqstore::EloqStore *store = InitStore(mem_store_opts);
     MapVerifier verify(test_tbl_id, store, false, 200);
+    verify.SetValueSize(300);
     constexpr uint64_t max_val = 10000;
     for (int i = 0; i < 20; i++)
     {

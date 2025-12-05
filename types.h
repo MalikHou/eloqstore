@@ -27,6 +27,7 @@ constexpr char FileNameSeparator = '_';
 static constexpr char FileNameData[] = "data";
 static constexpr char FileNameManifest[] = "manifest";
 static constexpr char TmpSuffix[] = ".tmp";
+constexpr size_t kDefaultScanPrefetchPageCount = 6;
 
 namespace fs = std::filesystem;
 
