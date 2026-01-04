@@ -108,6 +108,14 @@ struct KvOptions
      */
     uint16_t reserve_space_ratio = 100;
     /**
+     * @brief Max number of files uploaded concurrently in a batch.
+     */
+    uint32_t max_upload_batch = 1;
+    /**
+     * @brief Max cached DirectIO buffers per shard.
+     */
+    uint32_t direct_io_buffer_pool_size = 4;
+    /**
      * @brief Reuse files already present in the local cache directory when the
      * store starts.
      */
@@ -201,6 +209,10 @@ struct KvOptions
      * enabled.
      */
     uint16_t prewarm_task_count = 3;
+    /**
+     * @brief Size of mapping arena.
+     */
+    size_t mapping_arena_size = 16;
 
     std::function<bool(const TableIdent &)> prewarm_filter;
 };

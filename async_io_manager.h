@@ -23,8 +23,8 @@
 #undef BLOCK_SIZE
 
 #include "concurrentqueue/concurrentqueue.h"
+#include "direct_io_buffer.h"
 #include "error.h"
-#include "kv_options.h"
 #include "object_store.h"
 #include "prewarm_task.h"
 #include "task.h"
@@ -111,22 +111,18 @@ public:
                                    std::string_view log,
                                    uint64_t manifest_size) = 0;
     virtual KvError SwitchManifest(const TableIdent &tbl_id,
-                                   std::string_view snapshot) = 0;
+                                   std::string_view snapshot,
+                                   size_t padded_size) = 0;
     virtual KvError CreateArchive(const TableIdent &tbl_id,
                                   std::string_view snapshot,
-                                  uint64_t ts) = 0;
+                                  uint64_t ts,
+                                  size_t padded_size) = 0;
     virtual std::pair<ManifestFilePtr, KvError> GetManifest(
         const TableIdent &tbl_id) = 0;
 
     virtual KvError ReadFile(const TableIdent &tbl_id,
                              std::string_view filename,
-                             std::string &content)
-    {
-        __builtin_unreachable();
-    }
-    virtual KvError WriteFile(const TableIdent &tbl_id,
-                              std::string_view filename,
-                              std::string_view data)
+                             DirectIoBuffer &content)
     {
         __builtin_unreachable();
     }
@@ -168,16 +164,18 @@ public:
                            std::string_view log,
                            uint64_t manifest_size) override;
     KvError SwitchManifest(const TableIdent &tbl_id,
-                           std::string_view snapshot) override;
+                           std::string_view snapshot,
+                           size_t padded_size) override;
     KvError CreateArchive(const TableIdent &tbl_id,
                           std::string_view snapshot,
-                          uint64_t ts) override;
+                          uint64_t ts,
+                          size_t padded_size) override;
     std::pair<ManifestFilePtr, KvError> GetManifest(
         const TableIdent &tbl_id) override;
 
     KvError ReadFile(const TableIdent &tbl_id,
                      std::string_view filename,
-                     std::string &content) override;
+                     DirectIoBuffer &content) override;
     KvError DeleteFiles(const std::vector<std::string> &file_paths);
     KvError CloseFiles(const TableIdent &tbl_id,
                        const std::span<FileId> file_ids);
@@ -312,6 +310,7 @@ public:
     int Read(FdIdx fd, char *dst, size_t n, uint64_t offset);
     int Write(FdIdx fd, const char *src, size_t n, uint64_t offset);
     int Fdatasync(FdIdx fd);
+    int Ftruncate(FdIdx fd, off_t length);
     int Statx(int fd, const char *path, struct statx *result);
     int Rename(FdIdx dir_fd, const char *old_path, const char *new_path);
     int Close(int fd);
@@ -327,7 +326,8 @@ public:
      */
     virtual int WriteSnapshot(LruFD::Ref dir_fd,
                               std::string_view name,
-                              std::string_view content);
+                              std::string_view content,
+                              size_t padded_size);
     virtual int CreateFile(LruFD::Ref dir_fd, FileId file_id);
     virtual int OpenFile(const TableIdent &tbl_id, FileId file_id, bool direct);
     virtual KvError SyncFile(LruFD::Ref fd);
@@ -411,10 +411,12 @@ public:
     void Submit() override;
     void PollComplete() override;
     KvError SwitchManifest(const TableIdent &tbl_id,
-                           std::string_view snapshot) override;
+                           std::string_view snapshot,
+                           size_t padded_size) override;
     KvError CreateArchive(const TableIdent &tbl_id,
                           std::string_view snapshot,
-                          uint64_t ts) override;
+                          uint64_t ts,
+                          size_t padded_size) override;
     void CleanManifest(const TableIdent &tbl_id) override;
 
     ObjectStore &GetObjectStore()
@@ -424,13 +426,13 @@ public:
 
     KvError ReadArchiveFileAndDelete(const TableIdent &tbl_id,
                                      const std::string &filename,
-                                     std::string &content);
+                                     DirectIoBuffer &content);
 
     bool NeedPrewarm() const override;
     void RunPrewarm() override;
     KvError WriteFile(const TableIdent &tbl_id,
                       std::string_view filename,
-                      std::string_view data) override;
+                      const DirectIoBuffer &buffer);
     size_t LocalCacheRemained() const
     {
         return shard_local_space_limit_ - used_local_space_;
@@ -450,6 +452,9 @@ public:
     void MarkPrewarmListingComplete();
     bool IsPrewarmListingComplete() const;
     size_t GetPrewarmFilesPulled() const;
+    void RecycleBuffers(std::vector<DirectIoBuffer> &buffers);
+    void RecycleBuffer(DirectIoBuffer buffer);
+    DirectIoBufferPool &GetDirectIoBufferPool();
     PrewarmStats &GetPrewarmStats()
     {
         return prewarm_stats_;
@@ -469,14 +474,9 @@ private:
                       std::span<LruFD::Ref> fds) override;
     KvError CloseFile(LruFD::Ref fd) override;
 
-    static constexpr size_t kMaxUploadBatch = 10;
-
     KvError DownloadFile(const TableIdent &tbl_id, FileId file_id);
     KvError UploadFiles(const TableIdent &tbl_id,
                         std::vector<std::string> filenames);
-    KvError ReadFiles(const TableIdent &tbl_id,
-                      std::span<const std::string> filenames,
-                      std::vector<std::string> &contents);
 
     bool DequeClosedFile(const FileKey &key);
     void EnqueClosedFile(FileKey key);
@@ -566,6 +566,7 @@ private:
     // Prewarm statistics
     PrewarmStats prewarm_stats_;
 
+    DirectIoBufferPool direct_io_buffer_pool_;
     ObjectStore obj_store_;
 
     size_t inflight_upload_files_{0};
@@ -603,10 +604,12 @@ public:
                            std::string_view log,
                            uint64_t manifest_size) override;
     KvError SwitchManifest(const TableIdent &tbl_id,
-                           std::string_view snapshot) override;
+                           std::string_view snapshot,
+                           size_t padded_size) override;
     KvError CreateArchive(const TableIdent &tbl_id,
                           std::string_view snapshot,
-                          uint64_t ts) override;
+                          uint64_t ts,
+                          size_t padded_size) override;
     std::pair<ManifestFilePtr, KvError> GetManifest(
         const TableIdent &tbl_id) override;
 

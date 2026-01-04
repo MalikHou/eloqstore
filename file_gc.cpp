@@ -5,6 +5,7 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <filesystem>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "async_io_manager.h"
@@ -20,11 +21,13 @@
 namespace eloqstore
 {
 void GetRetainedFiles(std::unordered_set<FileId> &result,
-                      const std::vector<uint64_t> &tbl,
+                      const MappingSnapshot::MappingTbl &tbl,
                       uint8_t pages_per_file_shift)
 {
-    for (uint64_t val : tbl)
+    const size_t tbl_size = tbl.size();
+    for (PageId page_id = 0; page_id < tbl_size; ++page_id)
     {
+        uint64_t val = tbl.Get(page_id);
         if (MappingSnapshot::IsFilePageId(val))
         {
             FilePageId fp_id = MappingSnapshot::DecodeId(val);
@@ -32,7 +35,7 @@ void GetRetainedFiles(std::unordered_set<FileId> &result,
             result.emplace(file_id);
         }
     }
-};
+}
 
 namespace FileGarbageCollector
 {
@@ -139,7 +142,7 @@ KvError ListCloudFiles(const TableIdent &tbl_id,
     }
 
     ObjectStore &object_store = cloud_mgr->GetObjectStore();
-    if (!object_store.ParseListObjectsResponse(list_task.response_data_,
+    if (!object_store.ParseListObjectsResponse(list_task.response_data_.view(),
                                                list_task.json_data_,
                                                &cloud_files,
                                                nullptr))
@@ -196,7 +199,7 @@ void ClassifyFiles(const std::vector<std::string> &files,
 
 KvError DownloadArchiveFile(const TableIdent &tbl_id,
                             const std::string &archive_file,
-                            std::string &content,
+                            DirectIoBuffer &content,
                             CloudStoreMgr *cloud_mgr,
                             const KvOptions *options)
 {
@@ -222,13 +225,13 @@ KvError DownloadArchiveFile(const TableIdent &tbl_id,
 
     KvError write_err = cloud_mgr->WriteFile(
         tbl_id, archive_file, download_task.response_data_);
+    cloud_mgr->RecycleBuffer(std::move(download_task.response_data_));
     if (write_err != KvError::NoError)
     {
         LOG(ERROR) << "Failed to persist archive file: " << local_path
                    << ", error: " << static_cast<int>(write_err);
         return write_err;
     }
-    download_task.response_data_.clear();
 
     KvError err =
         cloud_mgr->ReadArchiveFileAndDelete(tbl_id, archive_file, content);
@@ -244,7 +247,7 @@ KvError DownloadArchiveFile(const TableIdent &tbl_id,
     return KvError::NoError;
 }
 
-FileId ParseArchiveForMaxFileId(const std::string &archive_content)
+FileId ParseArchiveForMaxFileId(std::string_view archive_content)
 {
     MemStoreMgr::Manifest manifest(archive_content);
     Replayer replayer(Options());
@@ -321,7 +324,7 @@ KvError GetOrUpdateArchivedMaxFileId(
     }
 
     // 3. read archive file based on mode (cloud or local).
-    std::string archive_content;
+    DirectIoBuffer archive_content;
     KvError read_err = KvError::NoError;
 
     if (!io_mgr->options_->cloud_store_path.empty())
@@ -351,7 +354,8 @@ KvError GetOrUpdateArchivedMaxFileId(
     }
 
     // 4. parse the archive file to get the maximum file ID.
-    least_not_archived_file_id = ParseArchiveForMaxFileId(archive_content) + 1;
+    least_not_archived_file_id =
+        ParseArchiveForMaxFileId(archive_content.view()) + 1;
 
     // 5. cache the result.
     cached_max_ids[tbl_id] = least_not_archived_file_id;

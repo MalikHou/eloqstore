@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "async_io_manager.h"
+#include "shard.h"
 #include "task.h"
 #include "utils.h"
 
@@ -45,13 +46,14 @@ constexpr std::string_view kDefaultGcsEndpoint =
     "https://storage.googleapis.com";
 constexpr std::string_view kDefaultGcsRegion = "auto";
 
-bool ParseJsonListResponse(const std::string &payload,
+bool ParseJsonListResponse(std::string_view payload,
                            std::vector<std::string> *objects,
                            std::vector<utils::CloudObjectInfo> *infos)
 {
     Json::Value response;
     Json::Reader reader;
-    if (!reader.parse(payload, response))
+    if (!reader.parse(
+            payload.data(), payload.data() + payload.size(), response, false))
     {
         return false;
     }
@@ -278,7 +280,7 @@ void AppendParsedEntry(const std::string &decoded_key,
     }
 }
 
-bool ParseS3XmlListResponse(const std::string &payload,
+bool ParseS3XmlListResponse(std::string_view payload,
                             const std::string &strip_prefix,
                             std::vector<std::string> *objects,
                             std::vector<utils::CloudObjectInfo> *infos,
@@ -315,7 +317,7 @@ bool ParseS3XmlListResponse(const std::string &payload,
             return false;
         }
         size_t inner_begin = start + contents_start.size();
-        std::string block = payload.substr(inner_begin, end - inner_begin);
+        std::string block(payload.substr(inner_begin, end - inner_begin));
         pos = end + contents_end.size();
 
         std::string key = ExtractTagValue(block, "Key");
@@ -364,7 +366,7 @@ bool ParseS3XmlListResponse(const std::string &payload,
             return false;
         }
         size_t inner_begin = start + prefix_start.size();
-        std::string block = payload.substr(inner_begin, end - inner_begin);
+        std::string block(payload.substr(inner_begin, end - inner_begin));
         pos = end + prefix_end.size();
         std::string prefix_value = ExtractTagValue(block, "Prefix");
         if (prefix_value.empty())
@@ -508,7 +510,7 @@ public:
     }
 
     bool ParseListObjectsResponse(
-        const std::string &payload,
+        std::string_view payload,
         const std::string &strip_prefix,
         std::vector<std::string> *objects,
         std::vector<utils::CloudObjectInfo> *infos,
@@ -715,7 +717,7 @@ public:
     }
 
     bool ParseListObjectsResponse(
-        const std::string &payload,
+        std::string_view payload,
         const std::string &strip_prefix,
         std::vector<std::string> *objects,
         std::vector<utils::CloudObjectInfo> *infos,
@@ -782,7 +784,7 @@ ObjectStore::ObjectStore(const KvOptions *options)
             g_aws_cleanup_registered = true;
         }
     }
-    async_http_mgr_ = std::make_unique<AsyncHttpManager>(options);
+    async_http_mgr_ = std::make_unique<AsyncHttpManager>();
 }
 
 ObjectStore::~ObjectStore()
@@ -799,7 +801,7 @@ ObjectStore::~ObjectStore()
 }
 
 bool ObjectStore::ParseListObjectsResponse(
-    const std::string &payload,
+    std::string_view payload,
     const std::string &strip_prefix,
     std::vector<std::string> *objects,
     std::vector<utils::CloudObjectInfo> *infos,
@@ -809,15 +811,16 @@ bool ObjectStore::ParseListObjectsResponse(
         payload, strip_prefix, objects, infos, next_continuation_token);
 }
 
-AsyncHttpManager::AsyncHttpManager(const KvOptions *options) : options_(options)
+AsyncHttpManager::AsyncHttpManager()
 {
-    if (options_->cloud_store_path.empty())
+    const KvOptions *option = Options();
+    if (option->cloud_store_path.empty())
     {
         LOG(FATAL) << "cloud_store_path must be set when using cloud store";
     }
-    cloud_path_ = ParseCloudPath(options_->cloud_store_path);
+    cloud_path_ = ParseCloudPath(option->cloud_store_path);
 
-    backend_ = CreateBackend(options_, cloud_path_);
+    backend_ = CreateBackend(option, cloud_path_);
     CHECK(backend_) << "Failed to initialize cloud backend";
 
     multi_handle_ = curl_multi_init();
@@ -838,7 +841,7 @@ AsyncHttpManager::~AsyncHttpManager()
 }
 
 bool AsyncHttpManager::ParseListObjectsResponse(
-    const std::string &payload,
+    std::string_view payload,
     const std::string &strip_prefix,
     std::vector<std::string> *objects,
     std::vector<utils::CloudObjectInfo> *infos,
@@ -896,7 +899,7 @@ void AsyncHttpManager::SubmitRequest(ObjectStore::Task *task)
     curl_easy_setopt(easy, CURLOPT_PROXY, "");
     curl_easy_setopt(easy, CURLOPT_NOPROXY, "*");
     curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, WriteCallback);
-    curl_easy_setopt(easy, CURLOPT_WRITEDATA, &task->response_data_);
+    curl_easy_setopt(easy, CURLOPT_WRITEDATA, task);
     curl_easy_setopt(easy, CURLOPT_PRIVATE, task);
     curl_easy_setopt(easy, CURLOPT_TIMEOUT, 300L);
 
@@ -1132,10 +1135,15 @@ bool AsyncHttpManager::SetupListRequest(ObjectStore::ListTask *task, CURL *easy)
 size_t AsyncHttpManager::WriteCallback(void *contents,
                                        size_t size,
                                        size_t nmemb,
-                                       std::string *userp)
+                                       void *userp)
 {
     size_t total = size * nmemb;
-    userp->append(static_cast<char *>(contents), total);
+    if (userp == nullptr || total == 0)
+    {
+        return total;
+    }
+    auto *task = static_cast<ObjectStore::Task *>(userp);
+    task->response_data_.append(static_cast<char *>(contents), total);
     return total;
 }
 
@@ -1237,7 +1245,10 @@ void AsyncHttpManager::ProcessCompletedRequests()
             if (task->TaskType() == ObjectStore::Task::Type::AsyncUpload)
             {
                 auto upload_task = static_cast<ObjectStore::UploadTask *>(task);
-                upload_task->data_buffer_.clear();
+                CHECK(shard != nullptr);
+                reinterpret_cast<CloudStoreMgr *>(shard->IoManager())
+                    ->GetDirectIoBufferPool()
+                    .Release(std::move(upload_task->data_buffer_));
                 upload_task->buffer_offset_ = 0;
             }
 

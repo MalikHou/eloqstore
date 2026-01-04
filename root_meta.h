@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -7,6 +8,7 @@
 #include <unordered_set>
 
 #include "compression.h"
+#include "manifest_buffer.h"
 #include "mem_index_page.h"
 #include "page_mapper.h"
 #include "task.h"
@@ -26,9 +28,11 @@ public:
                               std::string_view dict_bytes);
 
     std::string_view Finalize(PageId new_root, PageId ttl_root);
+    static bool ValidateChecksum(std::string_view record);
     void Reset();
     bool Empty() const;
     uint32_t CurrentSize() const;
+    size_t DirectIoSize() const;
 
     // checksum(8B)|root(4B)|ttl_root(4B)|log_size(4B)
     static constexpr uint16_t header_bytes =
@@ -39,7 +43,8 @@ public:
     static constexpr uint16_t offset_len = offset_ttl_root + sizeof(PageId);
 
 private:
-    std::string buff_;
+    static uint64_t CalcChecksum(std::string_view content);
+    ManifestBuffer buff_;
 };
 
 struct CowRootMeta

@@ -13,8 +13,10 @@
 #include <utility>
 #include <vector>
 
+#include "direct_io_buffer.h"
 #include "error.h"
 #include "kv_options.h"
+#include "pool.h"
 #include "task.h"
 #include "types.h"
 
@@ -33,6 +35,7 @@ class CloudStoreMgr;
 class AsyncHttpManager;
 class AsyncIoManager;
 
+using DirectIoBufferPool = Pool<DirectIoBuffer>;
 class ObjectStore
 {
 public:
@@ -45,7 +48,7 @@ public:
     }
 
     bool ParseListObjectsResponse(
-        const std::string &payload,
+        std::string_view payload,
         const std::string &strip_prefix,
         std::vector<std::string> *objects,
         std::vector<utils::CloudObjectInfo> *infos,
@@ -55,6 +58,10 @@ public:
     {
     public:
         Task() = default;
+        Task(Task &&) noexcept = default;
+        Task &operator=(Task &&) noexcept = default;
+        Task(const Task &) = delete;
+        Task &operator=(const Task &) = delete;
         virtual ~Task() = default;
         enum class Type : uint8_t
         {
@@ -66,7 +73,7 @@ public:
         virtual Type TaskType() = 0;
 
         KvError error_{KvError::NoError};
-        std::string response_data_{};
+        DirectIoBuffer response_data_;
         std::string json_data_{};
         curl_slist *headers_{nullptr};
         bool cloud_slot_acquired_{false};
@@ -117,7 +124,7 @@ public:
         const TableIdent *tbl_id_;
         std::string filename_;
         size_t file_size_{0};
-        std::string data_buffer_;
+        DirectIoBuffer data_buffer_;
         size_t buffer_offset_{0};
     };
 
@@ -199,7 +206,7 @@ public:
                                   const std::string &continuation,
                                   SignedRequestInfo *request) const = 0;
     virtual bool ParseListObjectsResponse(
-        const std::string &payload,
+        std::string_view payload,
         const std::string &strip_prefix,
         std::vector<std::string> *objects,
         std::vector<utils::CloudObjectInfo> *infos,
@@ -209,7 +216,7 @@ public:
 class AsyncHttpManager
 {
 public:
-    explicit AsyncHttpManager(const KvOptions *options);
+    AsyncHttpManager();
     ~AsyncHttpManager();
 
     void SubmitRequest(ObjectStore::Task *task);
@@ -227,7 +234,7 @@ public:
     }
 
     bool ParseListObjectsResponse(
-        const std::string &payload,
+        std::string_view payload,
         const std::string &strip_prefix,
         std::vector<std::string> *objects,
         std::vector<utils::CloudObjectInfo> *infos,
@@ -251,7 +258,7 @@ private:
     static size_t WriteCallback(void *contents,
                                 size_t size,
                                 size_t nmemb,
-                                std::string *userp);
+                                void *userp);
 
     static constexpr uint32_t kInitialRetryDelayMs = 10'000;
     static constexpr uint32_t kMaxRetryDelayMs = 40'000;
@@ -261,7 +268,6 @@ private:
     std::unordered_map<CURL *, ObjectStore::Task *> active_requests_;
     std::multimap<std::chrono::steady_clock::time_point, ObjectStore::Task *>
         pending_retries_;
-    const KvOptions *options_;
     int running_handles_{0};
 
     CloudPathInfo cloud_path_;

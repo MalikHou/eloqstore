@@ -188,6 +188,16 @@ int KvOptions::LoadFromIni(const char *path)
         reserve_space_ratio =
             reader.GetUnsigned(sec_run, "reserve_space_ratio", 100);
     }
+    if (reader.HasValue(sec_run, "max_upload_batch"))
+    {
+        max_upload_batch =
+            reader.GetUnsigned(sec_run, "max_upload_batch", max_upload_batch);
+    }
+    if (reader.HasValue(sec_run, "direct_io_buffer_pool_size"))
+    {
+        direct_io_buffer_pool_size = reader.GetUnsigned(
+            sec_run, "direct_io_buffer_pool_size", direct_io_buffer_pool_size);
+    }
     if (reader.HasValue(sec_run, "allow_reuse_local_caches"))
     {
         allow_reuse_local_caches =
@@ -319,6 +329,8 @@ bool KvOptions::operator==(const KvOptions &other) const
            file_amplify_factor == other.file_amplify_factor &&
            local_space_limit == other.local_space_limit &&
            reserve_space_ratio == other.reserve_space_ratio &&
+           max_upload_batch == other.max_upload_batch &&
+           direct_io_buffer_pool_size == other.direct_io_buffer_pool_size &&
            allow_reuse_local_caches == other.allow_reuse_local_caches &&
            prewarm_cloud_cache == other.prewarm_cloud_cache &&
            prewarm_task_count == other.prewarm_task_count &&
