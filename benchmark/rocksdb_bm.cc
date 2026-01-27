@@ -1,7 +1,8 @@
+#include "rocksdb_bm.h"
+
 #include <iomanip>
 
 #ifdef WITH_ROCKSDB
-#include "rocksdb_bm.h"
 namespace RocksDBBM
 {
 static DistributionType StringToDistributionType(const char *ctype)
