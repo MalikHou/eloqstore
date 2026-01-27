@@ -2,9 +2,8 @@
 
 #include <glog/logging.h>
 
-#include "random.h"
-
 #ifdef WITH_ROCKSDB
+#include "random.h"
 #include "rocksdb/advanced_cache.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"
