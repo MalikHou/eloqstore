@@ -45,10 +45,10 @@ install_clang_format_18_1_8() {
   echo "[INFO] Downloading LLVM clang-format 18.1.8"
   case "$ARCH" in
     x86_64)
-      PKG_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-x86_64-linux-gnu-ubuntu-18.04.tar.xz"
+      LLVM_PKG_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-x86_64-linux-gnu-ubuntu-18.04.tar.xz"
       ;;
     aarch64|arm64)
-      PKG_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-aarch64-linux-gnu.tar.xz"
+      LLVM_PKG_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-aarch64-linux-gnu.tar.xz"
       ;;
     *)
       echo "Unsupported arch: $ARCH" >&2
@@ -58,9 +58,9 @@ install_clang_format_18_1_8() {
 
   mkdir -p ./llvm-18.1.8
 
-  echo "[INFO] Downloading LLVM clang-format 18.1.8 from ${PKG_URL}"
+  echo "[INFO] Downloading LLVM clang-format 18.1.8 from ${LLVM_PKG_URL}"
 
-  curl -L "$PKG_URL" -o /tmp/llvm-18.1.8.tar.xz
+  curl -L "$LLVM_PKG_URL" -o /tmp/llvm-18.1.8.tar.xz
   tar -xf /tmp/llvm-18.1.8.tar.xz -C ./llvm-18.1.8 --strip-components=1
   rm -f /tmp/llvm-18.1.8.tar.xz
 
