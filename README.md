@@ -154,6 +154,22 @@ ctest --test-dir build/tests/
 ./build/benchmark/simple_bench --kvoptions=./benchmark/opts_append.ini --workload=write-read --kv_size=1024 --batch_size=20000 --max_key=10000000 --read_per_part=4 --partitions=1
 ```
 
+### Install Format Tool
+
+```shell 
+bash scripts/format.sh
+```
+
+This script will execute when necessary:
+- Install code format tools
+- Format the code
+
+The first time this script is executed, it will install:
+- libtinfo5
+- clang-format(18.1.8)
+
+**Note**: The main branch has code format checks; please run this script before committing the MR.
+
 ## 🤝 Contributing
 
 We welcome contributions from the developer community! 
