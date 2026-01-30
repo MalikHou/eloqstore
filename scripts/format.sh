@@ -21,7 +21,7 @@ install_clang_format_18_1_8() {
   echo "[INFO] Installing libtinfo5"
   case "$ARCH" in
     x86_64)
-      TINFO_PKG_URL="http://security.ubuntu.com/ubuntu/pool/universe/n/ncurses"
+      TINFO_PKG_URL="https://security.ubuntu.com/ubuntu/pool/universe/n/ncurses"
       ;;
     aarch64|arm64)
       TINFO_PKG_URL="https://cn.ports.ubuntu.com/pool/universe/n/ncurses"
@@ -38,8 +38,8 @@ install_clang_format_18_1_8() {
 
   echo "[INFO] Downloading ${TINFO_DEB} from ${TINFO_URL}"
   
-  wget -q -O "./${TINFO_DEB}" "$TINFO_URL"
-  $SUDO apt install -y "./${TINFO_DEB}"
+  wget -q -O "./${TINFO_DEB}" "$TINFO_URL" || { echo "[ERROR] Download failed: ${TINFO_URL}" >&2; return 1; }
+  $SUDO apt install -y "./${TINFO_DEB}" || return 1
 
   # 2) Download LLVM clang-format 18.1.8
   echo "[INFO] Downloading LLVM clang-format 18.1.8"
@@ -91,7 +91,7 @@ ensure_clang_format_18_1_8() {
 }
 
 # Format all files in the project
-ensure_clang_format_18_1_8
+ensure_clang_format_18_1_8 || { echo "[ERROR] Format failed" >&2; exit -1; }
 
 git ls-files -z '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' \
 | awk -v RS='\0' -v ORS='\0' '!/^(third_party|vendor|build|external)\//' \
