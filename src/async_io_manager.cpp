@@ -2288,9 +2288,20 @@ KvError CloudStoreMgr::RestoreFilesForTable(const TableIdent &tbl_id,
         if (filename.empty() ||
             boost::algorithm::ends_with(filename, TmpSuffix))
         {
-            LOG(ERROR) << "Unexpected cached file " << file_it->path()
-                       << ": temporary files must be cleaned before reuse";
-            return KvError::InvalidArgs;
+            fs::path unexpected_path = file_it->path();
+            std::error_code remove_ec;
+            fs::remove(unexpected_path, remove_ec);
+            if (remove_ec)
+            {
+                LOG(ERROR) << "Failed to remove cached file " << unexpected_path
+                           << ": " << remove_ec.message();
+            }
+            else
+            {
+                LOG(INFO) << "Removed unexpected cached file "
+                          << unexpected_path;
+            }
+            continue;
         }
 
         auto [prefix, suffix] = ParseFileName(filename);
@@ -2752,10 +2763,9 @@ std::pair<ManifestFilePtr, KvError> CloudStoreMgr::GetManifest(
 
     if (!found)
     {
-        LOG(ERROR) << "CloudStoreMgr::GetManifest: no manifest found "
-                      "for table "
-                   << tbl_id;
-        return {nullptr, KvError::CloudNoManifest};
+        // No manifest found; this partition does not belong to the current
+        // restore database.
+        return {nullptr, KvError::NotFound};
     }
 
     selected_term = best_term;
@@ -3205,14 +3215,19 @@ KvError CloudStoreMgr::SyncFile(LruFD::Ref fd)
         const TableIdent &tbl_id = *fd.Get()->tbl_->tbl_id_;
         uint64_t term = fd.Get()->term_;
         KvError err = UploadFiles(tbl_id, {ToFilename(file_id, term)});
-        if (err != KvError::NoError)
+        if (file_id == LruFD::kManifest)
         {
-            if (file_id == LruFD::kManifest)
+            // For manifest, retry until success or error that
+            // means manifest is not uploaded (insufficient storage).
+            while (err != KvError::NoError &&
+                   err != KvError::OssInsufficientStorage)
             {
-                LOG(FATAL) << "can not upload manifest: " << ErrorString(err);
+                LOG(WARNING) << "Manifest upload failed with "
+                             << ErrorString(err) << ", retrying.";
+                err = UploadFiles(tbl_id, {ToFilename(file_id, term)});
             }
-            return err;
         }
+        return err;
     }
 
     fd.Get()->dirty_ = false;

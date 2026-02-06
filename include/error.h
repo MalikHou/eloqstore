@@ -28,7 +28,7 @@ enum struct KvError : uint8_t
     CloudErr,
     IoFail,
     ExpiredTerm,
-    CloudNoManifest,
+    OssInsufficientStorage,
 
 };
 
@@ -68,8 +68,8 @@ constexpr const char *ErrorString(KvError err)
         return "Operation not permitted";
     case KvError::ExpiredTerm:
         return "Expired term";
-    case KvError::CloudNoManifest:
-        return "No manifest found in cloud but the directory is not empty";
+    case KvError::OssInsufficientStorage:
+        return "Object storage insufficient storage";
     }
     return "Unknown error";
 }
