@@ -105,6 +105,7 @@ set(ELOQ_STORE_SOURCES
         src/compression.cpp
         src/eloq_store.cpp
         src/eloqstore_module.cpp
+        src/fast_clock.cpp
         src/file_gc.cpp
         src/kill_point.cpp
         src/kv_options.cpp

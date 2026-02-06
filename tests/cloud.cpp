@@ -1059,7 +1059,7 @@ TEST_CASE("concurrent test with cloud", "[cloud]")
     options.num_threads = 4;
     options.fd_limit = 100 + eloqstore::num_reserved_fd;
     options.reserve_space_ratio = 5;
-    options.local_space_limit = 500 << 22;  // 100MB
+    options.local_space_limit = 500 << 22;  // ~2GB
     eloqstore::EloqStore *store = InitStore(options);
 
     ConcurrencyTester tester(store, "t1", 50, 1000);

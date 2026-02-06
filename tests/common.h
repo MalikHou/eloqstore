@@ -98,8 +98,25 @@ inline void CleanupLocalStore(eloqstore::KvOptions opts)
 
 namespace
 {
-constexpr std::string_view kDefaultTestAwsEndpoint = "http://127.0.0.1:9900";
-constexpr std::string_view kDefaultTestAwsRegion = "us-east-1";
+inline std::string DefaultTestAwsEndpoint()
+{
+    const char *endpoint = std::getenv("ELOQSTORE_CLOUD_ENDPOINT");
+    if (endpoint != nullptr && endpoint[0] != '\0')
+    {
+        return endpoint;
+    }
+    return "http://127.0.0.1:9900";
+}
+
+inline std::string DefaultTestAwsRegion()
+{
+    const char *region = std::getenv("ELOQSTORE_CLOUD_REGION");
+    if (region != nullptr && region[0] != '\0')
+    {
+        return region;
+    }
+    return "us-east-1";
+}
 
 struct ParsedCloudPath
 {
@@ -205,7 +222,7 @@ public:
         EnsureAwsSdkInitialized();
         Aws::Client::ClientConfiguration config;
         std::string endpoint = opts.cloud_endpoint.empty()
-                                   ? std::string(kDefaultTestAwsEndpoint)
+                                   ? DefaultTestAwsEndpoint()
                                    : opts.cloud_endpoint;
         if (!endpoint.empty())
         {
@@ -220,7 +237,7 @@ public:
             }
         }
         std::string region = opts.cloud_region.empty()
-                                 ? std::string(kDefaultTestAwsRegion)
+                                 ? DefaultTestAwsRegion()
                                  : opts.cloud_region;
         config.region = region.c_str();
         bool verify_ssl =

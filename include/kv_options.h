@@ -62,6 +62,11 @@ struct KvOptions
      */
     uint32_t io_queue_size = 4096;
     /**
+     * @brief Default timeout for read-only requests (Read/Floor/Scan), in ms.
+     * 0 means disabled.
+     */
+    uint32_t read_request_timeout_ms = 0;
+    /**
      * @brief Max amount of inflight write IO per shard.
      * Only take effect in non-append write mode.
      */
@@ -117,6 +122,11 @@ struct KvOptions
      * @brief Max number of files uploaded concurrently in a batch.
      */
     uint32_t max_upload_batch = 5;
+    /**
+     * @brief Max retries for cloud upload requests.
+     * Applies to data files and manifest uploads.
+     */
+    uint8_t cloud_upload_max_retries = 10;
     /**
      * @brief Maximum number of concurrent cloud HTTP requests per shard.
      */

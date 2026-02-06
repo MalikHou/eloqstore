@@ -82,6 +82,7 @@ inline const char *RequestTypeToString(RequestType type)
 class KvRequest
 {
 public:
+    explicit KvRequest(uint32_t timeout_ms = 0) : timeout_ms_(timeout_ms) {}
     virtual ~KvRequest() = default;
     virtual RequestType Type() const = 0;
     bool ReadOnly() const;
@@ -91,13 +92,18 @@ public:
     void SetTableId(TableIdent tbl_id);
     const TableIdent &TableId() const;
     uint64_t UserData() const;
+    /**
+     * @brief Get the timeout of the request. Using relative time, that is, x ms
+     * is considered a timeout.
+     * @return The timeout of the request in milliseconds, 0 means no timeout.
+     */
+    uint32_t TimeOutMs() const;
 
     /**
      * @brief Test if this request is done.
      */
     bool IsDone() const;
     void Wait() const;
-
 protected:
     void SetDone(KvError err);
 
@@ -112,6 +118,8 @@ protected:
     std::atomic<bool> done_{true};
 #endif
     KvError err_{KvError::NoError};
+    uint64_t start_time_ms_{0};
+    uint32_t timeout_ms_{0};
 
     friend class Shard;
     friend class EloqStore;
@@ -121,6 +129,7 @@ protected:
 class ReadRequest : public KvRequest
 {
 public:
+    explicit ReadRequest(uint32_t timeout_ms = 0) : KvRequest(timeout_ms) {}
     RequestType Type() const override
     {
         return RequestType::Read;
@@ -147,6 +156,7 @@ private:
 class FloorRequest : public KvRequest
 {
 public:
+    explicit FloorRequest(uint32_t timeout_ms = 0) : KvRequest(timeout_ms) {}
     RequestType Type() const override
     {
         return RequestType::Floor;
@@ -170,6 +180,7 @@ private:
 class ScanRequest : public KvRequest
 {
 public:
+    explicit ScanRequest(uint32_t timeout_ms = 0) : KvRequest(timeout_ms) {}
     RequestType Type() const override
     {
         return RequestType::Scan;

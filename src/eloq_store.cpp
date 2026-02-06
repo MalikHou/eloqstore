@@ -20,6 +20,7 @@
 #include "async_io_manager.h"
 #include "cloud_storage_service.h"
 #include "common.h"
+#include "fast_clock.h"
 #include "file_gc.h"
 #include "storage/shard.h"
 #include "tasks/archive_crond.h"
@@ -36,6 +37,21 @@
 
 namespace eloqstore
 {
+namespace
+{
+bool IsTimedReadRequestType(RequestType type)
+{
+    return type == RequestType::Read || type == RequestType::Floor ||
+           type == RequestType::Scan;
+}
+
+uint32_t ResolveReadTimeoutMs(const KvRequest *req, const KvOptions &options)
+{
+    const uint32_t request_timeout_ms = req->TimeOutMs();
+    return request_timeout_ms == 0 ? options.read_request_timeout_ms
+                                   : request_timeout_ms;
+}
+}  // namespace
 
 bool EloqStore::ValidateOptions(KvOptions &opts)
 {
@@ -77,6 +93,11 @@ bool EloqStore::ValidateOptions(KvOptions &opts)
         if (opts.max_upload_batch == 0)
         {
             LOG(ERROR) << "max_upload_batch must be greater than 0";
+            return false;
+        }
+        if (opts.cloud_upload_max_retries == 0)
+        {
+            LOG(ERROR) << "cloud_upload_max_retries must be greater than 0";
             return false;
         }
         if (opts.max_upload_batch >= opts.max_cloud_concurrency)
@@ -722,6 +743,16 @@ bool EloqStore::SendRequest(KvRequest *req)
 #else
     req->done_.store(false, std::memory_order_relaxed);
 #endif
+    if (IsTimedReadRequestType(req->Type()))
+    {
+        const uint32_t timeout_ms = ResolveReadTimeoutMs(req, options_);
+        req->start_time_ms_ =
+            timeout_ms > 0 ? FastClock::NowMilliseconds() : 0;
+    }
+    else
+    {
+        req->start_time_ms_ = 0;
+    }
 
     if (req->Type() == RequestType::DropTable)
     {
@@ -903,6 +934,11 @@ const char *KvRequest::ErrMessage() const
 uint64_t KvRequest::UserData() const
 {
     return user_data_;
+}
+
+uint32_t KvRequest::TimeOutMs() const
+{
+    return timeout_ms_;
 }
 
 void KvRequest::Wait() const

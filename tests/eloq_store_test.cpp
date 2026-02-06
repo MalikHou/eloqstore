@@ -5,6 +5,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <thread>
 
@@ -84,6 +85,12 @@ TEST_CASE("EloqStore ValidateOptions validates all parameters", "[eloq_store]")
     // Test invalid max_upload_batch (cloud mode)
     options.cloud_store_path = "test";
     options.max_upload_batch = 0;
+    REQUIRE(eloqstore::EloqStore::ValidateOptions(options) == false);
+    options = CreateValidOptions(test_dir);  // restore valid value
+
+    // Test invalid cloud_upload_max_retries (cloud mode)
+    options.cloud_store_path = "test";
+    options.cloud_upload_max_retries = 0;
     REQUIRE(eloqstore::EloqStore::ValidateOptions(options) == false);
     options = CreateValidOptions(test_dir);  // restore valid value
 
@@ -296,4 +303,91 @@ TEST_CASE("CircularQueue EnqueueAsFirst prepends items", "[cqueue]")
     REQUIRE(q.Get(2) == 3);
     REQUIRE(q.Get(3) == 4);
     REQUIRE(q.Get(4) == 5);
+}
+
+TEST_CASE("KvOptions loads read_request_timeout_ms from ini",
+          "[eloq_store][timeout]")
+{
+    auto ini_path = fs::temp_directory_path() / "eloqstore_timeout_opts.ini";
+    {
+        std::ofstream ini_file(ini_path);
+        REQUIRE(ini_file.is_open());
+        ini_file << "[run]\n";
+        ini_file << "read_request_timeout_ms = 123\n";
+        ini_file << "cloud_upload_max_retries = 17\n";
+        ini_file << "[permanent]\n";
+        ini_file << "data_page_size = 4KB\n";
+        ini_file << "data_file_size = 8MB\n";
+    }
+
+    eloqstore::KvOptions options;
+    REQUIRE(options.LoadFromIni(ini_path.c_str()) == 0);
+    REQUIRE(options.read_request_timeout_ms == 123);
+    REQUIRE(options.cloud_upload_max_retries == 17);
+    fs::remove(ini_path);
+}
+
+TEST_CASE("Read/Floor/Scan request timeout constructors",
+          "[eloq_store][timeout]")
+{
+    eloqstore::ReadRequest read_req(10);
+    eloqstore::FloorRequest floor_req(20);
+    eloqstore::ScanRequest scan_req(30);
+
+    REQUIRE(read_req.TimeOutMs() == 10);
+    REQUIRE(floor_req.TimeOutMs() == 20);
+    REQUIRE(scan_req.TimeOutMs() == 30);
+}
+
+TEST_CASE("EloqStore read timeout applies to scan and request timeout can "
+          "override default",
+          "[eloq_store][timeout]")
+{
+    eloqstore::KvOptions options;
+    options.num_threads = 1;
+    options.read_request_timeout_ms = 1;
+
+    eloqstore::EloqStore store(options);
+    REQUIRE(store.Start() == eloqstore::KvError::NoError);
+
+    eloqstore::TableIdent tbl_id("timeout_table", 0);
+    constexpr uint32_t kBatchCount = 50;
+    constexpr uint32_t kBatchSize = 512;
+    uint64_t sequence = 0;
+    for (uint32_t batch = 0; batch < kBatchCount; ++batch)
+    {
+        std::vector<eloqstore::WriteDataEntry> entries;
+        entries.reserve(kBatchSize);
+        for (uint32_t i = 0; i < kBatchSize; ++i)
+        {
+            entries.emplace_back(test_util::Key(sequence, 12),
+                                 std::string(512, 'v'),
+                                 sequence,
+                                 eloqstore::WriteOp::Upsert);
+            ++sequence;
+        }
+        eloqstore::BatchWriteRequest write_req;
+        write_req.SetArgs(tbl_id, std::move(entries));
+        store.ExecSync(&write_req);
+        REQUIRE(write_req.Error() == eloqstore::KvError::NoError);
+    }
+
+    bool saw_timeout = false;
+    for (int attempt = 0; attempt < 5 && !saw_timeout; ++attempt)
+    {
+        eloqstore::ScanRequest scan_req;
+        scan_req.SetArgs(tbl_id, std::string_view{}, std::string_view{});
+        scan_req.SetPagination(std::numeric_limits<size_t>::max(),
+                               std::numeric_limits<size_t>::max());
+        store.ExecSync(&scan_req);
+        saw_timeout = scan_req.Error() == eloqstore::KvError::Timeout;
+    }
+    REQUIRE(saw_timeout);
+
+    eloqstore::ReadRequest read_req(10'000);
+    read_req.SetArgs(tbl_id, test_util::Key(0, 12));
+    store.ExecSync(&read_req);
+    REQUIRE(read_req.Error() == eloqstore::KvError::NoError);
+
+    store.Stop();
 }

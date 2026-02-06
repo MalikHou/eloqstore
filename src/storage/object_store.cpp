@@ -15,6 +15,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <ios>
@@ -58,6 +59,30 @@ size_t AppendToString(void *contents, size_t size, size_t nmemb, void *userp)
     auto *buffer = static_cast<std::string *>(userp);
     buffer->append(static_cast<char *>(contents), total);
     return total;
+}
+
+bool IsIncompleteBodyError(const ObjectStore::Task *task)
+{
+    if (task == nullptr || task->response_data_.empty())
+    {
+        return false;
+    }
+    std::string_view response(task->response_data_.data(),
+                              task->response_data_.size());
+    return response.find("IncompleteBody") != std::string_view::npos;
+}
+
+uint32_t ComputeIncompleteBodyRetryDelayMs(uint8_t retry_count)
+{
+    // Fast retries for transient short-body uploads: 200ms, 400ms, 800ms...
+    // capped at 5s.
+    if (retry_count == 0)
+    {
+        return 200;
+    }
+    const uint8_t shift = std::min<uint8_t>(retry_count - 1, 4);
+    const uint32_t delay = 200U << shift;
+    return std::min<uint32_t>(delay, 5000U);
 }
 
 bool ParseJsonListResponse(std::string_view payload,
@@ -584,11 +609,21 @@ protected:
 
     virtual std::string DefaultEndpoint() const
     {
+        if (const char *endpoint = std::getenv("ELOQSTORE_CLOUD_ENDPOINT");
+            endpoint != nullptr && endpoint[0] != '\0')
+        {
+            return endpoint;
+        }
         return std::string(kDefaultAwsEndpoint);
     }
 
     virtual std::string DefaultRegion() const
     {
+        if (const char *region = std::getenv("ELOQSTORE_CLOUD_REGION");
+            region != nullptr && region[0] != '\0')
+        {
+            return region;
+        }
         return std::string(kDefaultAwsRegion);
     }
 
@@ -1459,6 +1494,22 @@ void AsyncHttpManager::ProcessCompletedRequests()
                 else if (response_code == 404)
                 {
                     task->error_ = KvError::NotFound;
+                }
+                else if (response_code == 400 &&
+                         task->TaskType() ==
+                             ObjectStore::Task::Type::AsyncUpload &&
+                         IsIncompleteBodyError(task) &&
+                         task->retry_count_ < task->max_retries_)
+                {
+                    task->retry_count_++;
+                    retry_delay_ms =
+                        ComputeIncompleteBodyRetryDelayMs(task->retry_count_);
+                    schedule_retry = true;
+                    LOG(WARNING) << "HTTP 400 IncompleteBody, scheduling retry "
+                                 << unsigned(task->retry_count_) << "/"
+                                 << unsigned(task->max_retries_) << " in "
+                                 << retry_delay_ms << " ms"
+                                 << ", task=" << task->Info();
                 }
                 else if (IsHttpRetryable(response_code) &&
                          task->retry_count_ < task->max_retries_)

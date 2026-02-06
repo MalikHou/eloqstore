@@ -143,6 +143,11 @@ int KvOptions::LoadFromIni(const char *path)
     {
         io_queue_size = reader.GetUnsigned(sec_run, "io_queue_size", 4096);
     }
+    if (reader.HasValue(sec_run, "read_request_timeout_ms"))
+    {
+        read_request_timeout_ms =
+            reader.GetUnsigned(sec_run, "read_request_timeout_ms", 0);
+    }
     if (reader.HasValue(sec_run, "max_inflight_write"))
     {
         max_inflight_write =
@@ -196,6 +201,18 @@ int KvOptions::LoadFromIni(const char *path)
     {
         max_upload_batch =
             reader.GetUnsigned(sec_run, "max_upload_batch", max_upload_batch);
+    }
+    if (reader.HasValue(sec_run, "cloud_upload_max_retries"))
+    {
+        uint32_t retries = reader.GetUnsigned(
+            sec_run, "cloud_upload_max_retries", cloud_upload_max_retries);
+        if (retries > std::numeric_limits<uint8_t>::max())
+        {
+            LOG(WARNING) << "cloud_upload_max_retries " << retries
+                         << " exceeds uint8_t max, clamping to 255";
+            retries = std::numeric_limits<uint8_t>::max();
+        }
+        cloud_upload_max_retries = static_cast<uint8_t>(retries);
     }
     if (reader.HasValue(sec_run, "max_cloud_concurrency"))
     {
@@ -334,6 +351,7 @@ bool KvOptions::operator==(const KvOptions &other) const
            root_meta_cache_size == other.root_meta_cache_size &&
            manifest_limit == other.manifest_limit &&
            fd_limit == other.fd_limit && io_queue_size == other.io_queue_size &&
+           read_request_timeout_ms == other.read_request_timeout_ms &&
            max_inflight_write == other.max_inflight_write &&
            max_write_batch_pages == other.max_write_batch_pages &&
            buf_ring_size == other.buf_ring_size &&
@@ -345,6 +363,7 @@ bool KvOptions::operator==(const KvOptions &other) const
            local_space_limit == other.local_space_limit &&
            reserve_space_ratio == other.reserve_space_ratio &&
            max_upload_batch == other.max_upload_batch &&
+           cloud_upload_max_retries == other.cloud_upload_max_retries &&
            max_cloud_concurrency == other.max_cloud_concurrency &&
            cloud_request_threads == other.cloud_request_threads &&
            direct_io_buffer_pool_size == other.direct_io_buffer_pool_size &&

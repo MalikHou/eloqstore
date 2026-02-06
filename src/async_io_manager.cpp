@@ -3008,6 +3008,7 @@ std::pair<KvError, int64_t> CloudStoreMgr::CasCreateTermFile(
     ObjectStore::UploadTask upload_task(&tbl_id, CurrentTermFileName);
     upload_task.data_buffer_.append(term_str);
     upload_task.if_none_match_ = "*";  // Only create if doesn't exist
+    upload_task.max_retries_ = options_->cloud_upload_max_retries;
     upload_task.SetKvTask(current_task);
 
     AcquireCloudSlot(current_task);
@@ -3026,6 +3027,7 @@ std::pair<KvError, int64_t> CloudStoreMgr::CasUpdateTermFileWithEtag(
     ObjectStore::UploadTask upload_task(&tbl_id, CurrentTermFileName);
     upload_task.data_buffer_.append(term_str);
     upload_task.if_match_ = etag;  // Only update if ETag matches
+    upload_task.max_retries_ = options_->cloud_upload_max_retries;
     upload_task.SetKvTask(current_task);
 
     AcquireCloudSlot(current_task);
@@ -3582,6 +3584,7 @@ KvError CloudStoreMgr::UploadFiles(const TableIdent &tbl_id,
     {
         auto task =
             std::make_unique<ObjectStore::UploadTask>(&tbl_id, std::move(name));
+        task->max_retries_ = options_->cloud_upload_max_retries;
         task->SetKvTask(current_task);
         pending.emplace_back(task.get());
         tasks.emplace_back(std::move(task));

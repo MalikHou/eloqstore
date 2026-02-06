@@ -93,7 +93,7 @@ ensure_clang_format_18_1_8() {
 # Format all files in the project
 ensure_clang_format_18_1_8 || { echo "[ERROR] Format failed" >&2; exit 1; }
 
-git ls-files -z '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' \
+git ls-files -z -c -o --exclude-standard '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' \
 | awk -v RS='\0' -v ORS='\0' '!/^(third_party|vendor|build|external)\//' \
 | xargs -0 -r clang-format-18.1.8 -i --style="file"
 

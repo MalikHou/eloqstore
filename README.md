@@ -99,23 +99,13 @@ This script installs all necessary dependencies including:
 
 **Note**: This script requires sudo privileges and may take several minutes to complete.
 
-### Debug Mode
+### Compile
 
 ```shell
 mkdir build
 cd build
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-cmake --build . -j8
-cd ..
-```
-
-### Release Mode
-
-```shell
-mkdir Release
-cd Release
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . -j8
+cmake .. -DCMAKE_BUILD_TYPE=Debug/Release
+cmake --build . -j
 cd ..
 ```
 
@@ -142,7 +132,12 @@ chmod +x minio
 ctest --test-dir build/tests/
 ```
 
-**Note**: Ensure MinIO is running before executing the tests. The tests will connect to MinIO running on `127.0.0.1:9900` by default.
+**Note**: Ensure MinIO is running before executing the tests. By default tests connect to `127.0.0.1:9900`.  
+To use a different endpoint (for example a Docker bridge IP), set:
+
+```shell
+export ELOQSTORE_CLOUD_ENDPOINT=http://127.0.0.1:9900
+```
 
 ### Benchmark
 

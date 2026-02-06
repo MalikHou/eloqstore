@@ -10,11 +10,8 @@
 #include <string>
 #include <utility>
 
-#if defined(__x86_64__) || defined(_M_X64)
-#include <x86intrin.h>  // For __rdtsc()
-#endif
-
 #include "async_io_manager.h"
+#include "fast_clock.h"
 #include "tasks/list_object_task.h"
 #include "utils.h"
 
@@ -27,9 +24,6 @@
 #endif
 namespace eloqstore
 {
-std::once_flag Shard::tsc_frequency_initialized_;
-std::atomic<uint64_t> Shard::tsc_cycles_per_microsecond_{0};
-
 DEFINE_uint64(max_processing_time_microseconds,
               50,
               "Max processing time in microseconds for low priority tasks.");
@@ -46,6 +40,58 @@ Shard::Shard(const EloqStore *store, size_t shard_id, uint32_t fd_limit)
     oss_enabled_ = !opts.store_path.empty() && !opts.cloud_store_path.empty();
 }
 
+bool Shard::IsTimedReadRequestType(RequestType type)
+{
+    return type == RequestType::Read || type == RequestType::Floor ||
+           type == RequestType::Scan;
+}
+
+uint32_t Shard::ResolveReadTimeoutMs(const KvRequest *req) const
+{
+    const uint32_t request_timeout_ms = req->TimeOutMs();
+    return request_timeout_ms == 0 ? store_->Options().read_request_timeout_ms
+                                   : request_timeout_ms;
+}
+
+bool Shard::IsReadRequestTimedOut(const KvRequest *req) const
+{
+    if (req == nullptr || !IsTimedReadRequestType(req->Type()))
+    {
+        return false;
+    }
+    if (req->start_time_ms_ == 0)
+    {
+        return false;
+    }
+
+    const uint32_t timeout_ms = ResolveReadTimeoutMs(req);
+    if (timeout_ms == 0)
+    {
+        return false;
+    }
+
+    const uint64_t now_ms = FastClock::NowMilliseconds();
+    if (now_ms < req->start_time_ms_)
+    {
+        // Monotonic clock wraparound is unlikely, but fail closed.
+        return true;
+    }
+    return now_ms - req->start_time_ms_ >= timeout_ms;
+}
+
+KvError Shard::ApplyReadTimeoutOnCompletion(KvRequest *req, KvError err) const
+{
+    if (req == nullptr || !IsTimedReadRequestType(req->Type()))
+    {
+        return err;
+    }
+    if (err != KvError::NoError && err != KvError::NotFound)
+    {
+        return err;
+    }
+    return IsReadRequestTimedOut(req) ? KvError::Timeout : err;
+}
+
 KvError Shard::Init()
 {
     // Inject process term into IO manager before any file operations.
@@ -59,7 +105,6 @@ KvError Shard::Init()
             cloud_mgr->SetProcessTerm(term);
         }
     }
-    InitializeTscFrequency();
     KvError res = io_mgr_->Init(this);
     return res;
 }
@@ -294,6 +339,12 @@ PagesPool *Shard::PagePool()
 
 void Shard::OnReceivedReq(KvRequest *req)
 {
+    if (IsReadRequestTimedOut(req))
+    {
+        req->SetDone(KvError::Timeout);
+        return;
+    }
+
     if (!req->ReadOnly())
     {
         auto wreq = reinterpret_cast<WriteRequest *>(req);
@@ -476,7 +527,7 @@ void Shard::ProcessReq(KvRequest *req)
 
 bool Shard::ExecuteReadyTasks()
 {
-    uint64_t start_us_fast = ReadTimeMicroseconds();
+    const uint64_t start_us_fast = FastClock::NowMicroseconds();
 
     if (oss_enabled_)
     {
@@ -508,7 +559,7 @@ bool Shard::ExecuteReadyTasks()
         {
             OnTaskFinished(task);
         }
-        uint64_t delta_us = DurationMicroseconds(start_us_fast);
+        const uint64_t delta_us = FastClock::ElapsedMicroseconds(start_us_fast);
         if (delta_us >= FLAGS_max_processing_time_microseconds)
         {
             break;
@@ -679,140 +730,6 @@ bool Shard::PendingWriteQueue::Empty() const
 bool Shard::HasPendingRequests() const
 {
     return requests_.size_approx() > 0;
-}
-
-/** @brief
- * Measure TSC frequency by sleeping for 1ms and measuring cycles.
- * Retries until stable (within 1% difference) or up to 16ms total.
- * Should be called once during data substrate initialization.
- * This function is thread-safe and will only execute once.
- */
-void Shard::InitializeTscFrequency()
-{
-#if defined(__x86_64__) || defined(_M_X64)
-    std::call_once(
-        tsc_frequency_initialized_,
-        []()
-        {
-            constexpr uint64_t SLEEP_MICROSECONDS = 1000;       // 1ms
-            constexpr uint64_t MAX_TOTAL_MICROSECONDS = 16000;  // 16ms max
-            constexpr double STABILITY_THRESHOLD =
-                0.01;  // 1% difference for stability
-
-            uint64_t prev_freq = 0;
-            uint64_t total_slept = 0;
-            int stable_count = 0;
-            constexpr int REQUIRED_STABLE_COUNT =
-                2;  // Need 2 consecutive stable measurements
-
-            while (total_slept < MAX_TOTAL_MICROSECONDS)
-            {
-                uint64_t start_cycles = __rdtsc();
-                std::this_thread::sleep_for(
-                    std::chrono::microseconds(SLEEP_MICROSECONDS));
-                uint64_t end_cycles = __rdtsc();
-                uint64_t elapsed_cycles = end_cycles - start_cycles;
-                uint64_t freq = elapsed_cycles /
-                                SLEEP_MICROSECONDS;  // cycles per microsecond
-
-                total_slept += SLEEP_MICROSECONDS;
-
-                // Check if frequency is stable (within 1% of previous
-                // measurement)
-                if (prev_freq > 0)
-                {
-                    double diff_ratio =
-                        (freq > prev_freq)
-                            ? static_cast<double>(freq - prev_freq) / prev_freq
-                            : static_cast<double>(prev_freq - freq) / prev_freq;
-                    if (diff_ratio <= STABILITY_THRESHOLD)
-                    {
-                        stable_count++;
-                        if (stable_count >= REQUIRED_STABLE_COUNT)
-                        {
-                            // Frequency is stable, use the average
-                            tsc_cycles_per_microsecond_.store(
-                                (prev_freq + freq) / 2,
-                                std::memory_order_release);
-                            return;
-                        }
-                    }
-                    else
-                    {
-                        stable_count = 0;  // Reset stability counter
-                    }
-                }
-
-                prev_freq = freq;
-            }
-
-            // If we couldn't get stable measurement, use the last measured
-            // value
-            if (prev_freq > 0)
-            {
-                tsc_cycles_per_microsecond_.store(prev_freq,
-                                                  std::memory_order_release);
-            }
-            else
-            {
-                // Fallback to approximate value if measurement failed
-                tsc_cycles_per_microsecond_.store(2000,
-                                                  std::memory_order_release);
-            }
-        });  // End of lambda passed to std::call_once
-#elif defined(__aarch64__)
-    std::call_once(tsc_frequency_initialized_,
-                   []()
-                   {
-                       uint64_t freq_hz;
-                       __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq_hz));
-                       tsc_cycles_per_microsecond_.store(
-                           freq_hz / 1000000, std::memory_order_release);
-                   });
-#endif
-}
-
-uint64_t Shard::ReadTimeMicroseconds()
-{
-#if defined(__x86_64__) || defined(_M_X64)
-    uint64_t cycles_per_us =
-        tsc_cycles_per_microsecond_.load(std::memory_order_relaxed);
-    assert(cycles_per_us != 0);
-    // Read TSC (Time Stamp Counter) - returns CPU cycles
-    uint64_t cycles = __rdtsc();
-    return cycles / cycles_per_us;
-#elif defined(__aarch64__)
-    // Ensure ARM timer frequency is initialized (thread-safe, only initializes
-    // once)
-    uint64_t cycles_per_us =
-        tsc_cycles_per_microsecond_.load(std::memory_order_relaxed);
-    assert(cycles_per_us != 0);
-    // Read ARM virtual counter - returns timer ticks
-    uint64_t ticks;
-    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(ticks));
-    return ticks / cycles_per_us;
-#else
-    // Fallback to std::chrono (slower but portable and precise)
-    using namespace std::chrono;
-    auto now = steady_clock::now();
-    return duration_cast<microseconds>(now.time_since_epoch()).count();
-#endif
-}
-
-uint64_t Shard::DurationMicroseconds(uint64_t start_us)
-{
-    // Check elapsed time (returns microseconds directly)
-    uint64_t end_us = ReadTimeMicroseconds();
-    // Handle potential wraparound (unlikely but safe)
-    if (end_us > start_us)
-    {
-        return end_us - start_us;
-    }
-    else
-    {
-        // Wraparound detected, use max value to break loop
-        return FLAGS_max_processing_time_microseconds;
-    }
 }
 
 }  // namespace eloqstore

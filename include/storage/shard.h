@@ -81,11 +81,10 @@ private:
     }
 #endif
 
-    void InitializeTscFrequency();
-
-    uint64_t ReadTimeMicroseconds();
-
-    uint64_t DurationMicroseconds(uint64_t start_us);
+    static bool IsTimedReadRequestType(RequestType type);
+    uint32_t ResolveReadTimeoutMs(const KvRequest *req) const;
+    bool IsReadRequestTimedOut(const KvRequest *req) const;
+    KvError ApplyReadTimeoutOnCompletion(KvRequest *req, KvError err) const;
 
     template <typename F>
     void StartTask(KvTask *task, KvRequest *req, F lbd)
@@ -121,6 +120,7 @@ private:
                         LOG(ERROR) << "Task is aborted due to out of memory";
                     }
                 }
+                err = this->ApplyReadTimeoutOnCompletion(task->req_, err);
 
 #ifdef ELOQSTORE_WITH_TXSERVICE
                 // Save request type before SetDone
@@ -222,10 +222,6 @@ private:
         0};  // Counter for frequency-controlled metric collection (not atomic
              // since each Shard runs in single-threaded context)
 #endif
-
-    // TSC frequency in cycles per microsecond (measured at initialization)
-    static std::once_flag tsc_frequency_initialized_;
-    static std::atomic<uint64_t> tsc_cycles_per_microsecond_;
 
     friend class EloqStoreModule;
 };

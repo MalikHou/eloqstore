@@ -3,7 +3,14 @@
     "build": {
       "dockerfile": "Dockerfile"
     },
-  
+    "runArgs": [
+      "--security-opt=seccomp=unconfined",
+      "--security-opt=apparmor=unconfined",
+      "--ulimit=memlock=-1:-1"
+    ],
+    "containerEnv": {
+      "ELOQSTORE_CLOUD_ENDPOINT": "http://127.0.0.1:9900"
+    },
     "remoteUser": "root",
     "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}"
 }
