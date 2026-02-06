@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <span>
@@ -88,10 +89,6 @@ public:
     virtual void InitBackgroundJob()
     {
     }
-    virtual bool BackgroundJobInited()
-    {
-        return true;
-    }
     virtual void RunPrewarm() {};
 
     /** These methods are provided for kv task. */
@@ -105,9 +102,6 @@ public:
     virtual KvError WritePage(const TableIdent &tbl_id,
                               VarPage page,
                               FilePageId file_page_id) = 0;
-    virtual KvError WritePages(const TableIdent &tbl_id,
-                               std::span<VarPage> pages,
-                               FilePageId first_fp_id) = 0;
     virtual KvError SyncData(const TableIdent &tbl_id) = 0;
     virtual KvError AbortWrite(const TableIdent &tbl_id) = 0;
 
@@ -127,6 +121,53 @@ public:
                              DirectIoBuffer &content)
     {
         __builtin_unreachable();
+    }
+
+    // Append-mode write buffer pool helpers (default no-op).
+    virtual char *AcquireWriteBuffer(uint16_t &buf_index)
+    {
+        (void) buf_index;
+        return nullptr;
+    }
+    virtual void ReleaseWriteBuffer(char *ptr, uint16_t buf_index)
+    {
+        (void) ptr;
+        (void) buf_index;
+    }
+    virtual size_t WriteBufferSize() const
+    {
+        return 0;
+    }
+    virtual bool HasWriteBufferPool() const
+    {
+        return false;
+    }
+    virtual bool WriteBufferUseFixed() const
+    {
+        return false;
+    }
+    virtual KvError SubmitMergedWrite(const TableIdent &tbl_id,
+                                      FileId file_id,
+                                      uint64_t offset,
+                                      char *buf_ptr,
+                                      size_t bytes,
+                                      uint16_t buf_index,
+                                      std::vector<VarPage> &pages,
+                                      std::vector<char *> &release_ptrs,
+                                      std::vector<uint16_t> &release_indices,
+                                      bool use_fixed)
+    {
+        (void) tbl_id;
+        (void) file_id;
+        (void) offset;
+        (void) buf_ptr;
+        (void) bytes;
+        (void) buf_index;
+        (void) pages;
+        (void) release_ptrs;
+        (void) release_indices;
+        (void) use_fixed;
+        return KvError::InvalidArgs;
     }
     /**
      * @brief Get the number of currently open file descriptors.
@@ -226,6 +267,31 @@ public:
     KvError Init(Shard *shard) override;
     void Submit() override;
     void PollComplete() override;
+    char *AcquireWriteBuffer(uint16_t &buf_index) override;
+    void ReleaseWriteBuffer(char *ptr, uint16_t buf_index) override;
+    size_t WriteBufferSize() const override
+    {
+        return write_buf_size_;
+    }
+    bool HasWriteBufferPool() const override
+    {
+        return write_buf_size_ > 0 && write_buf_ != nullptr;
+    }
+    bool WriteBufferUseFixed() const override
+    {
+        return write_buf_registered_;
+    }
+    KvError SubmitMergedWrite(const TableIdent &tbl_id,
+                              FileId file_id,
+                              uint64_t offset,
+                              char *buf_ptr,
+                              size_t bytes,
+                              uint16_t buf_index,
+                              std::vector<VarPage> &pages,
+                              std::vector<char *> &release_ptrs,
+                              std::vector<uint16_t> &release_indices,
+                              bool use_fixed) override;
+    void InitBackgroundJob() override;
 
     std::pair<Page, KvError> ReadPage(const TableIdent &tbl_id,
                                       FilePageId fp_id,
@@ -237,9 +303,6 @@ public:
     KvError WritePage(const TableIdent &tbl_id,
                       VarPage page,
                       FilePageId file_page_id) override;
-    KvError WritePages(const TableIdent &tbl_id,
-                       std::span<VarPage> pages,
-                       FilePageId first_fp_id) override;
     KvError SyncData(const TableIdent &tbl_id) override;
     KvError AbortWrite(const TableIdent &tbl_id) override;
 
@@ -371,7 +434,8 @@ public:
     {
         KvTask,
         BaseReq,
-        WriteReq
+        WriteReq,
+        MergedWriteReq
     };
 
     struct BaseReq
@@ -390,6 +454,21 @@ public:
         LruFD::Ref fd_ref_;
         WriteTask *task_{nullptr};
         WriteReq *next_{nullptr};
+    };
+
+    struct MergedWriteReq
+    {
+        WriteTask *task_{nullptr};
+        LruFD::Ref fd_ref_;
+        char *buf_ptr_{nullptr};
+        uint16_t buf_index_{0};
+        bool use_fixed_{true};
+        size_t bytes_{0};
+        uint64_t offset_{0};
+        std::vector<VarPage> pages_;
+        std::vector<char *> release_ptrs_;
+        std::vector<uint16_t> release_indices_;
+        MergedWriteReq *next_{nullptr};
     };
 
     class PartitionFiles
@@ -431,25 +510,26 @@ public:
     uint32_t AllocRegisterIndex();
     void FreeRegisterIndex(uint32_t idx);
 
+    uint16_t LookupRegisteredBufferIndex(const char *ptr) const;
+
     // Low-level io operation. Very simple wrap on syscall.
     io_uring_sqe *GetSQE(UserDataType type, const void *user_ptr);
     int MakeDir(FdIdx dir_fd, const char *path);
     int OpenAt(FdIdx dir_fd,
                const char *path,
                uint64_t flags,
-               uint64_t mode = 0);
+               uint64_t mode = 0,
+               bool fixed_target = true);
     int Read(FdIdx fd, char *dst, size_t n, uint64_t offset);
     int Write(FdIdx fd, const char *src, size_t n, uint64_t offset);
-    int Fdatasync(FdIdx fd);
-    int Statx(int fd, const char *path, struct statx *result);
+    virtual int Fdatasync(FdIdx fd);
+    int Statx(FdIdx fd, const char *path, struct statx *result);
+    int StatxAt(FdIdx dir_fd, const char *path, struct statx *result);
     int Rename(FdIdx dir_fd, const char *old_path, const char *new_path);
     int Close(int fd);
-    int RegisterFile(int fd);
-    int UnregisterFile(int idx);
+    int CloseDirect(int idx);
     int Fallocate(FdIdx fd, uint64_t size);
     int UnlinkAt(FdIdx dir_fd, const char *path, bool rmdir);
-    Page SwapPage(Page page, uint16_t buf_id);
-
     /**
      * @brief Write content to a file with given name in the directory.
      * This is often used to write snapshot of manifest atomically.
@@ -462,17 +542,19 @@ public:
                            uint64_t term = 0);
     virtual int OpenFile(const TableIdent &tbl_id,
                          FileId file_id,
-                         bool direct,
+                         uint64_t flags,
+                         uint64_t mode,
                          uint64_t term = 0);
     virtual KvError SyncFile(LruFD::Ref fd);
     virtual KvError SyncFiles(const TableIdent &tbl_id,
                               std::span<LruFD::Ref> fds);
     KvError CloseFiles(std::span<LruFD::Ref> fds);
-    KvError FdatasyncFiles(const TableIdent &tbl_id, std::span<LruFD::Ref> fds);
+    virtual KvError FdatasyncFiles(const TableIdent &tbl_id,
+                                   std::span<LruFD::Ref> fds);
     virtual KvError CloseFile(LruFD::Ref fd_ref);
     bool HasOtherFile(const TableIdent &tbl_id) const;
 
-    static FdIdx GetRootFD(const TableIdent &tbl_id);
+    FdIdx GetRootFD(const TableIdent &tbl_id);
     /**
      * @brief Get file descripter if it is already opened.
      */
@@ -511,10 +593,30 @@ public:
         WaitingZone waiting_;
     };
 
+    class MergedWriteReqPool
+    {
+    public:
+        explicit MergedWriteReqPool(uint32_t pool_size);
+        MergedWriteReq *Alloc(WriteTask *task,
+                              LruFD::Ref fd,
+                              char *buf_ptr,
+                              uint16_t buf_index,
+                              size_t bytes,
+                              uint64_t offset,
+                              std::vector<VarPage> pages);
+        void Free(MergedWriteReq *req);
+
+    private:
+        std::unique_ptr<MergedWriteReq[]> pool_;
+        MergedWriteReq *free_list_;
+        WaitingZone waiting_;
+    };
+
     /**
      * @brief This is only used in non-append mode.
      */
     std::unique_ptr<WriteReqPool> write_req_pool_{nullptr};
+    std::unique_ptr<MergedWriteReqPool> merged_write_req_pool_{nullptr};
 
     std::unordered_map<TableIdent, PartitionFiles> tables_;
     // Per-table FileIdTermMapping storage. Mapping is shared between
@@ -529,14 +631,33 @@ public:
     uint32_t alloc_reg_slot_{0};
     std::vector<uint32_t> free_reg_slots_;
 
-    io_uring_buf_ring *buf_ring_{nullptr};
-    std::vector<Page> bufs_pool_;
-    const int buf_group_{0};
-
     bool ring_inited_{false};
+    bool buffers_registered_{false};
+    char *registered_buf_base_{nullptr};
+    size_t registered_buf_stride_{0};
+    uint8_t registered_buf_shift_{0};
+    uint16_t registered_buf_count_{0};
+    size_t registered_last_slice_size_{0};
+    std::unique_ptr<char, decltype(&std::free)> write_buf_{nullptr, &std::free};
+    size_t write_buf_size_{0};
+    size_t write_buf_pool_size_{0};
+    uint16_t write_buf_count_{0};
+    bool write_buf_registered_{false};
+    uint16_t write_buf_index_base_{0};
+    struct WriteBufSlot
+    {
+        WriteBufSlot *next{nullptr};
+        uint16_t index{0};
+    };
+    std::vector<WriteBufSlot> write_buf_slots_;
+    WriteBufSlot *write_buf_free_{nullptr};
+    WaitingZone write_buf_waiting_;
+
     io_uring ring_;
     WaitingZone waiting_sqe_;
     uint32_t prepared_sqe_{0};
+
+    KvError BootstrapRing(Shard *shard);
 };
 
 class CloudStoreMgr : public IouringMgr
@@ -593,6 +714,16 @@ public:
     size_t ActivePrewarmTasks() const
     {
         return active_prewarm_tasks_;
+    }
+    // Cloud mode does not need fsync.
+    int Fdatasync(FdIdx fd) override
+    {
+        return 0;
+    }
+    KvError FdatasyncFiles(const TableIdent &tbl_id,
+                           std::span<LruFD::Ref> fds) override
+    {
+        return KvError::NoError;
     }
     void RegisterPrewarmActive();
     void UnregisterPrewarmActive();
@@ -660,7 +791,8 @@ private:
                    uint64_t term = 0) override;
     int OpenFile(const TableIdent &tbl_id,
                  FileId file_id,
-                 bool direct,
+                 uint64_t flags,
+                 uint64_t mode,
                  uint64_t term = 0) override;
     KvError SyncFile(LruFD::Ref fd) override;
     KvError SyncFiles(const TableIdent &tbl_id,
@@ -680,7 +812,6 @@ private:
     static std::string ToFilename(FileId file_id, uint64_t term = 0);
     size_t EstimateFileSize(FileId file_id) const;
     size_t EstimateFileSize(std::string_view filename) const;
-    bool BackgroundJobInited() override;
     void InitBackgroundJob() override;
     KvError RestoreLocalCacheState();
     KvError RestoreFilesForTable(const TableIdent &tbl_id,
@@ -743,7 +874,6 @@ private:
         bool killed_{false};
     };
 
-    bool background_job_inited_{false};
     FileCleaner file_cleaner_;
     std::vector<std::unique_ptr<Prewarmer>> prewarmers_;
     size_t active_prewarm_tasks_{0};
@@ -798,9 +928,6 @@ public:
     KvError WritePage(const TableIdent &tbl_id,
                       VarPage page,
                       FilePageId file_page_id) override;
-    KvError WritePages(const TableIdent &tbl_id,
-                       std::span<VarPage> pages,
-                       FilePageId first_fp_id) override;
     KvError SyncData(const TableIdent &tbl_id) override;
     KvError AbortWrite(const TableIdent &tbl_id) override;
 

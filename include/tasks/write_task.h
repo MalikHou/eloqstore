@@ -1,6 +1,6 @@
 #pragma once
 
-#include <vector>
+#include <utility>
 
 #include "error.h"
 #include "storage/data_page.h"
@@ -8,6 +8,7 @@
 #include "storage/page_mapper.h"
 #include "storage/root_meta.h"
 #include "tasks/task.h"
+#include "tasks/write_buffer_aggregator.h"
 #include "types.h"
 
 namespace eloqstore
@@ -50,6 +51,7 @@ protected:
     std::pair<OverflowPage, KvError> LoadOverflowPage(PageId page_id);
 
     std::pair<PageId, FilePageId> AllocatePage(PageId page_id);
+    std::string_view TaskTypeName() const;
     void FreePage(PageId page_id);
 
     FilePageId ToFilePage(PageId page_id);
@@ -63,24 +65,15 @@ protected:
     KvError WritePage(OverflowPage &&page);
     KvError WritePage(MemIndexPage *page);
     KvError WritePage(VarPage page, FilePageId file_page_id);
-
-    KvError FlushBatchPages();
-    /**
-     * @brief When the append-only mode is enabled, the pages ready to be
-     * written are put into this batch. The batch is then sequentially
-     * written to the disk when it is full or when a data file switch is
-     * required.
-     */
-    std::vector<VarPage> batch_pages_;
-    /**
-     * @brief First file page id of this batch of pages.
-     */
-    FilePageId batch_fp_id_{MaxFilePageId};
+    KvError AppendWritePage(VarPage page, FilePageId file_page_id);
+    void FlushAppendWrites();
+    std::pair<FileId, uint32_t> ConvFilePageId(FilePageId file_page_id) const;
 
     // Track whether FileIdTermMapping changed in this write task.
     // If it changed, we must force a full snapshot (WAL append doesn't include
     // FileIdTermMapping).
     bool file_id_term_mapping_dirty_{false};
+    WriteBufferAggregator append_aggregator_{0};
 };
 
 }  // namespace eloqstore
