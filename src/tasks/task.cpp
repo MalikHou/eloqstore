@@ -78,6 +78,50 @@ void KvTask::FinishIo()
     }
 }
 
+void KvTask::ResetIoTimeoutState()
+{
+    io_timeout_seq_++;
+    io_timeout_enabled_ = false;
+    io_cancel_requested_ = false;
+    io_timeout_pending_cancel_ = false;
+    io_timeout_deadline_ms_ = 0;
+    io_timeout_timer_idx_ = 0;
+    io_timeout_timer_gen_ = 0;
+    io_timeout_owner_ = nullptr;
+    tracked_io_user_data_count_ = 0;
+}
+
+bool KvTask::TrackIoUserData(uint64_t user_data)
+{
+    for (uint16_t i = 0; i < tracked_io_user_data_count_; ++i)
+    {
+        if (tracked_io_user_data_[i] == user_data)
+        {
+            return true;
+        }
+    }
+    if (tracked_io_user_data_count_ >= tracked_io_user_data_.size())
+    {
+        return false;
+    }
+    tracked_io_user_data_[tracked_io_user_data_count_++] = user_data;
+    return true;
+}
+
+void KvTask::UntrackIoUserData(uint64_t user_data)
+{
+    for (uint16_t i = 0; i < tracked_io_user_data_count_; ++i)
+    {
+        if (tracked_io_user_data_[i] == user_data)
+        {
+            tracked_io_user_data_[i] =
+                tracked_io_user_data_[tracked_io_user_data_count_ - 1];
+            tracked_io_user_data_count_--;
+            return;
+        }
+    }
+}
+
 std::pair<Page, KvError> LoadPage(const TableIdent &tbl_id,
                                   FilePageId file_page_id)
 {

@@ -12,6 +12,7 @@
 #include "circular_queue.h"
 #include "common.h"
 #include "test_utils.h"
+#include "time_wheel.h"
 
 namespace fs = std::filesystem;
 
@@ -67,6 +68,11 @@ TEST_CASE("EloqStore ValidateOptions validates all parameters", "[eloq_store]")
 
     // Test invalid max_write_batch_pages
     options.max_write_batch_pages = 0;
+    REQUIRE(eloqstore::EloqStore::ValidateOptions(options) == false);
+    options = CreateValidOptions(test_dir);  // restore valid value
+
+    // Test invalid read_request_timeout_ms (> time wheel max delay)
+    options.read_request_timeout_ms = eloqstore::TimeWheel::kMaxDelayMs + 1;
     REQUIRE(eloqstore::EloqStore::ValidateOptions(options) == false);
     options = CreateValidOptions(test_dir);  // restore valid value
 
@@ -337,6 +343,37 @@ TEST_CASE("Read/Floor/Scan request timeout constructors",
     REQUIRE(read_req.TimeOutMs() == 10);
     REQUIRE(floor_req.TimeOutMs() == 20);
     REQUIRE(scan_req.TimeOutMs() == 30);
+}
+
+TEST_CASE("Read/Floor/Scan request timeout rejects values over 60s",
+          "[eloq_store][timeout]")
+{
+    eloqstore::KvOptions options;
+    options.num_threads = 1;
+
+    eloqstore::EloqStore store(options);
+    REQUIRE(store.Start() == eloqstore::KvError::NoError);
+
+    eloqstore::TableIdent tbl_id("timeout_limit_table", 0);
+
+    eloqstore::ReadRequest read_req(60'001);
+    read_req.SetArgs(tbl_id, test_util::Key(0, 12));
+    store.ExecSync(&read_req);
+    REQUIRE(read_req.Error() == eloqstore::KvError::InvalidArgs);
+
+    eloqstore::FloorRequest floor_req(60'001);
+    floor_req.SetArgs(tbl_id, test_util::Key(0, 12));
+    store.ExecSync(&floor_req);
+    REQUIRE(floor_req.Error() == eloqstore::KvError::InvalidArgs);
+
+    eloqstore::ScanRequest scan_req(60'001);
+    scan_req.SetArgs(tbl_id, std::string_view{}, std::string_view{});
+    scan_req.SetPagination(std::numeric_limits<size_t>::max(),
+                           std::numeric_limits<size_t>::max());
+    store.ExecSync(&scan_req);
+    REQUIRE(scan_req.Error() == eloqstore::KvError::InvalidArgs);
+
+    store.Stop();
 }
 
 TEST_CASE("EloqStore read timeout applies to scan and request timeout can "

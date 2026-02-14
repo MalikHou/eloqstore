@@ -1,6 +1,12 @@
 #include "time_wheel.h"
+
 #include <atomic>
 #include <cassert>
+#include <chrono>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <x86intrin.h>
+#endif
 
 namespace eloqstore
 {
@@ -9,30 +15,30 @@ std::atomic<uint64_t> tsc_cycles_per_microsecond_{0};
 
 inline uint64_t ReadTimeMicroseconds()
 {
-        #if defined(__x86_64__) || defined(_M_X64)
-            uint64_t cycles_per_us =
-                tsc_cycles_per_microsecond_.load(std::memory_order_relaxed);
-            assert(cycles_per_us != 0);
-            // Read TSC (Time Stamp Counter) - returns CPU cycles
-            uint64_t cycles = __rdtsc();
-            return cycles / cycles_per_us;
-        #elif defined(__aarch64__)
-            // Ensure ARM timer frequency is initialized (thread-safe, only initializes
-            // once)
-            uint64_t cycles_per_us =
-                tsc_cycles_per_microsecond_.load(std::memory_order_relaxed);
-            assert(cycles_per_us != 0);
-            // Read ARM virtual counter - returns timer ticks
-            uint64_t ticks;
-            __asm__ volatile("mrs %0, cntvct_el0" : "=r"(ticks));
-            return ticks / cycles_per_us;
-        #else
-            // Fallback to std::chrono (slower but portable and precise)
-            using namespace std::chrono;
-            auto now = steady_clock::now();
-            return duration_cast<microseconds>(now.time_since_epoch()).count();
-        #endif
-        }
+#if defined(__x86_64__) || defined(_M_X64)
+    uint64_t cycles_per_us =
+        tsc_cycles_per_microsecond_.load(std::memory_order_relaxed);
+    assert(cycles_per_us != 0);
+    // Read TSC (Time Stamp Counter) - returns CPU cycles
+    uint64_t cycles = __rdtsc();
+    return cycles / cycles_per_us;
+#elif defined(__aarch64__)
+    // Ensure ARM timer frequency is initialized (thread-safe, only initializes
+    // once)
+    uint64_t cycles_per_us =
+        tsc_cycles_per_microsecond_.load(std::memory_order_relaxed);
+    assert(cycles_per_us != 0);
+    // Read ARM virtual counter - returns timer ticks
+    uint64_t ticks;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(ticks));
+    return ticks / cycles_per_us;
+#else
+    // Fallback to std::chrono (slower but portable and precise)
+    using namespace std::chrono;
+    auto now = steady_clock::now();
+    return duration_cast<microseconds>(now.time_since_epoch()).count();
+#endif
+}
 
 uint32_t TimeWheel::CurrentTick() const noexcept
 {

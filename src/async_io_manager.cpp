@@ -41,6 +41,7 @@
 #include "coding.h"
 #include "common.h"
 #include "eloq_store.h"
+#include "fast_clock.h"
 #include "kill_point.h"
 #include "kv_options.h"
 #include "storage/root_meta.h"
@@ -99,7 +100,12 @@ bool AsyncIoManager::IsIdle()
 }
 
 IouringMgr::IouringMgr(const KvOptions *opts, uint32_t fd_limit)
-    : AsyncIoManager(opts), fd_limit_(fd_limit)
+    : AsyncIoManager(opts),
+      fd_limit_(fd_limit),
+      io_timeout_wheel_(std::max<uint32_t>(
+                            4096,
+                            opts != nullptr ? opts->io_queue_size * 4 : 4096),
+                        static_cast<uint32_t>(FastClock::NowMilliseconds()))
 {
     memset(&ring_, 0, sizeof(ring_));
     lru_fd_head_.next_ = &lru_fd_tail_;
@@ -666,6 +672,9 @@ KvError ToKvError(int err_no)
         return KvError::OpenFileLimit;
     case -ENOSPC:
         return KvError::OutOfSpace;
+    case -ECANCELED:
+    case -ETIME:
+        return KvError::Timeout;
     default:
         LOG(ERROR) << "ToKvError: " << err_no;
         return KvError::IoFail;
@@ -680,12 +689,16 @@ std::pair<void *, IouringMgr::UserDataType> IouringMgr::DecodeUserData(
     return {ptr, type};
 }
 
+uint64_t IouringMgr::BuildUserData(const void *ptr, IouringMgr::UserDataType type)
+{
+    return (uint64_t(ptr) << 8) | uint64_t(type);
+}
+
 void IouringMgr::EncodeUserData(io_uring_sqe *sqe,
                                 const void *ptr,
                                 IouringMgr::UserDataType type)
 {
-    void *user_data = (void *) ((uint64_t(ptr) << 8) | uint64_t(type));
-    io_uring_sqe_set_data(sqe, user_data);
+    io_uring_sqe_set_data64(sqe, BuildUserData(ptr, type));
 }
 
 IouringMgr::FdIdx IouringMgr::GetRootFD(const TableIdent &tbl_id)
@@ -915,6 +928,10 @@ std::pair<FileId, uint32_t> IouringMgr::ConvFilePageId(
 
 void IouringMgr::Submit()
 {
+    const uint64_t now_ms = FastClock::NowMilliseconds();
+    HarvestTimedOutTasks(now_ms);
+    SubmitQueuedIoCancels(kMaxCancelTasksPerSubmit);
+
     if (prepared_sqe_ == 0)
     {
         return;
@@ -939,6 +956,10 @@ void IouringMgr::PollComplete()
     io_uring_for_each_cqe(&ring_, head, cqe)
     {
         cnt++;
+        if (cqe->user_data == 0)
+        {
+            continue;
+        }
 
         auto [ptr, type] = DecodeUserData(cqe->user_data);
         KvTask *task = nullptr;
@@ -984,7 +1005,12 @@ void IouringMgr::PollComplete()
             continue;
         }
         assert(task != nullptr);
+        OnIoCompleted(task, cqe->user_data);
         task->FinishIo();
+        if (task->inflight_io_ == 0)
+        {
+            CancelTaskTimeout(task);
+        }
     }
 
     io_uring_cq_advance(&ring_, cnt);
@@ -1771,19 +1797,263 @@ KvError IouringMgr::CreateArchive(const TableIdent &tbl_id,
 
 io_uring_sqe *IouringMgr::GetSQE(UserDataType type, const void *user_ptr)
 {
+    KvTask *task = ThdTask();
     io_uring_sqe *sqe;
     while ((sqe = io_uring_get_sqe(&ring_)) == NULL)
     {
-        waiting_sqe_.Wait(ThdTask());
+        waiting_sqe_.Wait(task);
     }
 
     if (user_ptr != nullptr)
     {
-        EncodeUserData(sqe, user_ptr, type);
+        uint64_t user_data = BuildUserData(user_ptr, type);
+        io_uring_sqe_set_data64(sqe, user_data);
+        TrackTimedIoUserData(task, user_data);
     }
-    ThdTask()->inflight_io_++;
+    task->inflight_io_++;
     prepared_sqe_++;
     return sqe;
+}
+
+io_uring_sqe *IouringMgr::GetInternalSQE()
+{
+    io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
+    if (sqe == nullptr && prepared_sqe_ > 0)
+    {
+        int ret = io_uring_submit(&ring_);
+        if (ret < 0)
+        {
+            LOG(ERROR) << "iouring submit failed while acquiring internal sqe "
+                       << ret;
+        }
+        else
+        {
+            prepared_sqe_ -= ret;
+        }
+        sqe = io_uring_get_sqe(&ring_);
+    }
+    if (sqe == nullptr)
+    {
+        return nullptr;
+    }
+    io_uring_sqe_set_data64(sqe, 0);
+    prepared_sqe_++;
+    return sqe;
+}
+
+bool IouringMgr::SubmitCancelByUserData(uint64_t user_data, uint32_t flags)
+{
+    io_uring_sqe *sqe = GetInternalSQE();
+    if (sqe == nullptr)
+    {
+        return false;
+    }
+    io_uring_prep_cancel64(sqe, user_data, flags);
+    return true;
+}
+
+void IouringMgr::OnTaskTimeout(void *arg)
+{
+    KvTask *task = static_cast<KvTask *>(arg);
+    if (task == nullptr)
+    {
+        return;
+    }
+
+    auto *io_mgr = static_cast<IouringMgr *>(task->io_timeout_owner_);
+    if (io_mgr == nullptr)
+    {
+        return;
+    }
+
+    task->io_timeout_timer_idx_ = 0;
+    task->io_timeout_timer_gen_ = 0;
+
+    if (!task->io_timeout_enabled_ || task->io_cancel_requested_ ||
+        task->inflight_io_ == 0)
+    {
+        return;
+    }
+    io_mgr->EnqueueTimedOutTask(task, task->io_timeout_seq_);
+}
+
+void IouringMgr::HarvestTimedOutTasks(uint64_t now_ms)
+{
+    TimeWheel::HarvestResult result{};
+    io_timeout_wheel_.HarvestTimers(static_cast<uint32_t>(now_ms),
+                                    result,
+                                    kMaxTimeoutCallbacksPerSubmit);
+}
+
+void IouringMgr::EnqueueTimedOutTask(KvTask *task, uint64_t timeout_seq)
+{
+    if (task == nullptr || task->io_timeout_pending_cancel_)
+    {
+        return;
+    }
+    task->io_timeout_pending_cancel_ = true;
+    timeout_cancel_queue_.push_back({task, timeout_seq});
+}
+
+void IouringMgr::SubmitQueuedIoCancels(uint32_t max_tasks)
+{
+    uint32_t processed = 0;
+    while (timeout_cancel_head_ < timeout_cancel_queue_.size() &&
+           processed < max_tasks)
+    {
+        TimeoutCancelEntry entry = timeout_cancel_queue_[timeout_cancel_head_++];
+        KvTask *task = entry.task;
+        if (task == nullptr)
+        {
+            processed++;
+            continue;
+        }
+
+        if (task->io_timeout_seq_ != entry.timeout_seq ||
+            !task->io_timeout_pending_cancel_)
+        {
+            processed++;
+            continue;
+        }
+
+        if (!task->io_timeout_enabled_ || task->io_cancel_requested_ ||
+            task->inflight_io_ == 0)
+        {
+            task->io_timeout_pending_cancel_ = false;
+            processed++;
+            continue;
+        }
+
+        bool submitted_all = true;
+        const uint64_t kv_task_key = BuildUserData(task, UserDataType::KvTask);
+        submitted_all &= SubmitCancelByUserData(
+            kv_task_key, IORING_ASYNC_CANCEL_ALL);
+
+        for (uint16_t i = 0; i < task->tracked_io_user_data_count_; ++i)
+        {
+            uint64_t key = task->tracked_io_user_data_[i];
+            if (key == kv_task_key)
+            {
+                continue;
+            }
+            submitted_all &=
+                SubmitCancelByUserData(key, IORING_ASYNC_CANCEL_ALL);
+        }
+
+        if (submitted_all)
+        {
+            task->io_cancel_requested_ = true;
+            task->io_timeout_pending_cancel_ = false;
+        }
+        else
+        {
+            timeout_cancel_queue_.push_back(entry);
+        }
+        processed++;
+    }
+    CompactCancelQueue();
+}
+
+void IouringMgr::CompactCancelQueue()
+{
+    if (timeout_cancel_head_ == 0)
+    {
+        return;
+    }
+    if (timeout_cancel_head_ == timeout_cancel_queue_.size())
+    {
+        timeout_cancel_queue_.clear();
+        timeout_cancel_head_ = 0;
+        return;
+    }
+    if (timeout_cancel_head_ < 1024 &&
+        timeout_cancel_head_ * 2 < timeout_cancel_queue_.size())
+    {
+        return;
+    }
+    timeout_cancel_queue_.erase(
+        timeout_cancel_queue_.begin(),
+        timeout_cancel_queue_.begin() +
+            static_cast<std::vector<TimeoutCancelEntry>::difference_type>(
+                timeout_cancel_head_));
+    timeout_cancel_head_ = 0;
+}
+
+void IouringMgr::CancelTaskTimeout(KvTask *task)
+{
+    if (task == nullptr)
+    {
+        return;
+    }
+    if (task->io_timeout_owner_ != nullptr && task->io_timeout_owner_ != this)
+    {
+        return;
+    }
+    if (task->io_timeout_timer_idx_ != 0)
+    {
+        io_timeout_wheel_.Cancel(
+            TimeWheel::TimerId{task->io_timeout_timer_idx_,
+                               task->io_timeout_timer_gen_});
+    }
+    task->io_timeout_timer_idx_ = 0;
+    task->io_timeout_timer_gen_ = 0;
+    task->io_timeout_pending_cancel_ = false;
+    task->io_timeout_owner_ = nullptr;
+}
+
+void IouringMgr::TrackTimedIoUserData(KvTask *task, uint64_t user_data)
+{
+    if (task == nullptr || !task->io_timeout_enabled_)
+    {
+        return;
+    }
+    if (!task->TrackIoUserData(user_data))
+    {
+        LOG(WARNING) << "too many inflight io tracked for timeout cancellation";
+    }
+    if (task->io_cancel_requested_)
+    {
+        return;
+    }
+    if (task->io_timeout_timer_idx_ != 0 || task->io_timeout_pending_cancel_)
+    {
+        return;
+    }
+
+    task->io_timeout_owner_ = this;
+    const uint64_t now_ms = FastClock::NowMilliseconds();
+    if (now_ms >= task->io_timeout_deadline_ms_)
+    {
+        EnqueueTimedOutTask(task, task->io_timeout_seq_);
+        return;
+    }
+
+    uint64_t delay_ms = task->io_timeout_deadline_ms_ - now_ms;
+    if (delay_ms > TimeWheel::kMaxDelayMs)
+    {
+        delay_ms = TimeWheel::kMaxDelayMs;
+    }
+    TimeWheel::TimerId timer_id =
+        io_timeout_wheel_.AddAfterMs(
+            static_cast<uint32_t>(delay_ms), &IouringMgr::OnTaskTimeout, task);
+    if (!timer_id)
+    {
+        LOG(WARNING) << "failed to arm io timeout timer, fallback to immediate "
+                        "cancel";
+        EnqueueTimedOutTask(task, task->io_timeout_seq_);
+        return;
+    }
+    task->io_timeout_timer_idx_ = timer_id.idx;
+    task->io_timeout_timer_gen_ = timer_id.gen;
+}
+
+void IouringMgr::OnIoCompleted(KvTask *task, uint64_t user_data)
+{
+    if (task == nullptr || !task->io_timeout_enabled_)
+    {
+        return;
+    }
+    task->UntrackIoUserData(user_data);
 }
 
 IouringMgr::WriteReqPool::WriteReqPool(uint32_t pool_size)

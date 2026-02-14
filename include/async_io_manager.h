@@ -27,6 +27,7 @@
 #include "direct_io_buffer.h"
 #include "error.h"
 #include "storage/object_store.h"
+#include "time_wheel.h"
 #include "tasks/prewarm_task.h"
 #include "tasks/task.h"
 #include "types.h"
@@ -81,6 +82,10 @@ public:
     }
     virtual void Submit() = 0;
     virtual void PollComplete() = 0;
+    virtual void CancelTaskTimeout(KvTask *task)
+    {
+        (void) task;
+    }
     virtual bool NeedPrewarm() const
     {
         return false;
@@ -226,6 +231,7 @@ public:
     KvError Init(Shard *shard) override;
     void Submit() override;
     void PollComplete() override;
+    void CancelTaskTimeout(KvTask *task) override;
 
     std::pair<Page, KvError> ReadPage(const TableIdent &tbl_id,
                                       FilePageId fp_id,
@@ -420,9 +426,19 @@ public:
     };
 
     static std::pair<void *, UserDataType> DecodeUserData(uint64_t user_data);
+    static uint64_t BuildUserData(const void *ptr, UserDataType type);
     static void EncodeUserData(io_uring_sqe *sqe,
                                const void *ptr,
                                UserDataType type);
+    io_uring_sqe *GetInternalSQE();
+    static void OnTaskTimeout(void *arg);
+    void HarvestTimedOutTasks(uint64_t now_ms);
+    void EnqueueTimedOutTask(KvTask *task, uint64_t timeout_seq);
+    void SubmitQueuedIoCancels(uint32_t max_tasks);
+    void CompactCancelQueue();
+    bool SubmitCancelByUserData(uint64_t user_data, uint32_t flags);
+    void TrackTimedIoUserData(KvTask *task, uint64_t user_data);
+    void OnIoCompleted(KvTask *task, uint64_t user_data);
     /**
      * @brief Convert file page id to <file_id, file_offset>
      */
@@ -511,6 +527,12 @@ public:
         WaitingZone waiting_;
     };
 
+    struct TimeoutCancelEntry
+    {
+        KvTask *task{nullptr};
+        uint64_t timeout_seq{0};
+    };
+
     /**
      * @brief This is only used in non-append mode.
      */
@@ -537,6 +559,11 @@ public:
     io_uring ring_;
     WaitingZone waiting_sqe_;
     uint32_t prepared_sqe_{0};
+    static constexpr uint32_t kMaxTimeoutCallbacksPerSubmit = 256;
+    static constexpr uint32_t kMaxCancelTasksPerSubmit = 128;
+    TimeWheel io_timeout_wheel_;
+    std::vector<TimeoutCancelEntry> timeout_cancel_queue_;
+    size_t timeout_cancel_head_{0};
 };
 
 class CloudStoreMgr : public IouringMgr

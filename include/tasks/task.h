@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <boost/context/continuation.hpp>
 #include <string>
 #include <string_view>
@@ -94,6 +95,8 @@ using boost::context::continuation;
 class KvTask
 {
 public:
+    static constexpr uint16_t kMaxTrackedIoUserData = 160;
+
     virtual ~KvTask() = default;
     virtual TaskType Type() const = 0;
     virtual void Abort() {};
@@ -113,10 +116,23 @@ public:
     int WaitIoResult();
     void WaitIo();
     void FinishIo();
+    void ResetIoTimeoutState();
+    bool TrackIoUserData(uint64_t user_data);
+    void UntrackIoUserData(uint64_t user_data);
 
     uint32_t inflight_io_{0};
     int io_res_{0};
     uint32_t io_flags_{0};
+    bool io_timeout_enabled_{false};
+    bool io_cancel_requested_{false};
+    bool io_timeout_pending_cancel_{false};
+    uint64_t io_timeout_deadline_ms_{0};
+    uint32_t io_timeout_timer_idx_{0};
+    uint32_t io_timeout_timer_gen_{0};
+    uint64_t io_timeout_seq_{0};
+    AsyncIoManager *io_timeout_owner_{nullptr};
+    std::array<uint64_t, kMaxTrackedIoUserData> tracked_io_user_data_{};
+    uint16_t tracked_io_user_data_count_{0};
 
     TaskStatus status_{TaskStatus::Idle};
     KvRequest *req_{nullptr};

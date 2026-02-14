@@ -89,6 +89,19 @@ private:
     template <typename F>
     void StartTask(KvTask *task, KvRequest *req, F lbd)
     {
+        io_mgr_->CancelTaskTimeout(task);
+        task->ResetIoTimeoutState();
+        if (IsTimedReadRequestType(req->Type()))
+        {
+            const uint32_t timeout_ms = ResolveReadTimeoutMs(req);
+            if (timeout_ms > 0 && req->start_time_ms_ > 0)
+            {
+                task->io_timeout_enabled_ = true;
+                task->io_timeout_deadline_ms_ =
+                    req->start_time_ms_ + timeout_ms;
+            }
+        }
+
         task->req_ = req;
         task->status_ = TaskStatus::Ongoing;
         running_ = task;

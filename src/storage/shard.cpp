@@ -19,6 +19,7 @@
 #include "eloqstore_metrics.h"
 #endif
 
+#include <bthread/eloq_module.h>
 #ifdef ELOQ_MODULE_ENABLED
 #include <bthread/eloq_module.h>
 #endif
@@ -240,6 +241,7 @@ void Shard::Stop()
 bool Shard::AddKvRequest(KvRequest *req)
 {
     bool ret = requests_.enqueue(req);
+    eloq::EloqModule::NotifyWorker(shard_id_);
 #ifdef ELOQ_MODULE_ENABLED
     if (ret)
     {
@@ -572,6 +574,7 @@ bool Shard::ExecuteReadyTasks()
 
 void Shard::OnTaskFinished(KvTask *task)
 {
+    io_mgr_->CancelTaskTimeout(task);
     if (!task->ReadOnly())
     {
         auto wtask = reinterpret_cast<WriteTask *>(task);

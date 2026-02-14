@@ -25,6 +25,7 @@
 #include "storage/shard.h"
 #include "tasks/archive_crond.h"
 #include "tasks/prewarm_task.h"
+#include "time_wheel.h"
 #include "utils.h"
 
 #ifdef ELOQ_MODULE_ENABLED
@@ -75,6 +76,12 @@ bool EloqStore::ValidateOptions(KvOptions &opts)
     if (opts.max_write_batch_pages == 0)
     {
         LOG(ERROR) << "Invalid option max_write_batch_pages";
+        return false;
+    }
+    if (opts.read_request_timeout_ms > TimeWheel::kMaxDelayMs)
+    {
+        LOG(ERROR) << "read_request_timeout_ms exceeds max supported timeout "
+                   << TimeWheel::kMaxDelayMs << " ms";
         return false;
     }
 
@@ -746,6 +753,11 @@ bool EloqStore::SendRequest(KvRequest *req)
     if (IsTimedReadRequestType(req->Type()))
     {
         const uint32_t timeout_ms = ResolveReadTimeoutMs(req, options_);
+        if (timeout_ms > TimeWheel::kMaxDelayMs)
+        {
+            req->SetDone(KvError::InvalidArgs);
+            return true;
+        }
         req->start_time_ms_ =
             timeout_ms > 0 ? FastClock::NowMilliseconds() : 0;
     }

@@ -62,6 +62,9 @@ target_link_libraries(simple_bench eloqstore ${BRPC_LIB} ${GFLAGS_LIBRARY})
 add_executable(simple_test simple_test.cpp)
 target_link_libraries(simple_test eloqstore ${BRPC_LIB} ${GFLAGS_LIBRARY})
 
+add_executable(timeout_storm_bench timeout_storm_bench.cpp)
+target_link_libraries(timeout_storm_bench eloqstore ${BRPC_LIB} ${GFLAGS_LIBRARY})
+
 include(CTest)
 enable_testing()
 
