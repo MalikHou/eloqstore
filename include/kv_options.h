@@ -69,12 +69,7 @@ struct KvOptions
     /**
      * @brief The maximum number of pages per batch for the write task.
      */
-    uint32_t max_write_batch_pages = 256;
-    /**
-     * @brief Size of io-uring selected buffer ring.
-     * It must be a power-of 2, and can be up to 32768.
-     */
-    uint16_t buf_ring_size = 1 << 12;
+    uint32_t max_write_batch_pages = 32;
     /**
      * @brief Size of coroutine stack.
      * According to the latest test results, at least 16KB is required.
@@ -84,14 +79,14 @@ struct KvOptions
      * @brief Limit number of retained archives.
      * Only take effect when data_append_mode is enabled.
      */
-    uint32_t num_retained_archives = 0;
+    uint32_t num_retained_archives = 100;
     /**
      * @brief Set the (minimum) archive time interval in seconds.
      * 0 means do not generate archives automatically.
      * Only take effect when data_append_mode is enabled and
      * num_retained_archives is not 0.
      */
-    uint32_t archive_interval_secs = 86400;  // 1 day
+    uint32_t archive_interval_secs = 0;
     /**
      * @brief The maximum number of running archive tasks at the same time.
      */
@@ -116,11 +111,13 @@ struct KvOptions
     /**
      * @brief Max number of files uploaded concurrently in a batch.
      */
-    uint32_t max_upload_batch = 5;
-    /**
-     * @brief Maximum number of concurrent cloud HTTP requests per shard.
-     */
     uint32_t max_cloud_concurrency = 20;
+    /**
+     * @brief Maximum number of concurrent write tasks per shard.
+     * 0 means unlimited (legacy behavior). In cloud mode, 0 is rewritten to
+     * max_cloud_concurrency during option validation.
+     */
+    uint32_t max_write_concurrency = 0;
     /**
      * @brief Number of dedicated threads that process cloud HTTP requests.
      * Each thread runs curl's multi loop and handles a subset of shards.
@@ -129,7 +126,22 @@ struct KvOptions
     /**
      * @brief Max cached DirectIO buffers per shard.
      */
-    uint32_t direct_io_buffer_pool_size = 4;
+    uint32_t direct_io_buffer_pool_size = 16;
+    /**
+     * @brief Size of each write buffer used for append-mode aggregation.
+     * Only take effect when data_append_mode is enabled.
+     */
+    uint64_t write_buffer_size = 1 * MB;
+    /**
+     * @brief Batch size for non-page direct IO (e.g. snapshot or upload IO).
+     * Must be page-aligned and non-zero.
+     */
+    uint64_t non_page_io_batch_size = 1 * MB;
+    /**
+     * @brief Ratio of buffer_pool_size reserved for append-mode write buffers.
+     * Only take effect when data_append_mode is enabled.
+     */
+    double write_buffer_ratio = 0.05;
     /**
      * @brief Reuse files already present in the local cache directory when the
      * store starts.
@@ -195,6 +207,7 @@ struct KvOptions
     {
         return static_cast<size_t>(data_page_size) << pages_per_file_shift;
     }
+
     /**
      * @brief Amount of pages per data file (1 << pages_per_file_shift).
      * It is recommended to set a smaller file size like 4MB in append write
@@ -236,10 +249,6 @@ struct KvOptions
      * enabled.
      */
     uint16_t prewarm_task_count = 3;
-    /**
-     * @brief Size of mapping arena.
-     */
-    size_t mapping_arena_size = 128;
 
     /**
      * @brief Filter function to determine which partitions belong to this

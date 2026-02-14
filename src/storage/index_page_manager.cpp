@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <memory>
@@ -23,28 +24,44 @@ namespace eloqstore
 {
 namespace
 {
+size_t EffectiveBufferPoolLimitBytes(const KvOptions *opts)
+{
+    const double ratio = std::clamp(opts->write_buffer_ratio, 0.0, 1.0);
+    size_t reserved = static_cast<size_t>(
+        static_cast<double>(opts->buffer_pool_size) * ratio);
+    if (reserved > opts->buffer_pool_size)
+    {
+        reserved = opts->buffer_pool_size;
+    }
+    size_t limit = opts->buffer_pool_size - reserved;
+    if (limit == 0)
+    {
+        return opts->data_page_size;
+    }
+    return std::max(limit, static_cast<size_t>(opts->data_page_size));
+}
+
 size_t RootMetaBytes(const RootMeta &meta)
 {
     if (meta.mapper_ == nullptr)
     {
         return 0;
     }
-    const auto &base = meta.mapper_->GetMapping()->mapping_tbl_.Base();
-    size_t bytes = base.capacity() * sizeof(uint64_t);
-    if (meta.compression_ != nullptr)
-    {
-        bytes += meta.compression_->DictionaryMemoryBytes();
-    }
+    const auto &tbl = meta.mapper_->GetMapping()->mapping_tbl_;
+    size_t bytes = tbl.capacity() * sizeof(uint64_t);
+    CHECK(meta.compression_ != nullptr);
+    bytes += meta.compression_->DictionaryMemoryBytes();
     return bytes;
 }
 }  // namespace
 
 IndexPageManager::IndexPageManager(AsyncIoManager *io_manager)
-    : io_manager_(io_manager),
-      mapping_arena_(Options()->mapping_arena_size),
-      root_meta_mgr_(this, Options())
+    : io_manager_(io_manager), root_meta_mgr_(this, Options())
 {
     active_head_.EnqueNext(&active_tail_);
+    const size_t page_limit =
+        EffectiveBufferPoolLimitBytes(Options()) / Options()->data_page_size;
+    index_pages_.reserve(page_limit);
 }
 
 IndexPageManager::~IndexPageManager()
@@ -111,7 +128,7 @@ bool IndexPageManager::IsFull() const
 {
     // Calculate current total memory usage
     size_t current_size = index_pages_.size() * Options()->data_page_size;
-    return current_size >= Options()->buffer_pool_size;
+    return current_size >= EffectiveBufferPoolLimitBytes(Options());
 }
 
 size_t IndexPageManager::GetBufferPoolUsed() const
@@ -121,7 +138,7 @@ size_t IndexPageManager::GetBufferPoolUsed() const
 
 size_t IndexPageManager::GetBufferPoolLimit() const
 {
-    return Options()->buffer_pool_size;
+    return EffectiveBufferPoolLimitBytes(Options());
 }
 
 std::pair<RootMetaMgr::Handle, KvError> IndexPageManager::FindRoot(
@@ -186,6 +203,11 @@ std::pair<RootMetaMgr::Handle, KvError> IndexPageManager::FindRoot(
             meta->waiting_.WakeAll();
             if (err != KvError::NoError)
             {
+                if (err != KvError::NotFound)
+                {
+                    LOG(ERROR)
+                        << "load meta failed, err: " << static_cast<int>(err);
+                }
                 root_meta_mgr_.Erase(tbl_id);
                 return {RootMetaMgr::Handle(), err};
             }
@@ -300,20 +322,20 @@ void IndexPageManager::UpdateRoot(const TableIdent &tbl_ident,
     root_meta_mgr_.EvictIfNeeded();
 }
 
-std::pair<MemIndexPage *, KvError> IndexPageManager::FindPage(
+std::pair<MemIndexPage::Handle, KvError> IndexPageManager::FindPage(
     MappingSnapshot *mapping, PageId page_id)
 {
     while (true)
     {
         // First checks swizzling pointers.
-        MemIndexPage *idx_page = mapping->GetSwizzlingPointer(page_id);
-        if (idx_page == nullptr)
+        MemIndexPage::Handle handle = mapping->GetSwizzlingHandle(page_id);
+        if (!handle)
         {
             // This is the first request to load the page.
             MemIndexPage *new_page = AllocIndexPage();
             if (new_page == nullptr)
             {
-                return {nullptr, KvError::OutOfMem};
+                return {MemIndexPage::Handle(), KvError::OutOfMem};
             }
             FilePageId file_page_id = mapping->ToFilePage(page_id);
             new_page->SetPageId(page_id);
@@ -329,21 +351,21 @@ std::pair<MemIndexPage *, KvError> IndexPageManager::FindPage(
                 new_page->waiting_.WakeAll();
                 mapping->Unswizzling(new_page);
                 FreeIndexPage(new_page);
-                return {nullptr, err};
+                return {MemIndexPage::Handle(), err};
             }
             FinishIo(mapping, new_page);
             new_page->waiting_.WakeAll();
-            return {new_page, KvError::NoError};
+            return {MemIndexPage::Handle(new_page), KvError::NoError};
         }
-        if (idx_page->IsDetached())
+        if (handle->IsDetached())
         {
             // This page is not loaded yet.
-            idx_page->waiting_.Wait(ThdTask());
+            handle->waiting_.Wait(ThdTask());
         }
         else
         {
-            EnqueueIndexPage(idx_page);
-            return {idx_page, KvError::NoError};
+            EnqueueIndexPage(handle.Get());
+            return {std::move(handle), KvError::NoError};
         }
     }
 }
@@ -444,22 +466,18 @@ KvError IndexPageManager::SeekIndex(MappingSnapshot *mapping,
     PageId current_id = page_id;
     while (true)
     {
-        auto [node, err] = FindPage(mapping, current_id);
+        auto [handle, err] = FindPage(mapping, current_id);
         CHECK_KV_ERR(err);
-        node->Pin();
-
-        IndexPageIter idx_it{node, Options()};
+        IndexPageIter idx_it{handle, Options()};
         idx_it.Seek(key);
         PageId child_id = idx_it.GetPageId();
 
-        if (node->IsPointingToLeaf())
+        if (handle->IsPointingToLeaf())
         {
             result = child_id;
-            node->Unpin();
             return KvError::NoError;
         }
 
-        node->Unpin();
         current_id = child_id;
     }
 }
@@ -477,6 +495,11 @@ AsyncIoManager *IndexPageManager::IoMgr() const
 MappingArena *IndexPageManager::MapperArena()
 {
     return &mapping_arena_;
+}
+
+MappingChunkArena *IndexPageManager::MapperChunkArena()
+{
+    return &mapping_chunk_arena_;
 }
 
 RootMetaMgr *IndexPageManager::RootMetaManager()

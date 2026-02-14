@@ -1015,7 +1015,6 @@ TEST_CASE("cloud store cached file LRU", "[cloud]")
 {
     eloqstore::KvOptions options = cloud_options;
     options.manifest_limit = 8 << 10;
-    options.fd_limit = 2;
     options.local_space_limit = 2 << 20;
     options.num_retained_archives = 1;
     options.archive_interval_secs = 3;
@@ -1311,6 +1310,7 @@ TEST_CASE("archive triggers with cloud-only partitions", "[cloud][archive]")
         false;                          // keep local cache empty after restart
     options.archive_interval_secs = 1;  // trigger archiver quickly
     options.local_space_limit = 1LL << 40;  // 1TB
+    options.fd_limit += utils::CountUsedFD();
 
     eloqstore::EloqStore *store = InitStore(options);
 

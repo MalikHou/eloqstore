@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -87,6 +88,25 @@ public:
         append(src.data(), src.size());
     }
 
+    static void UpdateDefaultReserve(size_t bytes)
+    {
+        default_reserve_bytes_.store(bytes);
+    }
+
+    void EnsureDefaultReserve()
+    {
+        size_t reserve = default_reserve_bytes_.load(std::memory_order_relaxed);
+        if (reserve == 0 || capacity_ >= reserve)
+        {
+            return;
+        }
+        EnsureCapacity(reserve);
+        if (size_ > reserve)
+        {
+            size_ = reserve;
+        }
+    }
+
     char *data()
     {
         return data_;
@@ -166,6 +186,7 @@ protected:
     char *data_{nullptr};
     size_t size_{0};
     size_t capacity_{0};
+    static inline std::atomic<size_t> default_reserve_bytes_{0};
 };
 
 }  // namespace eloqstore

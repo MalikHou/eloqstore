@@ -4,6 +4,7 @@
 #include <boost/context/protected_fixedsize_stack.hpp>
 #include <cstdio>
 #include <ctime>
+#include <memory>
 #include <utility>  // NOLINT(build/include_order)
 
 #include "circular_queue.h"
@@ -52,18 +53,23 @@ public:
     const EloqStore *store_;
     const size_t shard_id_{0};
     boost::context::continuation main_;
-    KvTask *running_;
+    uint64_t ts_{};
+    KvTask *running_{};
     CircularQueue<KvTask *> ready_tasks_;
     CircularQueue<KvTask *> low_priority_ready_tasks_;
     size_t running_writing_tasks_{};
     bool oss_enabled_{false};
+    bool io_mgr_and_page_pool_inited_{false};
 
 private:
     void WorkLoop();
+    void InitIoMgrAndPagePool();
     bool ExecuteReadyTasks();
     void OnTaskFinished(KvTask *task);
     void OnReceivedReq(KvRequest *req);
-    void ProcessReq(KvRequest *req);
+    bool ProcessReq(KvRequest *req);
+    void TryStartPendingWrite(const TableIdent &tbl_id);
+    void TryDispatchPendingWrites();
 
 #ifdef ELOQ_MODULE_ENABLED
     void WorkOneRound();
@@ -187,25 +193,28 @@ private:
     moodycamel::BlockingConcurrentQueue<KvRequest *> requests_;
     std::thread thd_;
     PagesPool page_pool_;
-    std::unique_ptr<AsyncIoManager> io_mgr_;
-    IndexPageManager index_mgr_;
     TaskManager task_mgr_;
 #ifndef NDEBUG
     boost::context::protected_fixedsize_stack stack_allocator_;
 #else
     boost::context::pooled_fixedsize_stack stack_allocator_;
 #endif
+    std::unique_ptr<AsyncIoManager> io_mgr_;
+    IndexPageManager index_mgr_;
 
     class PendingWriteQueue
     {
     public:
         void PushBack(WriteRequest *req);
+        void PushFront(WriteRequest *req);
+        WriteRequest *Front();
         WriteRequest *PopFront();
         bool Empty() const;
 
         // Requests from internal
         CompactRequest compact_req_;
         CleanExpiredRequest expire_req_;
+        bool running_{false};
 
     private:
         WriteRequest *head_{nullptr};

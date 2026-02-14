@@ -1246,14 +1246,27 @@ bool AsyncHttpManager::SetupUploadRequest(ObjectStore::UploadTask *task,
                                           CURL *easy)
 {
     const std::string &filename = task->filename_;
-    if (task->data_buffer_.empty())
+    // Inline full-buffer upload only.
+    // When file_size_ is not prefilled by caller, infer it from buffer size.
+    if (task->file_size_ == 0)
     {
-        LOG(ERROR) << "UploadTask missing data for file " << filename;
+        task->file_size_ = task->data_buffer_.size();
+    }
+    if (task->data_buffer_.empty() && task->file_size_ > 0)
+    {
+        LOG(ERROR) << "UploadTask missing inline upload buffer for file "
+                   << filename << " file_size=" << task->file_size_;
         task->error_ = KvError::InvalidArgs;
         return false;
     }
-    task->file_size_ = task->data_buffer_.size();
-    task->buffer_offset_ = 0;
+    if (task->data_buffer_.size() != task->file_size_)
+    {
+        LOG(ERROR) << "UploadTask buffer size mismatch for file " << filename
+                   << " buffer_size=" << task->data_buffer_.size()
+                   << " file_size=" << task->file_size_;
+        task->error_ = KvError::InvalidArgs;
+        return false;
+    }
 
     std::string key = ComposeKey(task->tbl_id_, filename);
     task->json_data_ = backend_->CreateSignedUrl(CloudHttpMethod::kPut, key);
@@ -1527,6 +1540,10 @@ void AsyncHttpManager::ProcessCompletedRequests()
 
 void AsyncHttpManager::CleanupTaskResources(ObjectStore::Task *task)
 {
+    if (task == nullptr)
+    {
+        return;
+    }
     curl_slist_free_all(task->headers_);
     task->headers_ = nullptr;
 }

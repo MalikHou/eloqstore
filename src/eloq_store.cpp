@@ -39,6 +39,11 @@ namespace eloqstore
 
 bool EloqStore::ValidateOptions(KvOptions &opts)
 {
+    if (opts.max_inflight_write == 0)
+    {
+        LOG(ERROR) << "Option max_inflight_write cannot be zero";
+        return false;
+    }
     if ((opts.data_page_size & (page_align - 1)) != 0)
     {
         LOG(ERROR) << "Option data_page_size is not page aligned";
@@ -47,6 +52,28 @@ bool EloqStore::ValidateOptions(KvOptions &opts)
     if ((opts.coroutine_stack_size & (page_align - 1)) != 0)
     {
         LOG(ERROR) << "Option coroutine_stack_size is not page aligned";
+        return false;
+    }
+    if (opts.write_buffer_size != 0 || opts.write_buffer_ratio != 0.0)
+    {
+        if (opts.write_buffer_size == 0 || opts.write_buffer_ratio <= 0.0 ||
+            opts.write_buffer_ratio >= 1.0)
+        {
+            LOG(ERROR) << "write_buffer_size must be non-zero and "
+                          "write_buffer_ratio must be in (0, 1) when enabled";
+            return false;
+        }
+        if ((opts.write_buffer_size & (page_align - 1)) != 0)
+        {
+            LOG(ERROR) << "write_buffer_size must be page aligned";
+            return false;
+        }
+    }
+    if (opts.non_page_io_batch_size == 0 ||
+        (opts.non_page_io_batch_size & (page_align - 1)) != 0)
+    {
+        LOG(ERROR)
+            << "non_page_io_batch_size must be non-zero and page aligned";
         return false;
     }
 
@@ -61,7 +88,6 @@ bool EloqStore::ValidateOptions(KvOptions &opts)
         LOG(ERROR) << "Invalid option max_write_batch_pages";
         return false;
     }
-
     if (!opts.cloud_store_path.empty())
     {
         if (opts.max_cloud_concurrency == 0)
@@ -69,20 +95,16 @@ bool EloqStore::ValidateOptions(KvOptions &opts)
             LOG(ERROR) << "max_cloud_concurrency must be greater than 0";
             return false;
         }
+        if (opts.max_write_concurrency == 0)
+        {
+            opts.max_write_concurrency = opts.max_cloud_concurrency;
+            LOG(WARNING) << "max_write_concurrency is not set in cloud mode, "
+                         << "resetting to max_cloud_concurrency "
+                         << opts.max_write_concurrency;
+        }
         if (opts.cloud_request_threads == 0)
         {
             LOG(ERROR) << "cloud_request_threads must be greater than 0";
-            return false;
-        }
-        if (opts.max_upload_batch == 0)
-        {
-            LOG(ERROR) << "max_upload_batch must be greater than 0";
-            return false;
-        }
-        if (opts.max_upload_batch >= opts.max_cloud_concurrency)
-        {
-            LOG(ERROR) << "max_upload_batch must be smaller than "
-                       << "max_cloud_concurrency";
             return false;
         }
         if (opts.local_space_limit == 0)
@@ -116,13 +138,15 @@ bool EloqStore::ValidateOptions(KvOptions &opts)
                          << "file, bumping to " << opts.local_space_limit;
         }
 
-        if (opts.fd_limit > max_fd_limit)
+        size_t count_used_fd = utils::CountUsedFD();
+        if (opts.fd_limit > max_fd_limit + num_reserved_fd + count_used_fd)
         {
             LOG(WARNING) << "fd_limit * data_page_size * (1 << "
                             "pages_per_file_shift) exceeds local_space_limit, "
                          << "clamping fd_limit from " << opts.fd_limit << " to "
-                         << max_fd_limit;
-            opts.fd_limit = static_cast<uint32_t>(max_fd_limit);
+                         << max_fd_limit + num_reserved_fd + count_used_fd;
+            opts.fd_limit = static_cast<uint32_t>(max_fd_limit) +
+                            num_reserved_fd + count_used_fd;
         }
     }
     else if (opts.prewarm_cloud_cache)

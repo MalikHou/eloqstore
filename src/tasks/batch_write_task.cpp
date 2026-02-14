@@ -18,11 +18,6 @@ BatchWriteTask::BatchWriteTask()
     : idx_page_builder_(Options()), data_page_builder_(Options())
 {
     overflow_ptrs_.reserve(Options()->overflow_pointers * 4);
-
-    if (Options()->data_append_mode)
-    {
-        batch_pages_.reserve(Options()->max_write_batch_pages);
-    }
 }
 
 KvError BatchWriteTask::SeekStack(std::string_view search_key)
@@ -71,7 +66,7 @@ KvError BatchWriteTask::SeekStack(std::string_view search_key)
 
 std::pair<PageId, KvError> BatchWriteTask::Seek(std::string_view key)
 {
-    if (stack_.back()->idx_page_ == nullptr)
+    if (!stack_.back()->handle_)
     {
         stack_.back()->is_leaf_index_ = true;
         return {MaxPageId, KvError::NoError};
@@ -84,19 +79,19 @@ std::pair<PageId, KvError> BatchWriteTask::Seek(std::string_view key)
         idx_iter.Seek(key);
         PageId page_id = idx_iter.GetPageId();
         assert(page_id != MaxPageId);
-        if (idx_entry->idx_page_->IsPointingToLeaf())
+        if (idx_entry->handle_->IsPointingToLeaf())
         {
             break;
         }
         assert(!stack_.back()->is_leaf_index_);
-        auto [node, err] = shard->IndexManager()->FindPage(
+        auto [handle, err] = shard->IndexManager()->FindPage(
             cow_meta_.mapper_->GetMapping(), page_id);
         if (err != KvError::NoError)
         {
             return {MaxPageId, err};
         }
-        node->Pin();
-        stack_.emplace_back(std::make_unique<IndexStackEntry>(node, Options()));
+        stack_.emplace_back(
+            std::make_unique<IndexStackEntry>(std::move(handle), Options()));
     }
     stack_.back()->is_leaf_index_ = true;
     return {stack_.back()->idx_page_iter_.GetPageId(), KvError::NoError};
@@ -234,16 +229,8 @@ void BatchWriteTask::Abort()
 {
     WriteTask::Abort();
 
-    // Unpins all index pages in the stack.
-    while (!stack_.empty())
-    {
-        IndexStackEntry *stack_entry = stack_.back().get();
-        if (stack_entry->idx_page_)
-        {
-            stack_entry->idx_page_->Unpin();
-        }
-        stack_.pop_back();
-    }
+    // Releases all index pages in the stack.
+    stack_.clear();
 
     for (DataPage &page : leaf_triple_)
     {
@@ -254,13 +241,23 @@ void BatchWriteTask::Abort()
 
 KvError BatchWriteTask::Apply()
 {
+    // directly go to low priority queue and wait for scheduling
+    YieldToLowPQ();
     KvError err = shard->IndexManager()->MakeCowRoot(tbl_ident_, cow_meta_);
     cow_meta_.compression_->SampleAndBuildDictionaryIfNeeded(data_batch_);
     CHECK_KV_ERR(err);
     err = ApplyBatch(cow_meta_.root_id_, true);
-    CHECK_KV_ERR(err);
+    if (err != KvError::NoError)
+    {
+        (void) WaitWrite();
+        return err;
+    }
     err = ApplyTTLBatch();
-    CHECK_KV_ERR(err);
+    if (err != KvError::NoError)
+    {
+        (void) WaitWrite();
+        return err;
+    }
     err = UpdateMeta();
     CHECK_KV_ERR(err);
     TriggerTTL();
@@ -296,17 +293,16 @@ KvError BatchWriteTask::ApplyBatch(PageId &root_id,
 
     if (root_id != MaxPageId)
     {
-        auto [root_page, err] = shard->IndexManager()->FindPage(
+        auto [handle, err] = shard->IndexManager()->FindPage(
             cow_meta_.old_mapping_.Get(), root_id);
         CHECK_KV_ERR(err);
         stack_.emplace_back(
-            std::make_unique<IndexStackEntry>(root_page, Options()));
-        root_page->Pin();
+            std::make_unique<IndexStackEntry>(std::move(handle), Options()));
     }
     else
     {
-        stack_.emplace_back(
-            std::make_unique<IndexStackEntry>(nullptr, Options()));
+        stack_.emplace_back(std::make_unique<IndexStackEntry>(
+            MemIndexPage::Handle(), Options()));
     }
 
     KvError err;
@@ -340,14 +336,14 @@ KvError BatchWriteTask::ApplyBatch(PageId &root_id,
     CHECK_KV_ERR(err);
 
     assert(!stack_.empty());
-    MemIndexPage *new_root = nullptr;
+    MemIndexPage::Handle new_root;
     while (!stack_.empty())
     {
-        auto [new_page, err] = Pop();
+        auto [new_handle, err] = Pop();
         CHECK_KV_ERR(err);
-        new_root = new_page;
+        new_root = std::move(new_handle);
     }
-    root_id = new_root == nullptr ? MaxPageId : new_root->GetPageId();
+    root_id = new_root ? new_root->GetPageId() : MaxPageId;
 
     return KvError::NoError;
 }
@@ -730,35 +726,30 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx, uint64_t now_ms)
     return KvError::NoError;
 }
 
-std::pair<MemIndexPage *, KvError> BatchWriteTask::Pop()
+std::pair<MemIndexPage::Handle, KvError> BatchWriteTask::Pop()
 {
     if (stack_.empty())
     {
-        return {nullptr, KvError::NoError};
+        return {MemIndexPage::Handle(), KvError::NoError};
     }
 
     IndexStackEntry *stack_entry = stack_.back().get();
     // There is no change at this level.
     if (stack_entry->changes_.empty())
     {
-        MemIndexPage *page = stack_entry->idx_page_;
-        if (page != nullptr)
-        {
-            page->Unpin();
-        }
+        MemIndexPage::Handle handle = std::move(stack_entry->handle_);
         stack_.pop_back();
-        return {page, KvError::NoError};
+        return {std::move(handle), KvError::NoError};
     }
 
     idx_page_builder_.Reset();
 
     const Comparator *cmp = shard->IndexManager()->GetComparator();
     std::vector<IndexOp> &changes = stack_entry->changes_;
-    MemIndexPage *stack_page = stack_entry->idx_page_;
     // If the change op contains no index page pointer, this is the lowest level
     // index page.
     bool is_leaf_index = stack_entry->is_leaf_index_;
-    IndexPageIter base_page_iter{stack_page, Options()};
+    IndexPageIter base_page_iter{stack_entry->handle_, Options()};
     bool is_base_iter_valid = false;
     AdvanceIndexPageIter(base_page_iter, is_base_iter_valid);
 
@@ -771,14 +762,16 @@ std::pair<MemIndexPage *, KvError> BatchWriteTask::Pop()
     // We keep the previous built page in the pipeline before flushing it to
     // storage. This is to redistribute between last two pages in case the last
     // page is sparse.
-    DirtyIndexPage prev_page;
+    MemIndexPage::Handle prev_handle;
+    std::string prev_key;
+    PageId prev_page_id = MaxPageId;
     std::string_view page_key =
         stack_.size() == 1 ? std::string_view{}
                            : stack_[stack_.size() - 2]->idx_page_iter_.Key();
     std::string curr_page_key{page_key};
-    if (stack_page != nullptr)
+    if (stack_entry->handle_)
     {
-        prev_page.page_id_ = stack_page->GetPageId();
+        prev_page_id = stack_entry->handle_->GetPageId();
     }
 
     auto add_to_page = [&](std::string_view new_key,
@@ -788,7 +781,8 @@ std::pair<MemIndexPage *, KvError> BatchWriteTask::Pop()
             idx_page_builder_.Add(new_key, new_page_id, is_leaf_index);
         if (!success)
         {
-            err = FinishIndexPage(prev_page, std::move(curr_page_key));
+            err = FinishIndexPage(
+                prev_handle, prev_key, prev_page_id, std::move(curr_page_key));
             CHECK_KV_ERR(err);
             curr_page_key = new_key;
             idx_page_builder_.Reset();
@@ -853,7 +847,7 @@ std::pair<MemIndexPage *, KvError> BatchWriteTask::Pop()
             KvError err = add_to_page(new_key, new_page_id);
             if (err != KvError::NoError)
             {
-                return {nullptr, err};
+                return {MemIndexPage::Handle(), err};
             }
         }
 
@@ -879,7 +873,7 @@ std::pair<MemIndexPage *, KvError> BatchWriteTask::Pop()
         KvError err = add_to_page(new_key, new_page_id);
         if (err != KvError::NoError)
         {
-            return {nullptr, err};
+            return {MemIndexPage::Handle(), err};
         }
         AdvanceIndexPageIter(base_page_iter, is_base_iter_valid);
     }
@@ -893,80 +887,76 @@ std::pair<MemIndexPage *, KvError> BatchWriteTask::Pop()
             KvError err = add_to_page(new_key, new_page);
             if (err != KvError::NoError)
             {
-                return {nullptr, err};
+                return {MemIndexPage::Handle(), err};
             }
         }
         ++cit;
     }
 
-    MemIndexPage *new_root = nullptr;
+    MemIndexPage::Handle new_root;
     if (idx_page_builder_.IsEmpty())
     {
-        FreePage(stack_.back()->idx_page_->GetPageId());
+        FreePage(stack_.back()->handle_->GetPageId());
         if (stack_.size() > 1)
         {
             IndexStackEntry *parent = stack_[stack_.size() - 2].get();
             std::string_view page_key = parent->idx_page_iter_.Key();
             parent->changes_.emplace_back(
-                std::string(page_key), prev_page.page_id_, WriteOp::Delete);
+                std::string(page_key), prev_page_id, WriteOp::Delete);
         }
     }
     else
     {
-        bool splited = prev_page.page_ != nullptr;
-        err = FinishIndexPage(prev_page, std::move(curr_page_key));
+        bool splited = static_cast<bool>(prev_handle);
+        err = FinishIndexPage(
+            prev_handle, prev_key, prev_page_id, std::move(curr_page_key));
         if (err != KvError::NoError)
         {
-            return {nullptr, err};
+            return {MemIndexPage::Handle(), err};
         }
-        err = FlushIndexPage(prev_page.page_,
-                             std::move(prev_page.key_),
-                             prev_page.page_id_,
-                             splited);
+        err = FlushIndexPage(
+            prev_handle, std::move(prev_key), prev_page_id, splited);
         if (err != KvError::NoError)
         {
-            return {nullptr, err};
+            return {MemIndexPage::Handle(), err};
         }
         if (!splited)
         {
-            new_root = prev_page.page_;
+            new_root = std::move(prev_handle);
         }
-        prev_page.page_ = nullptr;
     }
 
-    if (stack_page != nullptr)
-    {
-        stack_page->Unpin();
-    }
     stack_.pop_back();
-    return {new_root, KvError::NoError};
+    return {std::move(new_root), KvError::NoError};
 }
 
-KvError BatchWriteTask::FinishIndexPage(DirtyIndexPage &prev,
+KvError BatchWriteTask::FinishIndexPage(MemIndexPage::Handle &prev_handle,
+                                        std::string &prev_key,
+                                        PageId &prev_page_id,
                                         std::string cur_page_key)
 {
     assert(!idx_page_builder_.IsEmpty());
     const uint16_t cur_page_len = idx_page_builder_.CurrentSizeEstimate();
     std::string_view page_view = idx_page_builder_.Finish();
-    if (prev.page_ != nullptr)
+    if (prev_handle)
     {
         // Redistributing only if the current page length is smaller than
         // one quarter of data_page_size and the previous page length is
         // bigger than three quarter of data_page_size.
         const uint16_t one_quarter = Options()->data_page_size >> 2;
         const uint16_t three_quarter = Options()->data_page_size - one_quarter;
-        if (cur_page_len < one_quarter && prev.page_ != nullptr &&
-            prev.page_->RestartNum() > 1 &&
-            prev.page_->ContentLength() > three_quarter)
+        if (cur_page_len < one_quarter && prev_handle &&
+            prev_handle->RestartNum() > 1 &&
+            prev_handle->ContentLength() > three_quarter)
         {
-            page_view = Redistribute(prev.page_, page_view, cur_page_key);
+            page_view = Redistribute(prev_handle, page_view, cur_page_key);
         }
 
         KvError err = FlushIndexPage(
-            prev.page_, std::move(prev.key_), prev.page_id_, true);
+            prev_handle, std::move(prev_key), prev_page_id, true);
         CHECK_KV_ERR(err);
-        prev.page_ = nullptr;
-        prev.page_id_ = MaxPageId;
+        prev_handle = MemIndexPage::Handle();
+        prev_page_id = MaxPageId;
     }
     MemIndexPage *cur_page = shard->IndexManager()->AllocIndexPage();
     if (cur_page == nullptr)
@@ -974,27 +964,12 @@ KvError BatchWriteTask::FinishIndexPage(DirtyIndexPage &prev,
         return KvError::OutOfMem;
     }
     memcpy(cur_page->PagePtr(), page_view.data(), page_view.size());
-    prev.page_ = cur_page;
-    prev.key_ = std::move(cur_page_key);
+    prev_handle = MemIndexPage::Handle(cur_page);
+    prev_key = std::move(cur_page_key);
     return KvError::NoError;
 }
 
-BatchWriteTask::DirtyIndexPage::~DirtyIndexPage()
-{
-    if (page_ != nullptr)
-    {
-        if (page_->InFreeList())
-        {
-            page_ = nullptr;
-            return;
-        }
-        assert(page_->IsDetached());
-        shard->IndexManager()->FreeIndexPage(page_);
-        page_ = nullptr;
-    }
-}
-
-KvError BatchWriteTask::FlushIndexPage(MemIndexPage *idx_page,
+KvError BatchWriteTask::FlushIndexPage(MemIndexPage::Handle &idx_page,
                                        std::string idx_page_key,
                                        PageId page_id,
                                        bool split)
@@ -1011,9 +986,9 @@ KvError BatchWriteTask::FlushIndexPage(MemIndexPage *idx_page,
         assert(stack_.size() >= 1);
         if (stack_.size() == 1)
         {
-            stack_.emplace(
-                stack_.begin(),
-                std::make_unique<IndexStackEntry>(nullptr, Options()));
+            stack_.emplace(stack_.begin(),
+                           std::make_unique<IndexStackEntry>(
+                               MemIndexPage::Handle(), Options()));
         }
 
         IndexStackEntry *parent_entry = stack_[stack_.size() - 2].get();
@@ -1148,11 +1123,11 @@ Page BatchWriteTask::Redistribute(DataPage &prev_page,
     return new_page;
 }
 
-std::string_view BatchWriteTask::Redistribute(MemIndexPage *prev_page,
+std::string_view BatchWriteTask::Redistribute(MemIndexPage::Handle &prev_handle,
                                               std::string_view cur_page,
                                               std::string &cur_page_key)
 {
-    const uint16_t prev_page_len = prev_page->ContentLength();
+    const uint16_t prev_page_len = prev_handle->ContentLength();
     const uint16_t cur_page_len =
         DecodeFixed16(cur_page.data() + DataPage::page_size_offset);
     cur_page = cur_page.substr(0, cur_page_len);
@@ -1160,7 +1135,7 @@ std::string_view BatchWriteTask::Redistribute(MemIndexPage *prev_page,
     const uint16_t average_len = (prev_page_len + cur_page_len) >> 1;
     assert(prev_page_len >= average_len);
 
-    PageRegionIter region_iter({prev_page->PagePtr(), prev_page_len});
+    PageRegionIter region_iter({prev_handle->PagePtr(), prev_page_len});
     uint16_t preserve_region_cnt = 0;
     // Number of bytes occupied by header and tailer (number of regions).
     uint16_t preserve_len = IndexPageBuilder::HeaderSize() + sizeof(uint16_t);
@@ -1182,9 +1157,9 @@ std::string_view BatchWriteTask::Redistribute(MemIndexPage *prev_page,
     }
 
     // Merge last several regions of previous page with current page.
-    bool is_leaf_idx = prev_page->IsPointingToLeaf();
+    bool is_leaf_idx = prev_handle->IsPointingToLeaf();
     IndexPageBuilder idx_builder(Options());
-    IndexPageIter iter_prev(prev_page, Options());
+    IndexPageIter iter_prev(prev_handle, Options());
     iter_prev.SeekToRestart(preserve_region_cnt);
     iter_prev.Next();
     std::string new_page_key(iter_prev.Key());
@@ -1207,8 +1182,8 @@ std::string_view BatchWriteTask::Redistribute(MemIndexPage *prev_page,
 
     // Update previous page in-place.
     FastPageBuilder builder(Options());
-    builder.Reset(prev_page->PagePtr(), TypeOfPage(prev_page->PagePtr()));
-    region_iter.Reset({prev_page->PagePtr(), prev_page_len});
+    builder.Reset(prev_handle->PagePtr(), TypeOfPage(prev_handle->PagePtr()));
+    region_iter.Reset({prev_handle->PagePtr(), prev_page_len});
     for (uint16_t i = 0; i < preserve_region_cnt; i++)
     {
         // Copy preserved regions.
@@ -1219,8 +1194,8 @@ std::string_view BatchWriteTask::Redistribute(MemIndexPage *prev_page,
     builder.Finish();
 
 #ifndef NDEBUG
-    assert(prev_page->RestartNum() == preserve_region_cnt);
-    assert(prev_page->ContentLength() == preserve_len);
+    assert(prev_handle->RestartNum() == preserve_region_cnt);
+    assert(prev_handle->ContentLength() == preserve_len);
 #endif
     return new_page;
 }
@@ -1266,13 +1241,12 @@ std::string BatchWriteTask::RightBound(bool is_data_page)
 
 KvError BatchWriteTask::DeleteTree(PageId page_id, bool update_prev)
 {
-    auto [idx_page, err] = shard->IndexManager()->FindPage(
+    auto [handle, err] = shard->IndexManager()->FindPage(
         cow_meta_.mapper_->GetMapping(), page_id);
     CHECK_KV_ERR(err);
-    idx_page->Pin();
-    IndexPageIter iter(idx_page, Options());
+    IndexPageIter iter(handle, Options());
 
-    if (idx_page->IsPointingToLeaf())
+    if (handle->IsPointingToLeaf())
     {
         while (iter.Next())
         {
@@ -1280,11 +1254,9 @@ KvError BatchWriteTask::DeleteTree(PageId page_id, bool update_prev)
             update_prev = false;
             if (err != KvError::NoError)
             {
-                idx_page->Unpin();
                 return err;
             }
         }
-        idx_page->Unpin();
         FreePage(page_id);
         return KvError::NoError;
     }
@@ -1295,11 +1267,9 @@ KvError BatchWriteTask::DeleteTree(PageId page_id, bool update_prev)
         update_prev = false;
         if (err != KvError::NoError)
         {
-            idx_page->Unpin();
             return err;
         }
     }
-    idx_page->Unpin();
     FreePage(page_id);
     return KvError::NoError;
 }
@@ -1440,37 +1410,44 @@ void BatchWriteTask::AdvanceIndexPageIter(IndexPageIter &iter, bool &is_valid)
     is_valid = iter.HasNext() ? iter.Next() : false;
 }
 
-std::pair<MemIndexPage *, KvError> BatchWriteTask::TruncateIndexPage(
+std::pair<MemIndexPage::Handle, KvError> BatchWriteTask::TruncateIndexPage(
     PageId page_id, std::string_view trunc_pos)
 {
-    auto [idx_page, err] = shard->IndexManager()->FindPage(
+    auto [handle, err] = shard->IndexManager()->FindPage(
         cow_meta_.mapper_->GetMapping(), page_id);
     if (err != KvError::NoError)
     {
-        return {nullptr, err};
+        return {MemIndexPage::Handle(), err};
     }
 
-    const bool is_leaf_idx = idx_page->IsPointingToLeaf();
+    const bool is_leaf_idx = handle->IsPointingToLeaf();
     IndexPageBuilder builder(Options());
 
     auto truncate_sub_node = [&](std::string_view sub_node_key,
                                  PageId sub_node_id) -> KvError
     {
         // truncate sub-node
-        std::pair<bool, KvError> ret;
         if (is_leaf_idx)
         {
-            ret = TruncateDataPage(sub_node_id, trunc_pos);
+            auto [truncated, trunc_err] =
+                TruncateDataPage(sub_node_id, trunc_pos);
+            CHECK_KV_ERR(trunc_err);
+            if (truncated)
+            {
+                // This sub-node is partially truncated
+                builder.Add(sub_node_key, sub_node_id, is_leaf_idx);
+            }
         }
         else
         {
-            ret = TruncateIndexPage(sub_node_id, trunc_pos);
-        }
-        CHECK_KV_ERR(ret.second);
-        if (ret.first)
-        {
-            // This sub-node is partially truncated
-            builder.Add(sub_node_key, sub_node_id, is_leaf_idx);
+            auto [sub_handle, trunc_err] =
+                TruncateIndexPage(sub_node_id, trunc_pos);
+            CHECK_KV_ERR(trunc_err);
+            if (sub_handle)
+            {
+                // This sub-node is partially truncated
+                builder.Add(sub_node_key, sub_node_id, is_leaf_idx);
+            }
         }
         return KvError::NoError;
     };
@@ -1490,14 +1467,13 @@ std::pair<MemIndexPage *, KvError> BatchWriteTask::TruncateIndexPage(
         }
     };
 
-    IndexPageIter iter(idx_page, Options());
+    IndexPageIter iter(handle, Options());
     CHECK(iter.Next());
     std::string sub_node_key = {};
     PageId sub_node_id = iter.GetPageId();
 
     // Depth first search recursively
     bool cut_point_found = false;
-    idx_page->Pin();
     while (iter.Next())
     {
         std::string_view next_node_key = iter.Key();
@@ -1509,8 +1485,7 @@ std::pair<MemIndexPage *, KvError> BatchWriteTask::TruncateIndexPage(
             err = delete_sub_node(sub_node_key, sub_node_id, false);
             if (err != KvError::NoError)
             {
-                idx_page->Unpin();
-                return {nullptr, err};
+                return {MemIndexPage::Handle(), err};
             }
         }
         else if (Comp()->Compare(trunc_pos, next_node_key) >= 0)
@@ -1535,8 +1510,7 @@ std::pair<MemIndexPage *, KvError> BatchWriteTask::TruncateIndexPage(
             }
             if (err != KvError::NoError)
             {
-                idx_page->Unpin();
-                return {nullptr, err};
+                return {MemIndexPage::Handle(), err};
             }
         }
 
@@ -1555,34 +1529,38 @@ std::pair<MemIndexPage *, KvError> BatchWriteTask::TruncateIndexPage(
     {
         err = delete_sub_node(sub_node_key, sub_node_id, true);
     }
-    idx_page->Unpin();
     if (err != KvError::NoError)
     {
-        return {nullptr, err};
+        return {MemIndexPage::Handle(), err};
     }
 
     if (builder.IsEmpty())
     {
         // This index page is wholly deleted
         FreePage(page_id);
-        return {nullptr, KvError::NoError};
+        return {MemIndexPage::Handle(), KvError::NoError};
     }
     // This index page is partially truncated
     MemIndexPage *new_page = shard->IndexManager()->AllocIndexPage();
     if (new_page == nullptr)
     {
-        return {nullptr, KvError::OutOfMem};
+        return {MemIndexPage::Handle(), KvError::OutOfMem};
     }
+    MemIndexPage::Handle new_handle(new_page);
     std::string_view page_view = builder.Finish();
-    memcpy(new_page->PagePtr(), page_view.data(), page_view.size());
-    new_page->SetPageId(page_id);
-    err = WritePage(new_page);
+    memcpy(new_handle->PagePtr(), page_view.data(), page_view.size());
+    new_handle->SetPageId(page_id);
+    err = WritePage(new_handle);
     if (err != KvError::NoError)
     {
-        shard->IndexManager()->FreeIndexPage(new_page);
-        return {nullptr, err};
+        MemIndexPage *page = new_handle.Get();
+        new_handle.Reset();
+        CHECK(page->IsDetached());
+        CHECK(!page->IsPinned());
+        shard->IndexManager()->FreeIndexPage(page);
+        return {MemIndexPage::Handle(), err};
     }
-    return {new_page, KvError::NoError};
+    return {std::move(new_handle), KvError::NoError};
 }
 
 KvError BatchWriteTask::Truncate(std::string_view trunc_pos)
@@ -1627,8 +1605,7 @@ KvError BatchWriteTask::Truncate(std::string_view trunc_pos)
     do_update_ttl_ = true;
     auto [new_root, error] = TruncateIndexPage(cow_meta_.root_id_, trunc_pos);
     CHECK_KV_ERR(error);
-    cow_meta_.root_id_ =
-        new_root == nullptr ? MaxPageId : new_root->GetPageId();
+    cow_meta_.root_id_ = new_root ? new_root->GetPageId() : MaxPageId;
     err = ApplyTTLBatch();
     CHECK_KV_ERR(err);
     return UpdateMeta();

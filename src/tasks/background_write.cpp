@@ -4,6 +4,7 @@
 #include <memory>  // for std::shared_ptr
 #include <string>
 
+#include "storage/mem_index_page.h"
 #include "storage/shard.h"
 #include "utils.h"
 
@@ -19,31 +20,32 @@ public:
     ~MovingCachedPages()
     {
         // Moving operations are aborted
-        for (auto [page, src_fp_id] : pages_)
+        for (auto &entry : pages_)
         {
-            page->SetFilePageId(src_fp_id);
-            page->Unpin();
+            entry.handle->SetFilePageId(entry.src_fp_id);
         }
     }
-    void Add(MemIndexPage *page, FilePageId dest_fp_id)
+    void Add(MemIndexPage::Handle handle, FilePageId src_fp_id)
     {
-        page->Pin();
-        FilePageId src_fp_id = page->GetFilePageId();
-        page->SetFilePageId(dest_fp_id);
-        pages_.emplace_back(page, src_fp_id);
+        pages_.push_back({std::move(handle), src_fp_id});
     }
     void Finish()
     {
         // Moving operations are succeed
-        for (auto [page, _] : pages_)
+        for (auto &entry : pages_)
         {
-            page->Unpin();
+            entry.handle.Reset();
         }
         pages_.clear();
     }
 
 private:
-    std::vector<std::pair<MemIndexPage *, FilePageId>> pages_;
+    struct Entry
+    {
+        MemIndexPage::Handle handle;
+        FilePageId src_fp_id;
+    };
+    std::vector<Entry> pages_;
 };
 
 namespace
@@ -67,15 +69,15 @@ void BackgroundWrite::HeapSortFpIdsWithYield(
         return;
     }
 
-    constexpr size_t push_batch = 256;
-    constexpr size_t pop_batch = 256;
+    constexpr size_t push_batch = 1 << 8;
+    constexpr size_t pop_batch = 1 << 8;
 
     size_t push_ops = 0;
     for (size_t next = 1; next < fp_ids.size(); ++next)
     {
         std::push_heap(fp_ids.begin(), fp_ids.begin() + next + 1, FilePageLess);
         push_ops++;
-        if (push_ops % push_batch == 0)
+        if ((push_ops & (push_batch - 1)) == 0)
         {
             YieldToLowPQ();
         }
@@ -86,7 +88,7 @@ void BackgroundWrite::HeapSortFpIdsWithYield(
     {
         std::pop_heap(fp_ids.begin(), fp_ids.begin() + count, FilePageLess);
         pop_ops++;
-        if (pop_ops % pop_batch == 0)
+        if ((pop_ops & (pop_batch - 1)) == 0)
         {
             YieldToLowPQ();
         }
@@ -184,7 +186,7 @@ KvError BackgroundWrite::CompactDataFile()
     size_t round_cnt = 0;
     for (FileId file_id = begin_file_id; file_id < end_file_id; file_id++)
     {
-        if ((round_cnt & 0xFFFF) == 0)
+        if ((round_cnt & 0xFF) == 0)
         {
             YieldToLowPQ();
             round_cnt = 0;
@@ -221,6 +223,7 @@ KvError BackgroundWrite::CompactDataFile()
         // Compact this data file, copy all pages in this file to the back.
         for (auto it = it_low; it < it_high; it += max_move_batch)
         {
+            YieldToLowPQ();
             uint32_t batch_size = std::min(long(max_move_batch), it_high - it);
             const std::span<std::pair<FilePageId, PageId>> batch_ids(
                 it, batch_size);
@@ -228,14 +231,16 @@ KvError BackgroundWrite::CompactDataFile()
             move_batch_fp_ids.clear();
             for (auto [fp_id, page_id] : batch_ids)
             {
-                MemIndexPage *page =
-                    cow_meta_.old_mapping_->GetSwizzlingPointer(page_id);
-                if (page != nullptr)
+                MemIndexPage::Handle handle =
+                    cow_meta_.old_mapping_->GetSwizzlingHandle(page_id);
+                if (handle)
                 {
                     auto [_, new_fp_id] = AllocatePage(page_id);
-                    moving_cached.Add(page, new_fp_id);
-                    err = WritePage(page, new_fp_id);
+                    FilePageId src_fp_id = handle->GetFilePageId();
+                    handle->SetFilePageId(new_fp_id);
+                    err = WritePage(handle, new_fp_id);
                     CHECK_KV_ERR(err);
+                    moving_cached.Add(std::move(handle), src_fp_id);
                 }
                 else
                 {

@@ -6,6 +6,7 @@
 #include <liburing.h>
 #include <liburing/io_uring.h>
 #include <linux/openat2.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -37,6 +38,8 @@
 #include <bthread/eloq_module.h>
 #endif
 
+#include <butil/time.h>
+
 #include "cloud_storage_service.h"
 #include "coding.h"
 #include "common.h"
@@ -52,13 +55,33 @@ namespace eloqstore
 {
 namespace fs = std::filesystem;
 
+namespace
+{
+WriteTask *CurrentWriteTask()
+{
+    KvTask *task = ThdTask();
+    if (task == nullptr)
+    {
+        return nullptr;
+    }
+    switch (task->Type())
+    {
+    case TaskType::BatchWrite:
+    case TaskType::BackgroundWrite:
+        return static_cast<WriteTask *>(task);
+    default:
+        return nullptr;
+    }
+}
+}  // namespace
+
 char *VarPagePtr(const VarPage &page)
 {
     char *ptr = nullptr;
     switch (VarPageType(page.index()))
     {
     case VarPageType::MemIndexPage:
-        ptr = std::get<MemIndexPage *>(page)->PagePtr();
+        ptr = std::get<MemIndexPage::Handle>(page)->PagePtr();
         break;
     case VarPageType::DataPage:
         ptr = std::get<DataPage>(page).PagePtr();
@@ -72,6 +95,26 @@ char *VarPagePtr(const VarPage &page)
     }
     assert(!((uint64_t) ptr & (page_align - 1)));
     return ptr;
+}
+
+bool VarPageRegistered(const VarPage &page)
+{
+    switch (VarPageType(page.index()))
+    {
+    case VarPageType::MemIndexPage:
+    {
+        const MemIndexPage::Handle &handle =
+            std::get<MemIndexPage::Handle>(page);
+        return handle.Get() != nullptr && handle->IsRegistered();
+    }
+    case VarPageType::DataPage:
+        return std::get<DataPage>(page).IsRegistered();
+    case VarPageType::OverflowPage:
+        return std::get<OverflowPage>(page).IsRegistered();
+    case VarPageType::Page:
+        return std::get<Page>(page).IsRegistered();
+    }
+    return false;
 }
 
 std::unique_ptr<AsyncIoManager> AsyncIoManager::Instance(const EloqStore *store,
@@ -105,30 +148,30 @@ IouringMgr::IouringMgr(const KvOptions *opts, uint32_t fd_limit)
     lru_fd_head_.next_ = &lru_fd_tail_;
     lru_fd_tail_.prev_ = &lru_fd_head_;
 
-    if (!options_->data_append_mode)
-    {
-        uint32_t pool_size = options_->max_inflight_write;
-        write_req_pool_ = std::make_unique<WriteReqPool>(pool_size);
-    }
+    uint32_t pool_size = options_->max_inflight_write;
+    write_req_pool_ = std::make_unique<WriteReqPool>(pool_size);
+    merged_write_req_pool_ = std::make_unique<MergedWriteReqPool>(pool_size);
 }
 
 IouringMgr::~IouringMgr()
 {
     if (ring_inited_)
     {
+        if (buffers_registered_)
+        {
+            io_uring_unregister_buffers(&ring_);
+            buffers_registered_ = false;
+        }
         io_uring_unregister_files(&ring_);
         for (auto &[_, tbl] : tables_)
         {
             for (auto &[_, fd] : tbl.fds_)
             {
-                close(fd.fd_);
+                if (fd.fd_ >= 0 && fd.reg_idx_ < 0)
+                {
+                    close(fd.fd_);
+                }
             }
-        }
-
-        if (buf_ring_ != nullptr)
-        {
-            io_uring_free_buf_ring(
-                &ring_, buf_ring_, options_->buf_ring_size, buf_group_);
         }
 
         io_uring_queue_exit(&ring_);
@@ -137,7 +180,20 @@ IouringMgr::~IouringMgr()
 
 KvError IouringMgr::Init(Shard *shard)
 {
+    (void) shard;
+    return KvError::NoError;
+}
+
+KvError IouringMgr::BootstrapRing(Shard *shard)
+{
+    if (ring_inited_)
+    {
+        return KvError::NoError;
+    }
+
     io_uring_params params = {};
+    params.flags |= (IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
+                     IORING_SETUP_TASKRUN_FLAG);
     const uint32_t sq_size = options_->io_queue_size;
     int ret = io_uring_queue_init_params(sq_size, &ring_, &params);
     if (ret < 0)
@@ -150,37 +206,255 @@ KvError IouringMgr::Init(Shard *shard)
     if (fd_limit_ > 0)
     {
         ret = io_uring_register_files_sparse(&ring_, fd_limit_);
+        LOG(INFO) << "register files sparse with fd_limit " << fd_limit_
+                  << " ret " << ret;
         if (ret < 0)
         {
             LOG(ERROR) << "failed to reserve register file slots: " << ret;
             io_uring_queue_exit(&ring_);
+            ring_inited_ = false;
             return KvError::OpenFileLimit;
         }
         free_reg_slots_.reserve(fd_limit_);
     }
-
-    uint16_t num_bufs = options_->buf_ring_size;
-    assert(num_bufs);
-    uint16_t buf_size = options_->data_page_size;
-    buf_ring_ = io_uring_setup_buf_ring(&ring_, num_bufs, buf_group_, 0, &ret);
-    if (buf_ring_ == nullptr)
+    else
     {
-        LOG(ERROR) << "failed to initialize buffer ring: " << ret;
-        io_uring_unregister_files(&ring_);
+        LOG(ERROR) << "fd_limit is zero, cannot register fixed files";
         io_uring_queue_exit(&ring_);
-        return KvError::OutOfMem;
+        ring_inited_ = false;
+        return KvError::OpenFileLimit;
     }
-    int mask = io_uring_buf_ring_mask(num_bufs);
-    bufs_pool_.reserve(num_bufs);
-    for (uint16_t i = 0; i < num_bufs; i++)
+
+    bool registered_buffers = false;
+    size_t page_size = options_->data_page_size;
+    size_t pool_bytes = (options_->buffer_pool_size / page_size) * page_size;
+    constexpr size_t kMaxRegisteredBytes = 1ull << 30;  // 1 GiB per iovec.
+    registered_buf_base_ = nullptr;
+    registered_buf_stride_ = 0;
+    registered_buf_shift_ = 0;
+    registered_buf_count_ = 0;
+    registered_last_slice_size_ = 0;
+    write_buf_.reset();
+    write_buf_size_ = 0;
+    write_buf_pool_size_ = 0;
+    write_buf_count_ = 0;
+    write_buf_index_base_ = 0;
+
+    std::unique_ptr<char, decltype(&std::free)> page_buffer{nullptr,
+                                                            &std::free};
+    std::vector<iovec> iovecs;
+    uint16_t page_iov_count = 0;
+
+    if (pool_bytes > 0)
     {
-        Page page(shard->PagePool()->Allocate());
-        io_uring_buf_ring_add(buf_ring_, page.Ptr(), buf_size, i, mask, i);
-        bufs_pool_.emplace_back(std::move(page));
+        void *raw_ptr = nullptr;
+        int aligned = posix_memalign(&raw_ptr, page_align, pool_bytes);
+        if (aligned == 0 && raw_ptr != nullptr)
+        {
+            page_buffer.reset(static_cast<char *>(raw_ptr));
+            memset(page_buffer.get(), 0, pool_bytes);
+            size_t remaining = pool_bytes;
+            size_t offset = 0;
+            while (remaining > 0)
+            {
+                size_t chunk_size = std::min(remaining, kMaxRegisteredBytes);
+                iovec iov = {.iov_base = page_buffer.get() + offset,
+                             .iov_len = chunk_size};
+                iovecs.push_back(iov);
+                page_iov_count++;
+                remaining -= chunk_size;
+                offset += chunk_size;
+            }
+        }
+        else
+        {
+            LOG(WARNING) << "posix_memalign failed for registered pool, error: "
+                         << aligned;
+        }
     }
-    io_uring_buf_ring_advance(buf_ring_, num_bufs);
+
+    if (options_->data_append_mode && options_->write_buffer_ratio > 0.0 &&
+        options_->write_buffer_size > 0 && options_->buffer_pool_size > 0)
+    {
+        size_t write_buf_size = options_->write_buffer_size;
+        size_t write_pool_bytes = static_cast<size_t>(
+            static_cast<double>(options_->buffer_pool_size) *
+            options_->write_buffer_ratio);
+        write_pool_bytes =
+            std::min(write_pool_bytes, options_->buffer_pool_size);
+        if (write_buf_size % page_align != 0 ||
+            write_pool_bytes % page_align != 0)
+        {
+            size_t aligned_buf = (write_buf_size / page_align) * page_align;
+            size_t aligned_pool = (write_pool_bytes / page_align) * page_align;
+            LOG(WARNING) << "write buffer size not aligned, adjusted from "
+                         << write_buf_size << "/" << write_pool_bytes << " to "
+                         << aligned_buf << "/" << aligned_pool;
+            write_buf_size = aligned_buf;
+            write_pool_bytes = aligned_pool;
+        }
+        if (write_buf_size > 0 && write_pool_bytes >= write_buf_size)
+        {
+            void *raw_ptr = nullptr;
+            int aligned =
+                posix_memalign(&raw_ptr, page_align, write_pool_bytes);
+            if (aligned == 0 && raw_ptr != nullptr)
+            {
+                write_buf_.reset(static_cast<char *>(raw_ptr));
+                memset(write_buf_.get(), 0, write_pool_bytes);
+                write_buf_size_ = write_buf_size;
+                write_buf_pool_size_ = write_pool_bytes;
+                write_buf_count_ =
+                    static_cast<uint16_t>(write_pool_bytes / write_buf_size);
+            }
+            else
+            {
+                LOG(WARNING)
+                    << "posix_memalign failed for write buffers, error: "
+                    << aligned;
+            }
+        }
+        else
+        {
+            LOG(WARNING)
+                << "write_buffer_ratio is too small to allocate write buffers";
+        }
+    }
+
+    if (write_buf_ != nullptr && write_buf_count_ > 0)
+    {
+        write_buf_index_base_ = static_cast<uint16_t>(iovecs.size());
+        size_t offset = 0;
+        for (uint16_t i = 0; i < write_buf_count_; ++i)
+        {
+            iovec iov = {.iov_base = write_buf_.get() + offset,
+                         .iov_len = write_buf_size_};
+            iovecs.push_back(iov);
+            offset += write_buf_size_;
+        }
+        write_buf_slots_.clear();
+        write_buf_slots_.resize(write_buf_count_);
+        write_buf_free_ = nullptr;
+        for (uint16_t i = 0; i < write_buf_count_; ++i)
+        {
+            WriteBufSlot *slot = &write_buf_slots_[i];
+            slot->index = i;
+            slot->next = write_buf_free_;
+            write_buf_free_ = slot;
+        }
+    }
+
+    if (!iovecs.empty())
+    {
+        if (iovecs.size() > std::numeric_limits<uint16_t>::max())
+        {
+            LOG(WARNING) << "too many registered buffer slices: "
+                         << iovecs.size();
+            ret = -1;
+        }
+        else
+        {
+            ret =
+                io_uring_register_buffers(&ring_, iovecs.data(), iovecs.size());
+        }
+        if (ret < 0)
+        {
+            LOG(WARNING) << "failed to register buffers: " << ret
+                         << ", falling back to unregistered buffers";
+            write_buf_registered_ = false;
+        }
+        else
+        {
+            buffers_registered_ = true;
+            registered_buffers = true;
+            write_buf_registered_ =
+                (write_buf_ != nullptr && write_buf_count_ > 0);
+            if (page_buffer != nullptr)
+            {
+                registered_buf_base_ = page_buffer.get();
+                registered_buf_stride_ = kMaxRegisteredBytes;
+                registered_buf_shift_ = 30;
+                registered_buf_count_ = page_iov_count;
+                registered_last_slice_size_ =
+                    registered_buf_count_ == 0
+                        ? 0
+                        : iovecs[page_iov_count - 1].iov_len;
+                shard->PagePool()->Init(page_buffer.release(), pool_bytes);
+            }
+            else
+            {
+                registered_buf_base_ = nullptr;
+                registered_buf_stride_ = 0;
+                registered_buf_shift_ = 0;
+                registered_buf_count_ = 0;
+                registered_last_slice_size_ = 0;
+                shard->PagePool()->Init();
+            }
+        }
+    }
+    else
+    {
+        write_buf_registered_ = false;
+    }
+
+    if (!registered_buffers)
+    {
+        registered_buf_base_ = nullptr;
+        registered_buf_stride_ = 0;
+        registered_buf_shift_ = 0;
+        registered_buf_count_ = 0;
+        registered_last_slice_size_ = 0;
+        shard->PagePool()->Init();
+    }
 
     return KvError::NoError;
+}
+
+char *IouringMgr::AcquireWriteBuffer(uint16_t &buf_index)
+{
+    while (write_buf_free_ == nullptr)
+    {
+        write_buf_waiting_.Wait(ThdTask());
+    }
+    WriteBufSlot *slot = write_buf_free_;
+    write_buf_free_ = slot->next;
+    buf_index = static_cast<uint16_t>(write_buf_index_base_ + slot->index);
+    char *ptr = write_buf_.get() + (slot->index * write_buf_size_);
+    return ptr;
+}
+
+void IouringMgr::ReleaseWriteBuffer(char *ptr, uint16_t buf_index)
+{
+    if (write_buf_ == nullptr || write_buf_size_ == 0)
+    {
+        return;
+    }
+    uint16_t local_index =
+        static_cast<uint16_t>(buf_index - write_buf_index_base_);
+    assert(local_index < write_buf_slots_.size());
+    WriteBufSlot *slot = &write_buf_slots_[local_index];
+    slot->next = write_buf_free_;
+    write_buf_free_ = slot;
+    write_buf_waiting_.WakeOne();
+    (void) ptr;
+}
+
+void IouringMgr::InitBackgroundJob()
+{
+    if (ring_inited_)
+    {
+        return;
+    }
+
+    Shard *target_shard = shard;
+    CHECK(target_shard != nullptr)
+        << "Shard must be set before initializing io_uring";
+    KvError err = BootstrapRing(target_shard);
+    if (err != KvError::NoError)
+    {
+        LOG(FATAL) << "failed to initialize io queue in background thread: "
+                   << ErrorString(err);
+    }
 }
 
 std::pair<Page, KvError> IouringMgr::ReadPage(const TableIdent &tbl_id,
@@ -208,16 +482,24 @@ std::pair<Page, KvError> IouringMgr::ReadPage(const TableIdent &tbl_id,
             {
                 sqe->flags |= IOSQE_FIXED_FILE;
             }
-            sqe->buf_group = buf_group_;
-            sqe->flags |= IOSQE_BUFFER_SELECT;
-            io_uring_prep_read(sqe, fd.first, NULL, 0, offset);
-            res = ThdTask()->WaitIoResult();
-            if (ThdTask()->io_flags_ & IORING_CQE_F_BUFFER)
+            char *dst = result.Ptr();
+            bool use_fixed = result.IsRegistered();
+            if (use_fixed)
             {
-                uint16_t buf_id =
-                    ThdTask()->io_flags_ >> IORING_CQE_BUFFER_SHIFT;
-                result = SwapPage(std::move(result), buf_id);
+                uint16_t buf_index = LookupRegisteredBufferIndex(dst);
+                io_uring_prep_read_fixed(sqe,
+                                         fd.first,
+                                         dst,
+                                         options_->data_page_size,
+                                         offset,
+                                         buf_index);
             }
+            else
+            {
+                io_uring_prep_read(
+                    sqe, fd.first, dst, options_->data_page_size, offset);
+            }
+            res = ThdTask()->WaitIoResult();
             if (res == 0)
             {
                 LOG(ERROR) << "read page failed, reach end of file, file id:"
@@ -261,7 +543,6 @@ KvError IouringMgr::ReadPages(const TableIdent &tbl_id,
               page_(true) {};
 
         bool done_{false};
-        // no need to construct
         uint32_t offset_;
         LruFD::Ref fd_ref_;
         Page page_{false};
@@ -295,9 +576,23 @@ KvError IouringMgr::ReadPages(const TableIdent &tbl_id,
         {
             sqe->flags |= IOSQE_FIXED_FILE;
         }
-        sqe->buf_group = buf_group_;
-        sqe->flags |= IOSQE_BUFFER_SELECT;
-        io_uring_prep_read(sqe, fd, NULL, 0, req->offset_);
+        char *dst = req->page_.Ptr();
+        bool use_fixed = req->page_.IsRegistered();
+        if (use_fixed)
+        {
+            uint16_t buf_index = LookupRegisteredBufferIndex(dst);
+            io_uring_prep_read_fixed(sqe,
+                                     fd,
+                                     dst,
+                                     options_->data_page_size,
+                                     req->offset_,
+                                     buf_index);
+        }
+        else
+        {
+            io_uring_prep_read(
+                sqe, fd, dst, options_->data_page_size, req->offset_);
+        }
     };
 
     // Send requests.
@@ -312,12 +607,6 @@ KvError IouringMgr::ReadPages(const TableIdent &tbl_id,
             }
 
             int res = req.res_;
-            if (req.flags_ & IORING_CQE_F_BUFFER)
-            {
-                uint16_t buf_id = req.flags_ >> IORING_CQE_BUFFER_SHIFT;
-                req.page_ = SwapPage(std::move(req.page_), buf_id);
-            }
-
             KvError err = ToKvError(res);
             if ((res >= 0 && res < options_->data_page_size) ||
                 err == KvError::TryAgain)
@@ -390,7 +679,13 @@ std::pair<ManifestFilePtr, KvError> IouringMgr::GetManifest(
         return {nullptr, err};
     }
     struct statx result = {};
-    int res = Statx(fd.Get()->fd_, "", &result);
+    const std::string manifest_name = ManifestFileName(manifest_term);
+    auto [dir_fd, dir_err] = OpenFD(tbl_id, LruFD::kDirectory, false, 0);
+    if (dir_err != KvError::NoError)
+    {
+        return {nullptr, dir_err};
+    }
+    int res = StatxAt(dir_fd.FdPair(), manifest_name.c_str(), &result);
     if (res < 0)
     {
         LOG(ERROR) << "failed to statx manifest file: " << strerror(-res);
@@ -422,67 +717,72 @@ KvError IouringMgr::WritePage(const TableIdent &tbl_id,
     }
 
     char *ptr = req->PagePtr();
-    io_uring_prep_write(sqe, fd, ptr, options_->data_page_size, offset);
+    if (VarPageRegistered(req->page_))
+    {
+        uint16_t buf_index = LookupRegisteredBufferIndex(ptr);
+        io_uring_prep_write_fixed(
+            sqe, fd, ptr, options_->data_page_size, offset, buf_index);
+    }
+    else
+    {
+        io_uring_prep_write(sqe, fd, ptr, options_->data_page_size, offset);
+    }
     return KvError::NoError;
 }
 
-KvError IouringMgr::WritePages(const TableIdent &tbl_id,
-                               std::span<VarPage> pages,
-                               FilePageId first_fp_id)
+KvError IouringMgr::SubmitMergedWrite(const TableIdent &tbl_id,
+                                      FileId file_id,
+                                      uint64_t offset,
+                                      char *buf_ptr,
+                                      size_t bytes,
+                                      uint16_t buf_index,
+                                      std::vector<VarPage> &pages,
+                                      std::vector<char *> &release_ptrs,
+                                      std::vector<uint16_t> &release_indices,
+                                      bool use_fixed)
 {
-    auto [file_id, offset] = ConvFilePageId(first_fp_id);
     uint64_t term = GetFileIdTerm(tbl_id, file_id).value_or(ProcessTerm());
+    OnFileRangeWritePrepared(
+        tbl_id, file_id, term, offset, std::string_view(buf_ptr, bytes));
     auto [fd_ref, err] = OpenOrCreateFD(tbl_id, file_id, true, true, term);
     CHECK_KV_ERR(err);
     fd_ref.Get()->dirty_ = true;
 
-    auto writev = [this, &fd_ref](std::span<VarPage> pages,
-                                  uint32_t offset,
-                                  std::span<iovec> iov)
+    auto *req =
+        merged_write_req_pool_->Alloc(static_cast<WriteTask *>(ThdTask()),
+                                      std::move(fd_ref),
+                                      buf_ptr,
+                                      buf_index,
+                                      bytes,
+                                      offset,
+                                      std::move(pages));
+    req->release_ptrs_ = std::move(release_ptrs);
+    req->release_indices_ = std::move(release_indices);
+    req->use_fixed_ = use_fixed;
+
+    if (!req->pages_.empty())
     {
-        auto [fd, registered] = fd_ref.FdPair();
-        io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, ThdTask());
-        if (registered)
-        {
-            sqe->flags |= IOSQE_FIXED_FILE;
-        }
+        req->task_->inflight_io_ +=
+            static_cast<uint32_t>(req->pages_.size() - 1);
+    }
 
-        size_t num_pages = pages.size();
-        for (size_t i = 0; i < num_pages; i++)
-        {
-            iov[i].iov_base = VarPagePtr(pages[i]);
-            iov[i].iov_len = options_->data_page_size;
-        }
-        io_uring_prep_writev(sqe, fd, iov.data(), num_pages, offset);
-
-        int ret = ThdTask()->WaitIoResult();
-        if (ret < 0)
-        {
-            return ToKvError(ret);
-        }
-        const size_t expected_bytes = num_pages * options_->data_page_size;
-        if (static_cast<size_t>(ret) < expected_bytes)
-        {
-            return KvError::TryAgain;
-        }
-        return KvError::NoError;
-    };
-
-    TEST_KILL_POINT_WEIGHT("WritePages", 100)
-    size_t num_pages = pages.size();
-    if (num_pages <= 256)
+    io_uring_sqe *sqe = GetSQE(UserDataType::MergedWriteReq, req);
+    auto [fd, registered] = req->fd_ref_.FdPair();
+    if (registered)
     {
-        // Allocate iovec on stack (4KB).
-        std::array<iovec, 256> iov;
-        return writev(pages, offset, iov);
+        sqe->flags |= IOSQE_FIXED_FILE;
+    }
+    if (use_fixed)
+    {
+        io_uring_prep_write_fixed(
+            sqe, fd, buf_ptr, bytes, static_cast<off_t>(offset), buf_index);
     }
     else
     {
-        // Allocate iovec on heap when required space exceed 4KB.
-        std::vector<iovec> iov;
-        iov.resize(num_pages);
-        return writev(pages, offset, iov);
+        io_uring_prep_write(
+            sqe, fd, buf_ptr, bytes, static_cast<off_t>(offset));
     }
+    return KvError::NoError;
 }
 
 KvError IouringMgr::SyncData(const TableIdent &tbl_id)
@@ -712,7 +1012,9 @@ IouringMgr::LruFD::Ref IouringMgr::GetOpenedFD(const TableIdent &tbl_id,
     // This file may be in the process of being closed.
     LruFD::Ref fd_ref(&it_fd->second, this);
     fd_ref.Get()->mu_.Lock();
-    bool empty = fd_ref.Get()->fd_ == LruFD::FdEmpty;
+    bool empty = (file_id == LruFD::kDirectory)
+                     ? fd_ref.Get()->fd_ == LruFD::FdEmpty
+                     : fd_ref.Get()->reg_idx_ < 0;
     fd_ref.Get()->mu_.Unlock();
     return empty ? nullptr : fd_ref;
 }
@@ -730,26 +1032,27 @@ std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::OpenOrCreateFD(
     bool create,
     uint64_t term)
 {
-    auto it_tbl = tables_.find(tbl_id);
-    if (it_tbl == tables_.end())
+    auto [it_tbl, inserted] = tables_.try_emplace(tbl_id);
+    if (inserted)
     {
-        auto [it, _] = tables_.try_emplace(tbl_id);
-        it->second.tbl_id_ = &it->first;
-        it_tbl = it;
+        it_tbl->second.tbl_id_ = &it_tbl->first;
     }
     PartitionFiles *tbl = &it_tbl->second;
-    auto it_fd = tbl->fds_.find(file_id);
-    if (it_fd == tbl->fds_.end())
-    {
-        auto [it, _] = tbl->fds_.try_emplace(file_id, tbl, file_id, term);
-        it_fd = it;
-    }
+    auto [it_fd, _] = tbl->fds_.try_emplace(file_id, tbl, file_id, term);
     LruFD::Ref lru_fd(&it_fd->second, this);
 
     // Avoid multiple coroutines from concurrently opening or closing the same
     // file duplicately.
     lru_fd.Get()->mu_.Lock();
-    if (lru_fd.Get()->fd_ != LruFD::FdEmpty)
+    if (file_id == LruFD::kDirectory)
+    {
+        if (lru_fd.Get()->fd_ != LruFD::FdEmpty)
+        {
+            lru_fd.Get()->mu_.Unlock();
+            return {std::move(lru_fd), KvError::NoError};
+        }
+    }
+    else if (lru_fd.Get()->reg_idx_ >= 0)
     {
         // Check for term mismatch in cloud mode.
         const bool cloud_mode = !options_->cloud_store_path.empty();
@@ -759,18 +1062,13 @@ std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::OpenOrCreateFD(
             if (cached_term != 0 && cached_term != term)
             {
                 // Term mismatch detected, close and reopen with correct term.
-                int old_fd = lru_fd.Get()->fd_;
-                if (lru_fd.Get()->reg_idx_ >= 0)
-                {
-                    UnregisterFile(lru_fd.Get()->reg_idx_);
-                }
-                int res = Close(old_fd);
+                int old_idx = lru_fd.Get()->reg_idx_;
+                int res = CloseDirect(old_idx);
                 if (res < 0)
                 {
                     lru_fd.Get()->mu_.Unlock();
                     return {nullptr, ToKvError(res)};
                 }
-                lru_fd.Get()->fd_ = LruFD::FdEmpty;
                 lru_fd.Get()->reg_idx_ = -1;
                 // Fall through to open/create with correct term
             }
@@ -795,7 +1093,7 @@ std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::OpenOrCreateFD(
     {
         FdIdx root_fd = GetRootFD(tbl_id);
         std::string dirname = tbl_id.ToString();
-        fd = OpenAt(root_fd, dirname.c_str(), oflags_dir);
+        fd = OpenAt(root_fd, dirname.c_str(), oflags_dir, 0, false);
         if (fd == -ENOENT && create)
         {
             fd = MakeDir(root_fd, dirname.c_str());
@@ -803,7 +1101,10 @@ std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::OpenOrCreateFD(
     }
     else
     {
-        fd = OpenFile(tbl_id, file_id, direct, term);
+        uint64_t flags =
+            O_RDWR | (direct ? O_DIRECT : 0) | (create ? O_CREAT : 0);
+        uint64_t mode = create ? 0644 : 0;
+        fd = OpenFile(tbl_id, file_id, flags, mode, term);
         if (fd == -ENOENT && create)
         {
             // This must be data file because manifest should always be
@@ -840,9 +1141,15 @@ std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::OpenOrCreateFD(
         return {nullptr, error};
     }
 
-    if (file_id != LruFD::kDirectory)
+    if (file_id == LruFD::kDirectory)
     {
-        lru_fd.Get()->reg_idx_ = RegisterFile(fd);
+        lru_fd.Get()->fd_ = fd;
+        lru_fd.Get()->reg_idx_ = -1;
+    }
+    else
+    {
+        lru_fd.Get()->reg_idx_ = fd;
+        lru_fd.Get()->fd_ = LruFD::FdEmpty;
     }
 
     // Set term on newly opened data file FD.
@@ -850,7 +1157,6 @@ std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::OpenOrCreateFD(
     {
         lru_fd.Get()->term_ = term;
     }
-    lru_fd.Get()->fd_ = fd;
     lru_fd.Get()->mu_.Unlock();
     return {std::move(lru_fd), KvError::NoError};
 }
@@ -902,6 +1208,27 @@ void IouringMgr::SetFileIdTerm(const TableIdent &tbl_id,
     mapping_ptr->insert_or_assign(file_id, term);
 }
 
+inline uint16_t IouringMgr::LookupRegisteredBufferIndex(const char *ptr) const
+{
+    DCHECK(buffers_registered_);
+    DCHECK(ptr != nullptr);
+    DCHECK(registered_buf_base_ != nullptr);
+    DCHECK_GT(registered_buf_stride_, 0);
+    DCHECK_GT(registered_buf_shift_, 0);
+    DCHECK_GT(registered_buf_count_, 0);
+    size_t diff = static_cast<size_t>(ptr - registered_buf_base_);
+    [[maybe_unused]] size_t max_bytes =
+        registered_buf_stride_ * (registered_buf_count_ - 1) +
+        registered_last_slice_size_;
+    DCHECK_LT(diff, max_bytes);
+    size_t idx = diff >> registered_buf_shift_;
+    if (idx >= registered_buf_count_)
+    {
+        idx = registered_buf_count_ - 1;
+    }
+    return static_cast<uint16_t>(idx);
+}
+
 std::pair<FileId, uint32_t> IouringMgr::ConvFilePageId(
     FilePageId file_page_id) const
 {
@@ -915,16 +1242,39 @@ std::pair<FileId, uint32_t> IouringMgr::ConvFilePageId(
 
 void IouringMgr::Submit()
 {
-    if (prepared_sqe_ == 0)
+    const uint32_t prepared_before = prepared_sqe_;
+    const uint32_t sq_flags = ring_.sq.kflags == nullptr ? 0 : *ring_.sq.kflags;
+    const bool need_taskrun = (sq_flags & IORING_SQ_TASKRUN) != 0;
+
+    if (prepared_before == 0 && !need_taskrun)
     {
         return;
     }
-    int ret = io_uring_submit(&ring_);
-    if (ret < 0)
+
+    int ret = 0;
+    if (prepared_before == 0)
     {
-        LOG(ERROR) << "iouring submit failed " << ret;
+        // No new SQE, but taskrun is pending. Enter kernel to drive task_work.
+        ret = io_uring_enter(
+            ring_.ring_fd, 0, 0, IORING_ENTER_GETEVENTS, nullptr);
     }
     else
+    {
+        ret = io_uring_submit(&ring_);
+    }
+
+    if (__builtin_expect(ret < 0, 0))
+    {
+        if (prepared_before == 0)
+        {
+            LOG(ERROR) << "io_uring_enter(GETEVENTS) failed " << ret;
+        }
+        else
+        {
+            LOG(ERROR) << "iouring submit failed " << ret;
+        }
+    }
+    else if (prepared_before != 0)
     {
         prepared_sqe_ -= ret;
     }
@@ -979,6 +1329,40 @@ void IouringMgr::PollComplete()
             write_req_pool_->Free(req);
             break;
         }
+        case UserDataType::MergedWriteReq:
+        {
+            MergedWriteReq *req = static_cast<MergedWriteReq *>(ptr);
+            KvError err;
+            if (cqe->res < 0)
+            {
+                err = ToKvError(cqe->res);
+            }
+            else if (static_cast<size_t>(cqe->res) < req->bytes_)
+            {
+                err = KvError::TryAgain;
+            }
+            else
+            {
+                err = KvError::NoError;
+            }
+
+            for (VarPage &page : req->pages_)
+            {
+                req->task_->WritePageCallback(std::move(page), err);
+                req->task_->FinishIo();
+            }
+            ReleaseWriteBuffer(req->buf_ptr_, req->buf_index_);
+            for (size_t i = 0; i < req->release_ptrs_.size(); ++i)
+            {
+                if (req->release_ptrs_[i] != nullptr)
+                {
+                    ReleaseWriteBuffer(req->release_ptrs_[i],
+                                       req->release_indices_[i]);
+                }
+            }
+            merged_write_req_pool_->Free(req);
+            continue;
+        }
         default:
             assert(false);
             continue;
@@ -994,10 +1378,6 @@ void IouringMgr::PollComplete()
 int IouringMgr::MakeDir(FdIdx dir_fd, const char *path)
 {
     io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, ThdTask());
-    if (dir_fd.second)
-    {
-        sqe->flags |= IOSQE_FIXED_FILE;
-    }
     io_uring_prep_mkdirat(sqe, dir_fd.first, path, 0775);
     int res = ThdTask()->WaitIoResult();
     if (res < 0)
@@ -1011,7 +1391,7 @@ int IouringMgr::MakeDir(FdIdx dir_fd, const char *path)
         LOG(ERROR) << "fsync directory failed " << strerror(-res);
         return res;
     }
-    return OpenAt(dir_fd, path, oflags_dir);
+    return OpenAt(dir_fd, path, oflags_dir, 0, false);
 }
 
 int IouringMgr::CreateFile(LruFD::Ref dir_fd, FileId file_id, uint64_t term)
@@ -1031,7 +1411,7 @@ int IouringMgr::CreateFile(LruFD::Ref dir_fd, FileId file_id, uint64_t term)
         {
             // Avoid update metadata (file size) of file frequently in append
             // write mode.
-            Fallocate({fd, false}, options_->DataFileSize());
+            Fallocate({fd, true}, options_->DataFileSize());
         }
     }
     return fd;
@@ -1039,51 +1419,67 @@ int IouringMgr::CreateFile(LruFD::Ref dir_fd, FileId file_id, uint64_t term)
 
 int IouringMgr::OpenFile(const TableIdent &tbl_id,
                          FileId file_id,
-                         bool direct,
+                         uint64_t flags,
+                         uint64_t mode,
                          uint64_t term)
 {
-    uint64_t flags = O_RDWR;
     fs::path path = tbl_id.ToString();
     if (file_id == LruFD::kManifest)
     {
-        if (direct)
-        {
-            flags |= O_DIRECT;
-        }
         path.append(ManifestFileName(term));
     }
     else
     {
         // Data file is always opened with O_DIRECT.
-        flags |= O_DIRECT;
+        assert((flags & O_DIRECT) == O_DIRECT);
         assert(file_id <= LruFD::kMaxDataFile);
         path.append(DataFileName(file_id, term));
     }
     FdIdx root_fd = GetRootFD(tbl_id);
-    return OpenAt(root_fd, path.c_str(), flags);
+    return OpenAt(root_fd, path.c_str(), flags, mode);
 }
 
 int IouringMgr::OpenAt(FdIdx dir_fd,
                        const char *path,
                        uint64_t flags,
-                       uint64_t mode)
+                       uint64_t mode,
+                       bool fixed_target)
 {
-    lru_fd_count_++;
     EvictFD();
+    uint64_t open_flags = flags;
+    if ((open_flags & O_DIRECTORY) == 0)
+    {
+        open_flags |= O_NOATIME;
+    }
+    open_how how = {.flags = open_flags, .mode = mode, .resolve = 0};
+    if (fixed_target)
+    {
+        uint32_t idx = AllocRegisterIndex();
+        if (idx == UINT32_MAX)
+        {
+            LOG(ERROR) << "register file slot used up";
+            return -EMFILE;
+        }
+        io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, ThdTask());
+        io_uring_prep_openat2_direct(sqe, dir_fd.first, path, &how, idx);
+        int res = ThdTask()->WaitIoResult();
+        if (res < 0)
+        {
+            FreeRegisterIndex(idx);
+            return res;
+        }
+        lru_fd_count_++;
+        return static_cast<int>(idx);
+    }
 
     io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, ThdTask());
-    if (dir_fd.second)
-    {
-        sqe->flags |= IOSQE_FIXED_FILE;
-    }
-    open_how how = {.flags = flags, .mode = mode, .resolve = 0};
     io_uring_prep_openat2(sqe, dir_fd.first, path, &how);
     int fd = ThdTask()->WaitIoResult();
-
     if (fd < 0)
     {
-        lru_fd_count_--;
+        return fd;
     }
+    lru_fd_count_++;
     return fd;
 }
 
@@ -1096,19 +1492,6 @@ int IouringMgr::Read(FdIdx fd, char *dst, size_t n, uint64_t offset)
     }
     io_uring_prep_read(sqe, fd.first, dst, n, offset);
     return ThdTask()->WaitIoResult();
-}
-
-Page IouringMgr::SwapPage(Page page, uint16_t buf_id)
-{
-    assert(buf_id < bufs_pool_.size());
-    std::swap(page, bufs_pool_[buf_id]);
-
-    uint16_t buf_size = options_->data_page_size;
-    int mask = io_uring_buf_ring_mask(options_->buf_ring_size);
-    io_uring_buf_ring_add(
-        buf_ring_, bufs_pool_[buf_id].Ptr(), buf_size, buf_id, mask, 0);
-    io_uring_buf_ring_advance(buf_ring_, 1);
-    return page;
 }
 
 int IouringMgr::Write(FdIdx fd, const char *src, size_t n, uint64_t offset)
@@ -1197,6 +1580,7 @@ KvError IouringMgr::CloseFiles(std::span<LruFD::Ref> fds)
         CloseReq(KvTask *task, LruFD::Ref fd)
             : BaseReq(task), fd_ref_(std::move(fd)) {};
         LruFD::Ref fd_ref_;
+        int reg_idx_{-1};
         int fd_{LruFD::FdEmpty};
     };
 
@@ -1207,7 +1591,7 @@ KvError IouringMgr::CloseFiles(std::span<LruFD::Ref> fds)
         bool locked;
         int reg_idx;
     };
-    // We need to do three things: flush dirty pages, unregister, and close.
+    // We need to flush dirty pages and close.
     std::vector<PendingClose> pendings;
     pendings.reserve(fds.size());
     std::unordered_map<const TableIdent *, std::vector<LruFD::Ref>>
@@ -1223,7 +1607,7 @@ KvError IouringMgr::CloseFiles(std::span<LruFD::Ref> fds)
         }
 
         lru_fd->mu_.Lock();
-        if (lru_fd->fd_ == LruFD::FdEmpty)
+        if (lru_fd->reg_idx_ < 0 && lru_fd->fd_ == LruFD::FdEmpty)
         {
             lru_fd->mu_.Unlock();
             continue;
@@ -1264,56 +1648,6 @@ KvError IouringMgr::CloseFiles(std::span<LruFD::Ref> fds)
         }
     }
 
-    struct UnregisterReq : BaseReq
-    {
-        UnregisterReq(KvTask *task, PendingClose *pending)
-            : BaseReq(task), pending_(pending) {};
-        PendingClose *pending_;
-        int placeholder_{-1};
-    };
-
-    std::vector<UnregisterReq> unregister_reqs;
-    unregister_reqs.reserve(pendings.size());
-
-    for (PendingClose &pending : pendings)
-    {
-        if (!pending.locked || pending.reg_idx < 0)
-        {
-            continue;
-        }
-        UnregisterReq &req = unregister_reqs.emplace_back(ThdTask(), &pending);
-        io_uring_sqe *sqe = GetSQE(UserDataType::BaseReq, &req);
-        io_uring_prep_files_update(sqe, &req.placeholder_, 1, pending.reg_idx);
-    }
-
-    KvError unregister_err = KvError::NoError;
-    if (!unregister_reqs.empty())
-    {
-        ThdTask()->WaitIo();
-        for (UnregisterReq &req : unregister_reqs)
-        {
-            if (req.res_ < 0)
-            {
-                LOG(ERROR) << "unregister file slot failed file_id="
-                           << req.pending_->lru_fd->file_id_ << " : "
-                           << strerror(-req.res_);
-                if (unregister_err == KvError::NoError)
-                {
-                    unregister_err = ToKvError(req.res_);
-                }
-            }
-            PendingClose *pending = req.pending_;
-            FreeRegisterIndex(pending->reg_idx);
-            pending->lru_fd->reg_idx_ = -1;
-            pending->reg_idx = -1;
-        }
-    }
-    if (unregister_err != KvError::NoError)
-    {
-        unlock_pendings();
-        return unregister_err;
-    }
-
     std::vector<CloseReq> reqs;
     reqs.reserve(pendings.size());
 
@@ -1328,11 +1662,20 @@ KvError IouringMgr::CloseFiles(std::span<LruFD::Ref> fds)
         LruFD::Ref &fd_ref = *pending.fd_ref;
 
         CloseReq &req = reqs.emplace_back(ThdTask(), std::move(fd_ref));
-        req.fd_ = lru_fd->fd_;
-        lru_fd->fd_ = LruFD::FdEmpty;
-
         io_uring_sqe *sqe = GetSQE(UserDataType::BaseReq, &req);
-        io_uring_prep_close(sqe, req.fd_);
+        if (lru_fd->reg_idx_ < 0)
+        {
+            req.fd_ = lru_fd->fd_;
+            lru_fd->fd_ = LruFD::FdEmpty;
+            io_uring_prep_close(sqe, req.fd_);
+        }
+        else
+        {
+            req.reg_idx_ = pending.reg_idx;
+            lru_fd->reg_idx_ = -1;
+            lru_fd->fd_ = LruFD::FdEmpty;
+            io_uring_prep_close_direct(sqe, req.reg_idx_);
+        }
 
         lru_fd->mu_.Unlock();
         pending.locked = false;
@@ -1355,7 +1698,11 @@ KvError IouringMgr::CloseFiles(std::span<LruFD::Ref> fds)
                     close_err = ToKvError(req.res_);
                 }
             }
-            else
+            if (req.reg_idx_ >= 0)
+            {
+                FreeRegisterIndex(req.reg_idx_);
+            }
+            if (req.res_ == 0)
             {
                 lru_fd_count_--;
             }
@@ -1376,21 +1723,25 @@ int IouringMgr::Fdatasync(FdIdx fd)
     return ThdTask()->WaitIoResult();
 }
 
-int IouringMgr::Statx(int fd, const char *path, struct statx *result)
+int IouringMgr::Statx(FdIdx fd, const char *path, struct statx *result)
 {
     io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, ThdTask());
+    CHECK(!fd.second) << "statx does not support fixed file";
     io_uring_prep_statx(
-        sqe, fd, path, AT_EMPTY_PATH, STATX_BASIC_STATS, result);
+        sqe, fd.first, path, AT_EMPTY_PATH, STATX_BASIC_STATS, result);
+    return ThdTask()->WaitIoResult();
+}
+
+int IouringMgr::StatxAt(FdIdx dir_fd, const char *path, struct statx *result)
+{
+    io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, ThdTask());
+    io_uring_prep_statx(sqe, dir_fd.first, path, 0, STATX_BASIC_STATS, result);
     return ThdTask()->WaitIoResult();
 }
 
 int IouringMgr::Rename(FdIdx dir_fd, const char *old_path, const char *new_path)
 {
     io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, ThdTask());
-    if (dir_fd.second)
-    {
-        sqe->flags |= IOSQE_FIXED_FILE;
-    }
     io_uring_prep_renameat(
         sqe, dir_fd.first, old_path, dir_fd.first, new_path, 0);
     return ThdTask()->WaitIoResult();
@@ -1413,15 +1764,50 @@ int IouringMgr::Close(int fd)
     return res;
 }
 
+int IouringMgr::CloseDirect(int idx)
+{
+    io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, ThdTask());
+    io_uring_prep_close_direct(sqe, idx);
+    int res = ThdTask()->WaitIoResult();
+    if (res < 0)
+    {
+        LOG(ERROR) << "close direct file " << idx
+                   << " failed: " << strerror(-res);
+    }
+    if (res == 0)
+    {
+        FreeRegisterIndex(idx);
+        lru_fd_count_--;
+    }
+    return res;
+}
+
 KvError IouringMgr::CloseFile(LruFD::Ref fd_ref)
 {
     LruFD *lru_fd = fd_ref.Get();
-    const int fd = lru_fd->fd_;
-    if (fd < 0)
+    const int fd_idx = lru_fd->reg_idx_;
+    if (fd_idx < 0)
     {
-        return KvError::NoError;
+        const int fd = lru_fd->fd_;
+        if (fd < 0)
+        {
+            return KvError::NoError;
+        }
+        // Make sure no tasks can use this fd during closing.
+        lru_fd->mu_.Lock();
+        if (lru_fd->dirty_)
+        {
+            if (KvError err = SyncFile(fd_ref); err != KvError::NoError)
+            {
+                lru_fd->mu_.Unlock();
+                return err;
+            }
+        }
+        lru_fd->fd_ = LruFD::FdEmpty;
+        int res = Close(fd);
+        lru_fd->mu_.Unlock();
+        return ToKvError(res);
     }
-    FdIdx fd_idx = lru_fd->FdPair();
 
     // Make sure no tasks can use this fd during closing.
     lru_fd->mu_.Lock();
@@ -1435,25 +1821,17 @@ KvError IouringMgr::CloseFile(LruFD::Ref fd_ref)
         }
     }
 
-    if (fd_idx.second)
-    {
-        UnregisterFile(fd_idx.first);
-        lru_fd->reg_idx_ = -1;
-    }
-
-    if (int res = Close(fd); res < 0)
-    {
-        lru_fd->mu_.Unlock();
-        return ToKvError(res);
-    }
+    lru_fd->reg_idx_ = -1;
     lru_fd->fd_ = LruFD::FdEmpty;
+    int res = CloseDirect(fd_idx);
     lru_fd->mu_.Unlock();
-    return KvError::NoError;
+    return ToKvError(res);
 }
 
 bool IouringMgr::EvictFD()
 {
-    while (lru_fd_count_ > fd_limit_)
+    while (lru_fd_count_ > fd_limit_ ||
+           (free_reg_slots_.empty() && alloc_reg_slot_ >= fd_limit_))
     {
         LruFD *lru_fd = lru_fd_tail_.prev_;
         if (lru_fd == &lru_fd_head_)
@@ -1461,7 +1839,7 @@ bool IouringMgr::EvictFD()
             return false;
         }
         assert(lru_fd->ref_count_ == 0);
-        assert(lru_fd->fd_ >= 0);
+        assert(lru_fd->reg_idx_ >= 0 || lru_fd->fd_ >= 0);
         // This LruFD will be removed by ~LruFD::Ref if succeed to close,
         // otherwise be enqueued back to LRU.
         CloseFile(LruFD::Ref(lru_fd, this));
@@ -1534,43 +1912,6 @@ bool IouringMgr::HasOtherFile(const TableIdent &tbl_id) const
     return false;
 }
 
-int IouringMgr::RegisterFile(int fd)
-{
-    uint32_t idx = AllocRegisterIndex();
-    if (idx == UINT32_MAX)
-    {
-        DLOG(WARNING) << "register file slot used up: " << lru_fd_count_;
-        return -1;
-    }
-    io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, ThdTask());
-    io_uring_prep_files_update(sqe, &fd, 1, idx);
-    int res = ThdTask()->WaitIoResult();
-    if (res < 0)
-    {
-        LOG(ERROR) << "failed to register file " << fd << " at " << idx << ": "
-                   << strerror(-res);
-        FreeRegisterIndex(idx);
-        return -1;
-    }
-    return idx;
-}
-
-int IouringMgr::UnregisterFile(int idx)
-{
-    int fd = -1;
-    io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, ThdTask());
-    io_uring_prep_files_update(sqe, &fd, 1, idx);
-    int res = ThdTask()->WaitIoResult();
-    if (res < 0)
-    {
-        LOG(ERROR) << "can't unregister file at " << idx << ": "
-                   << strerror(-res);
-    }
-
-    FreeRegisterIndex(idx);
-    return res;
-}
-
 int IouringMgr::Fallocate(FdIdx fd, uint64_t size)
 {
     io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, ThdTask());
@@ -1620,6 +1961,10 @@ KvError IouringMgr::AppendManifest(const TableIdent &tbl_id,
     {
         SetFileIdTerm(tbl_id, LruFD::kManifest, manifest_term);
     }
+    // Record manifest write payload for cloud upload before submit
+    // (manifest segments are tracked too).
+    OnFileRangeWritePrepared(
+        tbl_id, LruFD::kManifest, manifest_term, offset, log);
 #ifndef NDEBUG
     const PageId root =
         DecodeFixed32(log.data() + ManifestBuilder::offset_root);
@@ -1648,16 +1993,33 @@ KvError IouringMgr::AppendManifest(const TableIdent &tbl_id,
     assert((offset & (alignment - 1)) == 0);
     assert((log.size() & (alignment - 1)) == 0);
 
-    int wres = Write(fd_ref.FdPair(), log.data(), log.size(), offset);
-    if (wres < 0)
+    const size_t write_batch_size = page_align;
+    size_t remaining = log.size();
+    size_t written = 0;
+    FdIdx fd_idx = fd_ref.FdPair();
+    while (remaining > 0)
     {
-        LOG(ERROR) << "append manifest failed " << tbl_id;
-        return ToKvError(wres);
-    }
-    if (wres < static_cast<int>(log.size()))
-    {
-        LOG(ERROR) << "append manifest less than expected " << tbl_id;
-        return KvError::TryAgain;
+        size_t batch = std::min(write_batch_size, remaining);
+        int wres = Write(fd_idx, log.data() + written, batch, offset + written);
+        if (wres < 0)
+        {
+            LOG(ERROR) << "append manifest failed " << tbl_id;
+            return ToKvError(wres);
+        }
+        if (wres == 0)
+        {
+            LOG(ERROR) << "append manifest wrote zero bytes " << tbl_id;
+            return KvError::TryAgain;
+        }
+        written += static_cast<size_t>(wres);
+        if (remaining >= static_cast<size_t>(wres))
+        {
+            remaining -= static_cast<size_t>(wres);
+        }
+        else
+        {
+            remaining = 0;
+        }
     }
 
     TEST_KILL_POINT_WEIGHT("AppendManifest:Sync", 10)
@@ -1683,25 +2045,42 @@ int IouringMgr::WriteSnapshot(LruFD::Ref dir_fd,
     [[maybe_unused]] const size_t alignment = page_align;
     assert((io_size & (alignment - 1)) == 0);
     assert((reinterpret_cast<uintptr_t>(write_ptr) & (alignment - 1)) == 0);
-    int res = Write({tmp_fd, false}, write_ptr, io_size, 0);
-    if (res < 0)
+    FdIdx tmp_fd_idx{tmp_fd, true};
+    size_t write_batch_size = Options()->non_page_io_batch_size;
+    size_t remaining = io_size;
+    size_t written = 0;
+    while (remaining > 0)
     {
-        Close(tmp_fd);
-        LOG(ERROR) << "write temporary file failed " << strerror(-res);
-        return res;
-    }
-    if (res < static_cast<int>(io_size))
-    {
-        Close(tmp_fd);
-        LOG(ERROR) << "write temporary file less than expected.";
-        return -EIO;
+        size_t batch = std::min(write_batch_size, remaining);
+        int res = Write(tmp_fd_idx, write_ptr + written, batch, written);
+        if (res < 0)
+        {
+            CloseDirect(tmp_fd);
+            LOG(ERROR) << "write snapshot failed: " << strerror(-res);
+            return res;
+        }
+        if (res == 0)
+        {
+            CloseDirect(tmp_fd);
+            LOG(ERROR) << "write temporary file wrote zero bytes.";
+            return -EIO;
+        }
+        written += static_cast<size_t>(res);
+        if (remaining >= static_cast<size_t>(res))
+        {
+            remaining -= static_cast<size_t>(res);
+        }
+        else
+        {
+            remaining = 0;
+        }
     }
 
     TEST_KILL_POINT("AtomicWriteFile:Sync")
-    res = Fdatasync({tmp_fd, false});
+    int res = Fdatasync({tmp_fd, true});
     if (res < 0)
     {
-        Close(tmp_fd);
+        CloseDirect(tmp_fd);
         LOG(ERROR) << "fsync temporary file failed " << strerror(-res);
         return res;
     }
@@ -1711,7 +2090,7 @@ int IouringMgr::WriteSnapshot(LruFD::Ref dir_fd,
     res = Rename(dir_fd.FdPair(), tmpfile.c_str(), name.data());
     if (res < 0)
     {
-        Close(tmp_fd);
+        CloseDirect(tmp_fd);
         LOG(ERROR) << "rename temporary file failed " << strerror(-res);
         return res;
     }
@@ -1719,7 +2098,7 @@ int IouringMgr::WriteSnapshot(LruFD::Ref dir_fd,
     res = Fdatasync(dir_fd.FdPair());
     if (res < 0)
     {
-        Close(tmp_fd);
+        CloseDirect(tmp_fd);
         LOG(ERROR) << "fsync directory failed " << strerror(-res);
         return res;
     }
@@ -1748,7 +2127,7 @@ KvError IouringMgr::SwitchManifest(const TableIdent &tbl_id,
     {
         return ToKvError(res);
     }
-    Close(res);
+    CloseDirect(res);
     return KvError::NoError;
 }
 
@@ -1765,7 +2144,7 @@ KvError IouringMgr::CreateArchive(const TableIdent &tbl_id,
     {
         return ToKvError(res);
     }
-    Close(res);
+    CloseDirect(res);
     return KvError::NoError;
 }
 
@@ -1781,6 +2160,9 @@ io_uring_sqe *IouringMgr::GetSQE(UserDataType type, const void *user_ptr)
     {
         EncodeUserData(sqe, user_ptr, type);
     }
+    // SQE objects are reused by io_uring. Clear per-request flags so fixed-fd
+    // state does not leak to non-fixed operations.
+    sqe->flags = 0;
     ThdTask()->inflight_io_++;
     prepared_sqe_++;
     return sqe;
@@ -1818,6 +2200,64 @@ void IouringMgr::WriteReqPool::Free(WriteReq *req)
 {
     req->fd_ref_ = nullptr;
 
+    req->next_ = free_list_;
+    free_list_ = req;
+    waiting_.WakeOne();
+}
+
+IouringMgr::MergedWriteReqPool::MergedWriteReqPool(uint32_t pool_size)
+{
+    assert(pool_size > 0);
+    pool_ = std::make_unique<MergedWriteReq[]>(pool_size);
+    free_list_ = nullptr;
+    for (size_t i = 0; i < pool_size; i++)
+    {
+        pool_[i].pages_.clear();
+        pool_[i].task_ = nullptr;
+        pool_[i].next_ = free_list_;
+        free_list_ = &pool_[i];
+    }
+}
+
+IouringMgr::MergedWriteReq *IouringMgr::MergedWriteReqPool::Alloc(
+    WriteTask *task,
+    LruFD::Ref fd,
+    char *buf_ptr,
+    uint16_t buf_index,
+    size_t bytes,
+    uint64_t offset,
+    std::vector<VarPage> pages)
+{
+    while (free_list_ == nullptr)
+    {
+        waiting_.Wait(ThdTask());
+    }
+    MergedWriteReq *req = free_list_;
+    free_list_ = req->next_;
+
+    req->task_ = task;
+    req->fd_ref_ = std::move(fd);
+    req->buf_ptr_ = buf_ptr;
+    req->buf_index_ = buf_index;
+    req->bytes_ = bytes;
+    req->offset_ = offset;
+    req->pages_ = std::move(pages);
+    req->next_ = nullptr;
+    return req;
+}
+
+void IouringMgr::MergedWriteReqPool::Free(MergedWriteReq *req)
+{
+    req->pages_.clear();
+    req->release_ptrs_.clear();
+    req->release_indices_.clear();
+    req->fd_ref_ = nullptr;
+    req->task_ = nullptr;
+    req->buf_ptr_ = nullptr;
+    req->buf_index_ = 0;
+    req->use_fixed_ = true;
+    req->bytes_ = 0;
+    req->offset_ = 0;
     req->next_ = free_list_;
     free_list_ = req;
     waiting_.WakeOne();
@@ -2032,7 +2472,7 @@ void IouringMgr::LruFD::Ref::Clear()
     if (--fd_->ref_count_ == 0)
     {
         PartitionFiles *partition_files = fd_->tbl_;
-        if (fd_->fd_ >= 0)
+        if (fd_->reg_idx_ >= 0 || fd_->fd_ >= 0)
         {
             io_mgr_->lru_fd_head_.EnqueNext(fd_);
         }
@@ -2059,7 +2499,8 @@ void IouringMgr::WriteReq::SetPage(VarPage page)
     switch (VarPageType(page.index()))
     {
     case VarPageType::MemIndexPage:
-        page_.emplace<MemIndexPage *>(std::get<MemIndexPage *>(page));
+        page_.emplace<MemIndexPage::Handle>(
+            std::move(std::get<MemIndexPage::Handle>(page)));
         break;
     case VarPageType::DataPage:
         page_.emplace<DataPage>(std::move(std::get<DataPage>(page)));
@@ -2118,7 +2559,7 @@ CloudStoreMgr::CloudStoreMgr(const KvOptions *opts,
                              CloudStorageService *service)
     : IouringMgr(opts, fd_limit),
       file_cleaner_(this),
-      direct_io_buffer_pool_(opts->direct_io_buffer_pool_size),
+      direct_io_buffer_pool_(opts->direct_io_buffer_pool_size, true),
       obj_store_(opts, service),
       cloud_service_(service)
 {
@@ -2130,6 +2571,8 @@ CloudStoreMgr::CloudStoreMgr(const KvOptions *opts,
     {
         prewarmers_.emplace_back(std::make_unique<Prewarmer>(this));
     }
+    DirectIoBuffer::UpdateDefaultReserve(
+        std::max(options_->DataFileSize(), static_cast<size_t>(8 * MB)));
 }
 
 KvError CloudStoreMgr::Init(Shard *shard)
@@ -2154,6 +2597,194 @@ KvError CloudStoreMgr::Init(Shard *shard)
         err = RestoreLocalCacheState();
         CHECK_KV_ERR(err);
     }
+    return KvError::NoError;
+}
+
+void CloudStoreMgr::OnFileRangeWritePrepared(const TableIdent &tbl_id,
+                                             FileId file_id,
+                                             uint64_t term,
+                                             uint64_t offset,
+                                             std::string_view data)
+{
+    if (data.empty())
+    {
+        return;
+    }
+    auto *owner = CurrentWriteTask();
+    if (owner == nullptr)
+    {
+        return;
+    }
+
+    const std::string filename = ToFilename(file_id, term);
+    WriteTask::UploadState &state = owner->MutableUploadState();
+    if (state.invalid)
+    {
+        LOG(ERROR) << "WriteTask upload state already invalid, table=" << tbl_id
+                   << " filename=" << state.filename << " offset=" << offset
+                   << " bytes=" << data.size();
+        return;
+    }
+
+    if (state.initialized)
+    {
+        if (state.filename != filename)
+        {
+            state.invalid = true;
+            LOG(ERROR) << "WriteTask upload state switched file before upload, "
+                       << "table=" << tbl_id << " previous=" << state.filename
+                       << " current=" << filename;
+            return;
+        }
+        if (offset != state.end_offset)
+        {
+            state.invalid = true;
+            LOG(ERROR) << "WriteTask upload buffer must append continuously, "
+                       << "table=" << tbl_id << " filename=" << filename
+                       << " expected_offset=" << state.end_offset
+                       << " actual_offset=" << offset;
+            return;
+        }
+    }
+    else
+    {
+        state.filename = filename;
+        state.start_offset = offset;
+        state.end_offset = offset;
+        state.initialized = true;
+    }
+
+    const uint64_t bytes = data.size();
+    if (offset > std::numeric_limits<uint64_t>::max() - bytes)
+    {
+        state.invalid = true;
+        LOG(ERROR) << "WriteTask upload state offset overflow, table=" << tbl_id
+                   << " filename=" << filename << " offset=" << offset
+                   << " bytes=" << bytes;
+        return;
+    }
+    uint64_t new_end = offset + bytes;
+    if (new_end > std::numeric_limits<size_t>::max())
+    {
+        state.invalid = true;
+        LOG(ERROR) << "WriteTask upload state size overflow, table=" << tbl_id
+                   << " filename=" << filename << " end_offset=" << new_end;
+        return;
+    }
+    state.buffer.resize(static_cast<size_t>(new_end));
+    std::memcpy(state.buffer.data() + static_cast<size_t>(offset),
+                data.data(),
+                data.size());
+    state.end_offset = new_end;
+}
+
+KvError CloudStoreMgr::OnDataFileSealed(const TableIdent &tbl_id,
+                                        FileId file_id)
+{
+    assert(file_id <= LruFD::kMaxDataFile);
+    // If file is still open, sync it (which will upload via SyncFile)
+    LruFD::Ref fd_ref = GetOpenedFD(tbl_id, file_id);
+    if (fd_ref != nullptr)
+    {
+        return SyncFile(std::move(fd_ref));
+    }
+
+    // File is already closed, upload it directly
+    // This handles the case where file was closed before sealing callback
+    uint64_t term = GetFileIdTerm(tbl_id, file_id).value_or(ProcessTerm());
+    return UploadFile(tbl_id, ToFilename(file_id, term), CurrentWriteTask());
+}
+
+KvError CloudStoreMgr::ReadFilePrefix(const TableIdent &tbl_id,
+                                      std::string_view filename,
+                                      size_t prefix_len,
+                                      DirectIoBuffer &buffer,
+                                      size_t dst_offset)
+{
+    if (prefix_len == 0)
+    {
+        return KvError::NoError;
+    }
+    if (dst_offset > buffer.size() || prefix_len > buffer.size() - dst_offset)
+    {
+        LOG(ERROR) << "Invalid prefix destination range, table=" << tbl_id
+                   << " filename=" << filename << " prefix_len=" << prefix_len
+                   << " dst_offset=" << dst_offset
+                   << " buffer_size=" << buffer.size();
+        return KvError::InvalidArgs;
+    }
+
+    // Construct absolute path to file
+    fs::path abs_path = tbl_id.StorePath(options_->store_path);
+    abs_path /= filename;
+
+    // Open file for reading using io_uring
+    io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, ThdTask());
+    open_how how = {.flags = O_RDONLY | O_NOATIME, .mode = 0, .resolve = 0};
+    io_uring_prep_openat2(sqe, AT_FDCWD, abs_path.c_str(), &how);
+    int fd = ThdTask()->WaitIoResult();
+    if (fd < 0)
+    {
+        LOG(ERROR) << "Failed to open file prefix for upload, table=" << tbl_id
+                   << " filename=" << filename << " error=" << strerror(-fd);
+        return ToKvError(fd);
+    }
+
+    // Read prefix_len bytes from file start in larger batches to reduce
+    // per-IO overhead on shard threads.
+    const size_t read_batch_size = options_->non_page_io_batch_size;
+
+    FdIdx fd_idx{fd, false};
+    KvError status = KvError::NoError;
+    size_t remaining = prefix_len;
+    size_t read_offset = 0;
+    while (remaining > 0)
+    {
+        size_t batch = std::min(read_batch_size, remaining);
+        int read_res = Read(fd_idx,
+                            buffer.data() + dst_offset + read_offset,
+                            batch,
+                            read_offset);
+        if (read_res < 0)
+        {
+            status = ToKvError(read_res);
+            LOG(ERROR) << "Failed to read file prefix for upload, table="
+                       << tbl_id << " filename=" << filename
+                       << " offset=" << read_offset
+                       << " error=" << strerror(-read_res);
+            break;
+        }
+        if (read_res == 0)
+        {
+            // Unexpected EOF: file is shorter than expected
+            status = KvError::EndOfFile;
+            LOG(ERROR) << "Unexpected EOF while reading file prefix, table="
+                       << tbl_id << " filename=" << filename
+                       << " offset=" << read_offset
+                       << " expected=" << prefix_len;
+            break;
+        }
+
+        read_offset += static_cast<size_t>(read_res);
+        remaining -= static_cast<size_t>(read_res);
+    }
+
+    // Close file descriptor
+    sqe = GetSQE(UserDataType::KvTask, ThdTask());
+    io_uring_prep_close(sqe, fd);
+    int close_res = ThdTask()->WaitIoResult();
+    if (close_res < 0)
+    {
+        LOG(ERROR) << "Failed to close prefix-read file, table=" << tbl_id
+                   << " filename=" << filename
+                   << " error=" << strerror(-close_res);
+        // Don't override read error with close error
+        if (status == KvError::NoError)
+        {
+            status = ToKvError(close_res);
+        }
+    }
+    CHECK_KV_ERR(status);
     return KvError::NoError;
 }
 
@@ -2829,7 +3460,7 @@ std::pair<ManifestFilePtr, KvError> CloudStoreMgr::GetManifest(
         // of this manifest is same to the one on cloud and can be used on this
         // read operation (without changing manifest content). The manifest with
         // process_term will be uploaded on next write operation.)
-        KvError up_err = UploadFiles(tbl_id, {promoted_name});
+        KvError up_err = UploadFile(tbl_id, promoted_name, nullptr);
         if (up_err != KvError::NoError)
         {
             LOG(ERROR) << "CloudStoreMgr::GetManifest: failed to upload "
@@ -3097,13 +3728,13 @@ KvError CloudStoreMgr::SwitchManifest(const TableIdent &tbl_id,
         // This is a new cached file.
         used_local_space_ += options_->manifest_limit;
     }
-    err = UploadFiles(tbl_id, {manifest_name});
+    err = UploadFile(tbl_id, manifest_name, nullptr, snapshot);
     if (err != KvError::NoError)
     {
         LOG(FATAL) << "can not upload manifest: " << ErrorString(err);
     }
 
-    IouringMgr::Close(res);
+    IouringMgr::CloseDirect(res);
     EnqueClosedFile(std::move(fkey));
     return KvError::NoError;
 }
@@ -3130,11 +3761,19 @@ KvError CloudStoreMgr::CreateArchive(const TableIdent &tbl_id,
     {
         return ToKvError(res);
     }
-    err = UploadFiles(tbl_id, {name});
-    IouringMgr::Close(res);
+    err = UploadFile(tbl_id, name, nullptr, snapshot);
+    IouringMgr::CloseDirect(res);
     used_local_space_ += options_->manifest_limit;
     EnqueClosedFile(FileKey(tbl_id, name));
     return err;
+}
+
+KvError CloudStoreMgr::AbortWrite(const TableIdent &tbl_id)
+{
+    // First abort the base I/O manager state (reset dirty flags, etc.)
+    KvError err = IouringMgr::AbortWrite(tbl_id);
+    CHECK_KV_ERR(err);
+    return KvError::NoError;
 }
 
 int CloudStoreMgr::CreateFile(LruFD::Ref dir_fd, FileId file_id, uint64_t term)
@@ -3155,14 +3794,15 @@ int CloudStoreMgr::CreateFile(LruFD::Ref dir_fd, FileId file_id, uint64_t term)
 
 int CloudStoreMgr::OpenFile(const TableIdent &tbl_id,
                             FileId file_id,
-                            bool direct,
+                            uint64_t flags,
+                            uint64_t mode,
                             uint64_t term)
 {
     FileKey key = FileKey(tbl_id, ToFilename(file_id, term));
     if (DequeClosedFile(key))
     {
         // Try to open the file cached locally.
-        int res = IouringMgr::OpenFile(tbl_id, file_id, direct, term);
+        int res = IouringMgr::OpenFile(tbl_id, file_id, flags, mode, term);
         if (res < 0 && res != -ENOENT)
         {
             EnqueClosedFile(std::move(key));
@@ -3194,7 +3834,7 @@ int CloudStoreMgr::OpenFile(const TableIdent &tbl_id,
     }
 
     // Try to open the successfully downloaded file.
-    res = IouringMgr::OpenFile(tbl_id, file_id, direct, term);
+    res = IouringMgr::OpenFile(tbl_id, file_id, flags, mode, term);
     if (res < 0 && res != -ENOENT)
     {
         EnqueClosedFile(std::move(key));
@@ -3204,41 +3844,59 @@ int CloudStoreMgr::OpenFile(const TableIdent &tbl_id,
 
 KvError CloudStoreMgr::SyncFile(LruFD::Ref fd)
 {
-    if (int res = IouringMgr::Fdatasync(fd.FdPair()); res < 0)
-    {
-        return ToKvError(res);
-    }
-
     FileId file_id = fd.Get()->file_id_;
+    KvError err = KvError::NoError;
     if (file_id != LruFD::kDirectory)
     {
         const TableIdent &tbl_id = *fd.Get()->tbl_->tbl_id_;
         uint64_t term = fd.Get()->term_;
-        KvError err = UploadFiles(tbl_id, {ToFilename(file_id, term)});
+        err = UploadFile(tbl_id, ToFilename(file_id, term), CurrentWriteTask());
         if (file_id == LruFD::kManifest)
         {
-            // For manifest, retry until success or error that
+            // For manifest files, retry until success or error that
             // means manifest is not uploaded (insufficient storage).
+            // Manifests are critical and must be uploaded eventually.
             while (err != KvError::NoError &&
                    err != KvError::OssInsufficientStorage)
             {
                 LOG(WARNING) << "Manifest upload failed with "
                              << ErrorString(err) << ", retrying.";
-                err = UploadFiles(tbl_id, {ToFilename(file_id, term)});
+                err = UploadFile(
+                    tbl_id, ToFilename(file_id, term), CurrentWriteTask());
             }
+        }
+        if (err == KvError::NoError)
+        {
+            fd.Get()->dirty_ = false;
         }
         return err;
     }
-
-    fd.Get()->dirty_ = false;
-    return KvError::NoError;
+    return err;
 }
 
 KvError CloudStoreMgr::SyncFiles(const TableIdent &tbl_id,
                                  std::span<LruFD::Ref> fds)
 {
-    KvError err = FdatasyncFiles(tbl_id, fds);
-    CHECK_KV_ERR(err);
+    if (options_->data_append_mode && CurrentWriteTask() != nullptr)
+    {
+        size_t dirty_data_files = 0;
+        for (LruFD::Ref fd : fds)
+        {
+            FileId file_id = fd.Get()->file_id_;
+            if (file_id <= LruFD::kMaxDataFile)
+            {
+                ++dirty_data_files;
+            }
+        }
+        if (dirty_data_files > 1)
+        {
+            LOG(ERROR) << "SyncFiles found more than one dirty data file in a "
+                          "single write task, table="
+                       << tbl_id << " dirty_data_files=" << dirty_data_files;
+            return KvError::Corrupted;
+        }
+    }
+
     std::vector<std::string> filenames;
     for (LruFD::Ref fd : fds)
     {
@@ -3249,7 +3907,7 @@ KvError CloudStoreMgr::SyncFiles(const TableIdent &tbl_id,
             filenames.emplace_back(ToFilename(file_id, term));
         }
     }
-    err = UploadFiles(tbl_id, std::move(filenames));
+    KvError err = UploadFiles(tbl_id, std::move(filenames));
     if (err != KvError::NoError)
     {
         return err;
@@ -3320,14 +3978,9 @@ size_t CloudStoreMgr::EstimateFileSize(std::string_view filename) const
     __builtin_unreachable();
 }
 
-inline bool CloudStoreMgr::BackgroundJobInited()
-{
-    return background_job_inited_;
-}
-
 void CloudStoreMgr::InitBackgroundJob()
 {
-    background_job_inited_ = true;
+    IouringMgr::InitBackgroundJob();
     shard->running_ = &file_cleaner_;
     file_cleaner_.coro_ = boost::context::callcc(
         [this](continuation &&sink)
@@ -3420,7 +4073,7 @@ KvError CloudStoreMgr::DownloadFile(const TableIdent &tbl_id,
 
     // Set KvTask pointer and initialize inflight_io_
     download_task.SetKvTask(current_task);
-    download_task.response_data_ = std::move(direct_io_buffer_pool_.Acquire());
+    download_task.response_data_ = AcquireCloudBuffer(current_task);
 
     AcquireCloudSlot(current_task);
     obj_store_.SubmitTask(&download_task, shard);
@@ -3428,14 +4081,37 @@ KvError CloudStoreMgr::DownloadFile(const TableIdent &tbl_id,
 
     if (download_task.error_ != KvError::NoError)
     {
-        RecycleBuffer(std::move(download_task.response_data_));
+        ReleaseCloudBuffer(std::move(download_task.response_data_));
         return download_task.error_;
     }
 
     KvError err = WriteFile(tbl_id, filename, download_task.response_data_);
-    RecycleBuffer(std::move(download_task.response_data_));
+    ReleaseCloudBuffer(std::move(download_task.response_data_));
     CHECK_KV_ERR(err);
     return KvError::NoError;
+}
+
+DirectIoBuffer CloudStoreMgr::AcquireCloudBuffer(KvTask *task)
+{
+    CHECK(task != nullptr);
+    while (options_->direct_io_buffer_pool_size != 0 &&
+           inflight_cloud_buffers_ >= options_->direct_io_buffer_pool_size)
+    {
+        cloud_buffer_waiting_.Wait(task);
+    }
+    ++inflight_cloud_buffers_;
+    return direct_io_buffer_pool_.Acquire();
+}
+
+void CloudStoreMgr::ReleaseCloudBuffer(DirectIoBuffer buffer)
+{
+    if (buffer.capacity() != 0)
+    {
+        direct_io_buffer_pool_.Release(std::move(buffer));
+    }
+    CHECK_GT(inflight_cloud_buffers_, 0);
+    --inflight_cloud_buffers_;
+    cloud_buffer_waiting_.WakeOne();
 }
 
 void CloudStoreMgr::RecycleBuffers(std::vector<DirectIoBuffer> &buffers)
@@ -3484,7 +4160,8 @@ KvError IouringMgr::ReadFile(const TableIdent &tbl_id,
     abs_path /= filename;
 
     io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, ThdTask());
-    open_how how = {.flags = O_RDONLY | O_DIRECT, .mode = 0, .resolve = 0};
+    open_how how = {
+        .flags = O_RDONLY | O_DIRECT | O_NOATIME, .mode = 0, .resolve = 0};
     io_uring_prep_openat2(sqe, AT_FDCWD, abs_path.c_str(), &how);
     int fd = ThdTask()->WaitIoResult();
     if (fd < 0)
@@ -3500,7 +4177,8 @@ KvError IouringMgr::ReadFile(const TableIdent &tbl_id,
         struct statx stx
         {
         };
-        int stat_res = Statx(fd, "", &stx);
+        FdIdx stat_fd{fd, false};
+        int stat_res = Statx(stat_fd, "", &stx);
         if (stat_res < 0)
         {
             KvError err = ToKvError(stat_res);
@@ -3517,7 +4195,7 @@ KvError IouringMgr::ReadFile(const TableIdent &tbl_id,
     }
 
     buffer.resize(file_size);
-    constexpr size_t read_batch_size = 1ULL << 20;
+    const size_t read_batch_size = Options()->non_page_io_batch_size;
     size_t remaining = buffer.padded_size();
     size_t read_offset = 0;
     FdIdx fd_idx{fd, false};
@@ -3579,105 +4257,182 @@ KvError IouringMgr::ReadFile(const TableIdent &tbl_id,
     return KvError::NoError;
 }
 
+KvError CloudStoreMgr::UploadFile(const TableIdent &tbl_id,
+                                  std::string filename,
+                                  WriteTask *owner,
+                                  std::string_view payload)
+{
+    KvTask *current_task = ThdTask();
+    ObjectStore::UploadTask upload_task(&tbl_id, std::move(filename));
+    upload_task.SetKvTask(current_task);
+
+    auto [prefix, suffix] = ParseFileName(upload_task.filename_);
+    const bool is_data_file = (prefix == FileNameData);
+    if (is_data_file)
+    {
+        FileId file_id = 0;
+        uint64_t term = 0;
+        if (!ParseDataFileSuffix(suffix, file_id, term))
+        {
+            LOG(ERROR) << "Invalid data filename for upload: "
+                       << upload_task.filename_;
+            return KvError::InvalidArgs;
+        }
+    }
+    else if (prefix != FileNameManifest)
+    {
+        LOG(ERROR) << "Unsupported upload filename: " << upload_task.filename_;
+        return KvError::InvalidArgs;
+    }
+
+    DirectIoBuffer temp_buffer;
+    DirectIoBuffer *upload_buffer = nullptr;
+    uint64_t start_offset = 0;
+    uint64_t end_offset = 0;
+    bool has_buffered_range = false;
+
+    if (owner != nullptr)
+    {
+        WriteTask::UploadState &state = owner->MutableUploadState();
+        if (state.invalid)
+        {
+            LOG(ERROR) << "WriteTask upload state is invalid, table=" << tbl_id
+                       << " filename=" << state.filename;
+            state.ResetMetadata();
+            return KvError::InvalidArgs;
+        }
+        if (state.initialized && state.filename != upload_task.filename_)
+        {
+            LOG(ERROR) << "WriteTask upload state filename mismatch, table="
+                       << tbl_id << " state=" << state.filename
+                       << " upload=" << upload_task.filename_;
+            state.ResetMetadata();
+            return KvError::Corrupted;
+        }
+        upload_buffer = &state.buffer;
+        has_buffered_range = state.initialized;
+        start_offset = state.start_offset;
+        end_offset = state.end_offset;
+    }
+    else
+    {
+        temp_buffer = AcquireCloudBuffer(current_task);
+        upload_buffer = &temp_buffer;
+    }
+
+    auto cleanup = [&]()
+    {
+        if (owner != nullptr)
+        {
+            owner->MutableUploadState().ResetMetadata();
+        }
+        else
+        {
+            ReleaseCloudBuffer(std::move(temp_buffer));
+        }
+    };
+
+    size_t file_size = 0;
+    if (has_buffered_range)
+    {
+        if (end_offset > std::numeric_limits<size_t>::max())
+        {
+            LOG(ERROR) << "Buffered upload end offset overflow, table="
+                       << tbl_id << " filename=" << upload_task.filename_
+                       << " end_offset=" << end_offset;
+            cleanup();
+            return KvError::InvalidArgs;
+        }
+        file_size = is_data_file ? options_->DataFileSize()
+                                 : static_cast<size_t>(end_offset);
+    }
+    else if (!payload.empty())
+    {
+        if (owner != nullptr)
+        {
+            LOG(ERROR) << "Payload upload should not bind a write-task owner, "
+                       << "table=" << tbl_id
+                       << " filename=" << upload_task.filename_;
+            cleanup();
+            return KvError::InvalidArgs;
+        }
+        upload_buffer->assign(payload);
+        file_size = upload_buffer->size();
+    }
+    else
+    {
+        KvError read_err =
+            ReadFile(tbl_id, upload_task.filename_, *upload_buffer);
+        if (read_err != KvError::NoError)
+        {
+            cleanup();
+            return read_err;
+        }
+        file_size = upload_buffer->size();
+    }
+
+    if (has_buffered_range)
+    {
+        if (start_offset > end_offset || end_offset > file_size)
+        {
+            LOG(ERROR) << "Invalid buffered upload range, table=" << tbl_id
+                       << " filename=" << upload_task.filename_
+                       << " start_offset=" << start_offset
+                       << " end_offset=" << end_offset
+                       << " file_size=" << file_size;
+            cleanup();
+            return KvError::InvalidArgs;
+        }
+        if (upload_buffer->size() != static_cast<size_t>(end_offset))
+        {
+            LOG(ERROR) << "Buffered upload size mismatch, table=" << tbl_id
+                       << " filename=" << upload_task.filename_
+                       << " buffered_size=" << upload_buffer->size()
+                       << " end_offset=" << end_offset;
+            cleanup();
+            return KvError::InvalidArgs;
+        }
+        upload_buffer->resize(file_size);
+        if (start_offset > 0)
+        {
+            KvError err = ReadFilePrefix(tbl_id,
+                                         upload_task.filename_,
+                                         static_cast<size_t>(start_offset),
+                                         *upload_buffer,
+                                         0);
+            if (err != KvError::NoError)
+            {
+                cleanup();
+                return err;
+            }
+        }
+    }
+
+    upload_task.file_size_ = file_size;
+    upload_task.data_buffer_ = std::move(*upload_buffer);
+
+    AcquireCloudSlot(current_task);
+    obj_store_.SubmitTask(&upload_task, shard);
+    current_task->WaitIo();
+
+    *upload_buffer = std::move(upload_task.data_buffer_);
+    KvError upload_err = upload_task.error_;
+    cleanup();
+    return upload_err;
+}
+
 KvError CloudStoreMgr::UploadFiles(const TableIdent &tbl_id,
                                    std::vector<std::string> filenames)
 {
-    if (filenames.empty())
+    WriteTask *owner = CurrentWriteTask();
+    for (std::string &filename : filenames)
     {
-        return KvError::NoError;
-    }
-
-    KvTask *current_task = ThdTask();
-    std::vector<std::unique_ptr<ObjectStore::UploadTask>> tasks;
-    tasks.reserve(filenames.size());
-    std::vector<ObjectStore::UploadTask *> pending;
-    pending.reserve(filenames.size());
-
-    for (auto &name : filenames)
-    {
-        auto task =
-            std::make_unique<ObjectStore::UploadTask>(&tbl_id, std::move(name));
-        task->SetKvTask(current_task);
-        pending.emplace_back(task.get());
-        tasks.emplace_back(std::move(task));
-    }
-
-    size_t processed = 0;
-    const size_t max_upload_batch = options_->max_upload_batch;
-    std::vector<DirectIoBuffer> batch_contents;
-    batch_contents.reserve(max_upload_batch);
-    while (processed < pending.size())
-    {
-        while (inflight_upload_files_ >= max_upload_batch)
+        KvError err = UploadFile(tbl_id, std::move(filename), owner);
+        if (err != KvError::NoError)
         {
-            upload_slots_waiting_.Wait(current_task);
-        }
-
-        size_t batch = std::min(max_upload_batch, pending.size() - processed);
-        size_t span_size =
-            std::min(max_upload_batch - inflight_upload_files_, batch);
-        auto span = std::span<ObjectStore::UploadTask *>(
-            pending.data() + processed, span_size);
-        inflight_upload_files_ += span_size;
-        batch_contents.clear();
-        KvError read_err = KvError::NoError;
-        for (ObjectStore::UploadTask *task : span)
-        {
-            DirectIoBuffer file_buffer = direct_io_buffer_pool_.Acquire();
-            read_err = ReadFile(tbl_id, task->filename_, file_buffer);
-            if (read_err != KvError::NoError)
-            {
-                break;
-            }
-            batch_contents.emplace_back(std::move(file_buffer));
-        }
-        if (read_err != KvError::NoError)
-        {
-            inflight_upload_files_ -= span_size;
-            upload_slots_waiting_.WakeAll();
-            RecycleBuffers(batch_contents);
-            return read_err;
-        }
-
-        for (size_t i = 0; i < span.size(); ++i)
-        {
-            ObjectStore::UploadTask *task = span[i];
-            task->data_buffer_ = std::move(batch_contents[i]);
-            task->file_size_ = task->data_buffer_.size();
-            task->buffer_offset_ = 0;
-            AcquireCloudSlot(current_task);
-            obj_store_.SubmitTask(task, shard);
-        }
-        batch_contents.clear();
-
-        if (!span.empty())
-        {
-            current_task->WaitIo();
-            inflight_upload_files_ -= span_size;
-            upload_slots_waiting_.WakeAll();
-            for (ObjectStore::UploadTask *task : span)
-            {
-                if (!task->data_buffer_.empty())
-                {
-                    direct_io_buffer_pool_.Release(
-                        std::move(task->data_buffer_));
-                }
-            }
-        }
-
-        processed += span_size;
-    }
-
-    RecycleBuffers(batch_contents);
-
-    for (const auto &task : tasks)
-    {
-        if (task->error_ != KvError::NoError)
-        {
-            return task->error_;
+            return err;
         }
     }
-
     return KvError::NoError;
 }
 
@@ -3770,7 +4525,7 @@ void CloudStoreMgr::FileCleaner::Run()
             UnlinkReq &req = unlink_reqs[req_count++];
             req.file_ = file;
             req.path_ = file->key_->tbl_id_.ToString();
-            req.path_.append(file->key_->filename_);
+            req.path_ /= file->key_->filename_;
 
             io_uring_sqe *sqe = io_mgr_->GetSQE(UserDataType::BaseReq, &req);
             int root_fd = io_mgr_->GetRootFD(req.file_->key_->tbl_id_).first;
@@ -3898,13 +4653,6 @@ KvError MemStoreMgr::WritePage(const TableIdent &tbl_id,
     return KvError::NoError;
 }
 
-KvError MemStoreMgr::WritePages(const TableIdent &tbl_id,
-                                std::span<VarPage> pages,
-                                FilePageId first_fp_id)
-{
-    LOG(FATAL) << "not implemented";
-}
-
 KvError MemStoreMgr::SyncData(const TableIdent &tbl_id)
 {
     return KvError::NoError;
@@ -3953,6 +4701,7 @@ KvError MemStoreMgr::CreateArchive(const TableIdent &tbl_id,
                                    uint64_t ts)
 {
     LOG(FATAL) << "not implemented";
+    return KvError::InvalidArgs;
 }
 
 KvError MemStoreMgr::Manifest::Read(char *dst, size_t n)
@@ -3987,9 +4736,10 @@ KvError CloudStoreMgr::WriteFile(const TableIdent &tbl_id,
 
     std::string path_str = path.string();
     io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, ThdTask());
-    open_how how = {.flags = O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT,
-                    .mode = 0644,
-                    .resolve = 0};
+    open_how how = {
+        .flags = O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT | O_NOATIME,
+        .mode = 0644,
+        .resolve = 0};
     io_uring_prep_openat2(sqe, AT_FDCWD, path_str.c_str(), &how);
     int fd = ThdTask()->WaitIoResult();
     if (fd < 0)

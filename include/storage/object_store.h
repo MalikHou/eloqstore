@@ -151,9 +151,10 @@ public:
 
         const TableIdent *tbl_id_;
         std::string filename_;
+        // Total logical object size expected by remote upload.
         size_t file_size_{0};
+        // Inline one-buffer upload source.
         DirectIoBuffer data_buffer_;
-        size_t buffer_offset_{0};
         // For If-Match header
         std::string if_match_{};
         // For If-None-Match header (use "*" for create)

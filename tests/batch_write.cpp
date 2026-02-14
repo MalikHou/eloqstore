@@ -128,7 +128,6 @@ TEST_CASE("batch write abort releases pinned index pages",
     opts.num_threads = 1;
     opts.data_page_size = 4096;
     opts.buffer_pool_size = 4096;  // Allow only a single MemIndexPage.
-    opts.buf_ring_size = 8;
     opts.max_write_batch_pages = 4;
 
     auto build_entries =
@@ -206,7 +205,6 @@ TEST_CASE("batch write task pool handles many partitions concurrently",
     };
 
     eloqstore::EloqStore *store = InitStore(opts);
-
     constexpr uint32_t partitions = 3000;
     std::vector<eloqstore::BatchWriteRequest> wave1(partitions);
     std::vector<eloqstore::BatchWriteRequest> wave2(partitions);

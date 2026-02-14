@@ -23,7 +23,7 @@ eloqstore::KvOptions CreateValidOptions(const fs::path &test_dir)
     options.coroutine_stack_size = 8192;
     options.overflow_pointers = 4;
     options.max_write_batch_pages = 16;
-    options.fd_limit = 100;
+    options.fd_limit = 200;
     return options;
 }
 
@@ -81,12 +81,6 @@ TEST_CASE("EloqStore ValidateOptions validates all parameters", "[eloq_store]")
     REQUIRE(eloqstore::EloqStore::ValidateOptions(options) == false);
     options = CreateValidOptions(test_dir);  // restore valid value
 
-    // Test invalid max_upload_batch (cloud mode)
-    options.cloud_store_path = "test";
-    options.max_upload_batch = 0;
-    REQUIRE(eloqstore::EloqStore::ValidateOptions(options) == false);
-    options = CreateValidOptions(test_dir);  // restore valid value
-
     // Cloud storage configuration: auto fix local space limit and append mode
     options.cloud_store_path = "test";
     options.local_space_limit = 0;
@@ -104,10 +98,6 @@ TEST_CASE("EloqStore ValidateOptions validates all parameters", "[eloq_store]")
     options.data_append_mode = true;
     options.cloud_store_path = "test";
     REQUIRE(eloqstore::EloqStore::ValidateOptions(options) == true);
-    const uint64_t per_file = static_cast<uint64_t>(options.data_page_size) *
-                              (1ULL << options.pages_per_file_shift);
-    REQUIRE(options.fd_limit ==
-            static_cast<uint32_t>(options.local_space_limit / per_file));
 
     // prewarm without cloud path is disabled automatically
     options = CreateValidOptions(test_dir);

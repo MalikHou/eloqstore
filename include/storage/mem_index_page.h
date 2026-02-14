@@ -26,6 +26,70 @@ struct TableIdent;
 class MemIndexPage
 {
 public:
+    class Handle
+    {
+    public:
+        Handle() = default;
+        explicit Handle(MemIndexPage *page)
+        {
+            Reset(page);
+        }
+
+        Handle(const Handle &) = delete;
+        Handle &operator=(const Handle &) = delete;
+
+        Handle(Handle &&other) noexcept : page_(other.page_)
+        {
+            other.page_ = nullptr;
+        }
+        Handle &operator=(Handle &&other) noexcept
+        {
+            if (this != &other)
+            {
+                Reset();
+                page_ = other.page_;
+                other.page_ = nullptr;
+            }
+            return *this;
+        }
+
+        ~Handle()
+        {
+            Reset();
+        }
+
+        void Reset(MemIndexPage *page = nullptr)
+        {
+            if (page_ != nullptr)
+            {
+                page_->Unpin();
+            }
+            page_ = page;
+            if (page_ != nullptr)
+            {
+                page_->Pin();
+            }
+        }
+
+        MemIndexPage *Get() const
+        {
+            return page_;
+        }
+
+        MemIndexPage *operator->() const
+        {
+            return page_;
+        }
+
+        explicit operator bool() const
+        {
+            return page_ != nullptr;
+        }
+
+    private:
+        MemIndexPage *page_{nullptr};
+    };
+
     static size_t const max_page_size = 1 << 16;
     static uint16_t const page_size_offset = page_type_offset + sizeof(uint8_t);
     static uint16_t const leftmost_ptr_offset =
@@ -102,6 +166,11 @@ public:
      */
     std::string String(const KvOptions *opts) const;
 
+    bool IsRegistered() const
+    {
+        return page_.IsRegistered();
+    }
+
 private:
     /**
      * @brief The page ID is 0, if the page is newly created in memory and has
@@ -139,7 +208,7 @@ public:
     using uptr = std::unique_ptr<IndexPageIter>;
 
     IndexPageIter() = delete;
-    IndexPageIter(const MemIndexPage *index_page, const KvOptions *opts);
+    IndexPageIter(const MemIndexPage::Handle &handle, const KvOptions *opts);
     IndexPageIter(std::string_view page_view, const KvOptions *opts);
 
     bool HasNext() const
